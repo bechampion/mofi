@@ -69,6 +69,23 @@ fn glyph_for_item(item: &LaunchItem) -> &'static str {
     }
 }
 
+/// Returns a representative Nerd Font glyph for each built-in theme name.
+fn theme_glyph_for(name: &str) -> &'static str {
+    match name {
+        "kanagawa"   => "\u{E6AC}",   // nf-custom-vim  (wave/japanese feel)
+        "gruvbox"    => "\u{F0043}",  // nf-md-fire     (warm earthy tones)
+        "nord"       => "\u{F0599}",  // nf-md-snowflake
+        "tokyonight" => "\u{F0E7B}",  // nf-md-city_variant_outline
+        "dracula"    => "\u{F0B4B}",  // nf-md-bat
+        "solarized"  => "\u{F0438}",  // nf-md-weather_sunny
+        "monokai"    => "\u{F0A71}",  // nf-md-coffee
+        "catppuccin" => "\u{F028B}",  // nf-md-cat
+        "onedark"    => "\u{F04A6}",  // nf-md-moon_waning_crescent
+        "rosepine"   => "\u{F04CB}",  // nf-md-pine_tree
+        _            => "\u{F53F}",   // nf-md-palette  (fallback)
+    }
+}
+
 fn glyph_for_app(name: &str) -> &'static str {
     let n = name.to_lowercase();
     if n.contains("safari")                                            { "\u{E748}" }
@@ -543,12 +560,12 @@ impl eframe::App for RofiApp {
                                 (Mode::Apps,      "Apps"),
                                 (Mode::Clipboard, "Clipboard"),
                                 (Mode::Pass,      "Pass"),
-                                (Mode::Themes,    "\u{F53F}  Themes"),
+                                (Mode::Themes,    "Themes"),
                                 (Mode::About,     "About"),
                             ];
                             // \u{F53F} = nf-md-palette (󰔿) — theme/palette icon
                             let input_tab:  &[(Mode, &str)] = &[(Mode::Input,  "Input")];
-                            let themes_tab: &[(Mode, &str)] = &[(Mode::Themes, "\u{F53F}  Themes")];
+                            let themes_tab: &[(Mode, &str)] = &[(Mode::Themes, "Themes")];
                             let tabs = match self.mode {
                                 Mode::Input  => input_tab,
                                 // Themes tab is now also in normal_tabs, so just fall through.
@@ -712,17 +729,22 @@ impl eframe::App for RofiApp {
                                     return;
                                 }
                                 let aw = ui.available_width();
-                                // Use palette icon for themes mode, list icon for input mode.
-                                let row_icon = if self.mode == Mode::Themes { "\u{F53F}" } else { "\u{F0CA}" };
                                 // Collect a snapshot so we don't hold a borrow on self.input_filtered
                                 // while potentially mutating self inside the loop.
                                 let rows: Vec<(usize, usize)> = self.input_filtered.iter()
                                     .copied()
                                     .enumerate()
                                     .collect();
+                                let is_themes = self.mode == Mode::Themes;
                                 for (row_idx, item_idx) in rows {
                                     let sel = row_idx == self.selected;
                                     let text = self.input_items[item_idx].clone();
+                                    // Per-row icon: theme-specific glyph in themes mode, plain list bullet otherwise.
+                                    let row_icon = if is_themes {
+                                        theme_glyph_for(text.trim_start_matches("* "))
+                                    } else {
+                                        "\u{F0CA}"  // nf-fa-list_ul
+                                    };
                                     let (rr, _) = ui.allocate_exact_size(Vec2::new(aw, ROW_HEIGHT), egui::Sense::hover());
                                     if sel { ui.scroll_to_rect(rr, None); }
                                     if sel {
