@@ -185,6 +185,9 @@ The active theme name is saved to `~/.config/mofi/config.toml`:
 theme = "kanagawa"
 ```
 
+![Themes picker](assets/themes-1.png)
+![Themes live preview](assets/themes-2.png)
+
 ---
 
 ## Pipe-select mode (`--input`)
