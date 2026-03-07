@@ -210,7 +210,31 @@ mofi --daemon     persistent egui window (hidden by default), started via launch
 mofi --client     toggle show/hide — sends socket message then SIGUSR1
 mofi --input      pipe-select: reads stdin, sends items to daemon, prints selection to stdout
 mofi --themes     theme picker: presents built-in themes with live preview, writes chosen theme to config
+mofi --install    install plist, load launchd agent, append skhd hotkey, create config
+mofi --restart    unload and reload the launchd agent, then print the new daemon PID
 ```
+
+### `--restart`
+
+Restarts the running daemon without touching the launchd plist or any config files.
+Use it whenever you rebuild the binary and want the new version to take effect immediately:
+
+```sh
+cargo build --release
+~/rofi-mac/target/release/mofi --restart
+# → [restart] unloading... ok
+# → [restart] loading...   ok
+# → [restart] daemon running (PID 12345)
+```
+
+Internally it runs:
+
+```sh
+launchctl unload ~/Library/LaunchAgents/com.user.mofi.plist
+launchctl load  ~/Library/LaunchAgents/com.user.mofi.plist
+```
+
+and then reads `/tmp/mofi.pid` to confirm the new PID.
 
 Communication uses a Unix socket at `/tmp/mofi.sock`. The daemon PID is written to `/tmp/mofi.pid`.
 
