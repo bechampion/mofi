@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag name to release (e.g. v0.1.0)"
+        required: true
+        default: "v0.1.0"
 
 permissions:
   contents: write
@@ -75,9 +81,10 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          name: mofi ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name != 'master' && github.ref_name || inputs.tag }}
+          name: mofi ${{ github.ref_name != 'master' && github.ref_name || inputs.tag }}
           body: |
-            ## mofi ${{ github.ref_name }}
+            ## mofi ${{ github.ref_name != 'master' && github.ref_name || inputs.tag }}
 
             ### Installation
 
@@ -85,13 +92,13 @@ jobs:
 
             ```bash
             # Apple Silicon (M1/M2/M3)
-            curl -Lo mofi https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/mofi-aarch64-apple-darwin
+            curl -Lo mofi https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name != 'master' && github.ref_name || inputs.tag }}/mofi-aarch64-apple-darwin
             chmod +x mofi
             sudo mv mofi /usr/local/bin/mofi
             mofi --install
 
             # Intel
-            curl -Lo mofi https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/mofi-x86_64-apple-darwin
+            curl -Lo mofi https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name != 'master' && github.ref_name || inputs.tag }}/mofi-x86_64-apple-darwin
             chmod +x mofi
             sudo mv mofi /usr/local/bin/mofi
             mofi --install
@@ -105,9 +112,9 @@ jobs:
             ```
 
             ### What's new
-            See [CHANGELOG](https://github.com/${{ github.repository }}/blob/master/CHANGELOG.md) or the commit history for details.
+            See the [commit history](https://github.com/${{ github.repository }}/commits/master) for details.
           files: |
             artifacts/mofi-aarch64-apple-darwin/mofi-aarch64-apple-darwin
             artifacts/mofi-x86_64-apple-darwin/mofi-x86_64-apple-darwin
           draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(github.ref_name, '-') || contains(inputs.tag, '-') }}
