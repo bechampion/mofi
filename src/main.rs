@@ -38,6 +38,10 @@ fn main() -> eframe::Result<()> {
             install_main();
             Ok(())
         }
+        "--restart" => {
+            restart_main();
+            Ok(())
+        }
         _ => run_daemon(),
     }
 }
@@ -330,6 +334,52 @@ fn install_main() {
     println!("Done. mofi is installed and running.");
     println!("  Open with: Cmd+Space");
     println!("  Pick a theme: mofi --themes");
+}
+
+// ── --restart ─────────────────────────────────────────────────────────────────
+
+fn restart_main() {
+    use std::path::PathBuf;
+
+    let plist = PathBuf::from(
+        shellexpand::tilde("~/Library/LaunchAgents/com.user.mofi.plist").as_ref()
+    );
+
+    if !plist.exists() {
+        eprintln!("mofi: plist not found at {} — run `mofi --install` first", plist.display());
+        std::process::exit(1);
+    }
+
+    let plist_str = plist.to_str().unwrap();
+
+    print!("  [restart] unloading... ");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let unload = std::process::Command::new("launchctl")
+        .args(["unload", plist_str])
+        .status();
+    match unload {
+        Ok(s) if s.success() => println!("ok"),
+        Ok(s) => println!("exited {}", s),
+        Err(e) => { eprintln!("error: {}", e); std::process::exit(1); }
+    }
+
+    print!("  [restart] loading...   ");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let load = std::process::Command::new("launchctl")
+        .args(["load", plist_str])
+        .status();
+    match load {
+        Ok(s) if s.success() => println!("ok"),
+        Ok(s) => { eprintln!("launchctl load exited {}", s); std::process::exit(1); }
+        Err(e) => { eprintln!("error: {}", e); std::process::exit(1); }
+    }
+
+    // Give the daemon a moment to write its PID file, then confirm.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    match fs::read_to_string(PID_FILE) {
+        Ok(pid) => println!("  [restart] daemon running (PID {})", pid.trim()),
+        Err(_)  => println!("  [restart] daemon started (PID file not yet written)"),
+    }
 }
 
 /// Message sent from the socket thread to the UI thread.
