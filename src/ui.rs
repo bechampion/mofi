@@ -63,9 +63,81 @@ mod kana {
 
 fn glyph_for_item(item: &LaunchItem) -> &'static str {
     match item {
-        LaunchItem::Clip(_) => "\u{F328}",
-        LaunchItem::Pass(_) => "\u{F0756}",
+        LaunchItem::Clip(e) => glyph_for_clip(&e.text),
+        LaunchItem::Pass(e) => glyph_for_pass(&e.name),
         LaunchItem::App(a)  => glyph_for_app(&a.name),
+    }
+}
+
+/// Pick a glyph based on clipboard text content.
+fn glyph_for_clip(text: &str) -> &'static str {
+    let trimmed = text.trim();
+    // URL
+    if trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("ftp://")
+    {
+        return "\u{F0AC}";  // nf-fa-globe
+    }
+    // Email address
+    if !trimmed.contains('\n') && trimmed.contains('@') && trimmed.contains('.') {
+        return "\u{F0E0}";  // nf-fa-envelope
+    }
+    // File path
+    if trimmed.starts_with('/') || trimmed.starts_with("~/") {
+        return "\u{F15B}";  // nf-fa-file
+    }
+    // UUID  e.g. 550e8400-e29b-41d4-a716-446655440000
+    let is_uuid = {
+        let p: Vec<&str> = trimmed.split('-').collect();
+        p.len() == 5
+            && p[0].len() == 8  && p[1].len() == 4
+            && p[2].len() == 4  && p[3].len() == 4
+            && p[4].len() == 12
+            && p.iter().all(|s| s.chars().all(|c| c.is_ascii_hexdigit()))
+    };
+    if is_uuid {
+        return "\u{F0CB2}";  // nf-md-numeric
+    }
+    // Pure numeric / hex token (short, no spaces)
+    if !trimmed.contains('\n')
+        && trimmed.len() <= 64
+        && trimmed.chars().all(|c| c.is_ascii_hexdigit() || c == 'x' || c == 'X' || c == '-' || c == '_')
+    {
+        return "\u{F0CB2}";  // nf-md-numeric
+    }
+    // Multi-line → text-box stack
+    if trimmed.contains('\n') {
+        return "\u{F0219}";  // nf-md-text_box_multiple
+    }
+    // Short snippet → single page
+    if trimmed.len() <= 60 {
+        return "\u{F0F6}";   // nf-fa-file_text_o  (small note / page)
+    }
+    // Long single-line text
+    "\u{F0219}"              // nf-md-text_box
+}
+
+/// Pick a padlock glyph based on the pass entry path.
+fn glyph_for_pass(name: &str) -> &'static str {
+    let lower = name.to_lowercase();
+    // Category hints from folder/entry name.
+    if lower.contains("ssh") || lower.contains("gpg") || lower.contains("key") {
+        "\u{F0306}"   // nf-md-key_variant
+    } else if lower.contains("bank") || lower.contains("finance") || lower.contains("credit") {
+        "\u{F024B}"   // nf-md-bank
+    } else if lower.contains("email") || lower.contains("mail") || lower.contains("smtp") {
+        "\u{F0E0}"    // nf-fa-envelope
+    } else if lower.contains("wifi") || lower.contains("network") || lower.contains("vpn") {
+        "\u{F0A72}"   // nf-md-lock_check  (network cred)
+    } else if lower.contains("github") || lower.contains("gitlab") || lower.contains("git") {
+        "\u{F0A70}"   // nf-md-source_repository_multiple → use lock + git feel
+    } else if lower.contains("work") || lower.contains("corp") || lower.contains("office") {
+        "\u{F0A75}"   // nf-md-briefcase_lock
+    } else if name.contains('/') {
+        "\u{F023}"    // nf-fa-lock  (nested entry — standard padlock)
+    } else {
+        "\u{F09C0}"   // nf-md-lock  (top-level entry — solid lock)
     }
 }
 
