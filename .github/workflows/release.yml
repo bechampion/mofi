@@ -1,0 +1,113 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            artifact: mofi-aarch64-apple-darwin
+          - target: x86_64-apple-darwin
+            artifact: mofi-x86_64-apple-darwin
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename binary
+        run: |
+          cp target/${{ matrix.target }}/release/mofi ${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  release:
+    name: Create release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create universal binary note
+        run: |
+          echo "To create a universal binary from the two architecture builds:" > artifacts/README.txt
+          echo "  lipo -create -output mofi mofi-aarch64-apple-darwin mofi-x86_64-apple-darwin" >> artifacts/README.txt
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: mofi ${{ github.ref_name }}
+          body: |
+            ## mofi ${{ github.ref_name }}
+
+            ### Installation
+
+            Download the binary for your architecture, make it executable, and run `--install`:
+
+            ```bash
+            # Apple Silicon (M1/M2/M3)
+            curl -Lo mofi https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/mofi-aarch64-apple-darwin
+            chmod +x mofi
+            sudo mv mofi /usr/local/bin/mofi
+            mofi --install
+
+            # Intel
+            curl -Lo mofi https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/mofi-x86_64-apple-darwin
+            chmod +x mofi
+            sudo mv mofi /usr/local/bin/mofi
+            mofi --install
+            ```
+
+            ### Universal binary (local build)
+
+            ```bash
+            lipo -create -output mofi mofi-aarch64-apple-darwin mofi-x86_64-apple-darwin
+            chmod +x mofi
+            ```
+
+            ### What's new
+            See [CHANGELOG](https://github.com/${{ github.repository }}/blob/master/CHANGELOG.md) or the commit history for details.
+          files: |
+            artifacts/mofi-aarch64-apple-darwin/mofi-aarch64-apple-darwin
+            artifacts/mofi-x86_64-apple-darwin/mofi-x86_64-apple-darwin
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

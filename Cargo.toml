@@ -15,8 +15,10 @@ walkdir = "2"
 dirs = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
 signal-hook = "0.3"
 libc = "0.2"
+shellexpand = "3"
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSRunningApplication", "NSWorkspace"] }
 

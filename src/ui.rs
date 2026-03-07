@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use eframe::egui::{
     self, Color32, FontData, FontDefinitions, FontFamily, FontId, Key, Rounding, Stroke, Vec2,
@@ -12,11 +13,12 @@ use objc2_app_kit::{
 
 use crate::apps::discover_apps;
 use crate::clipboard::{load_history, start_poller, ClipboardEntry, ClipboardHistory};
+use crate::config::{config_path, theme_by_name, Config, Theme};
 use crate::launcher::{launch_app, paste_text, LaunchItem, Launcher};
 use crate::pass::discover_pass_entries;
 
-/// Capture the currently active (frontmost) app that is not us.
-/// Called right before we show the rofi window.
+// ── macOS helpers ─────────────────────────────────────────────────────────────
+
 fn capture_previous_app() -> Option<Retained<NSRunningApplication>> {
     let workspace = NSWorkspace::sharedWorkspace();
     let apps = workspace.runningApplications();
@@ -29,10 +31,11 @@ fn capture_previous_app() -> Option<Retained<NSRunningApplication>> {
     None
 }
 
-/// Restore focus to a previously captured app.
 fn restore_app_focus(app: &NSRunningApplication) {
     app.activateWithOptions(NSApplicationActivationOptions(0));
 }
+
+// ── Constants ─────────────────────────────────────────────────────────────────
 
 const MAPLE_MONO_REGULAR: &str = "/Users/jgarcia/Library/Fonts/MapleMono-NF-Regular.ttf";
 const MAPLE_MONO_MEDIUM: &str = "/Users/jgarcia/Library/Fonts/MapleMono-NF-Medium.ttf";
@@ -40,190 +43,118 @@ const ICON_SIZE: f32 = 24.0;
 const ROW_HEIGHT: f32 = 38.0;
 const MAX_VISIBLE_ROWS: usize = 7;
 
-// ── Kanagawa palette ────────────────────────────────────────────────────────
-#[allow(dead_code)]
+// ── Kanagawa palette (kept for per-item accent colors) ────────────────────────
 mod kana {
     use eframe::egui::Color32;
-
-    pub const fn hex(r: u8, g: u8, b: u8) -> Color32 {
-        Color32::from_rgb(r, g, b)
-    }
-
-    // Backgrounds
-    pub const SUMI_INK0: Color32 = hex(0x16, 0x16, 0x1D); // darkest bg
-    pub const SUMI_INK1: Color32 = hex(0x1F, 0x1F, 0x28); // default bg
-    pub const SUMI_INK2: Color32 = hex(0x2A, 0x2A, 0x37); // lighter bg
-    pub const SUMI_INK3: Color32 = hex(0x36, 0x36, 0x46); // cursorline
-    pub const SUMI_INK4: Color32 = hex(0x54, 0x54, 0x6D); // non-text / borders
-    pub const WAVE_BLUE1: Color32 = hex(0x22, 0x32, 0x49); // popup bg / visual selection
-    pub const WAVE_BLUE2: Color32 = hex(0x2D, 0x4F, 0x67); // popup selection / search
-
-    // Foregrounds
-    pub const FUJI_WHITE: Color32 = hex(0xDC, 0xD7, 0xBA); // default fg
-    pub const OLD_WHITE: Color32 = hex(0xC8, 0xC0, 0x93); // dim fg / statusline
-    pub const FUJI_GRAY: Color32 = hex(0x72, 0x71, 0x69); // comments
-    pub const SPRING_VIOLET1: Color32 = hex(0x93, 0x8A, 0xA9); // light fg
-    pub const ONI_VIOLET: Color32 = hex(0x95, 0x7F, 0xB8); // keywords
-    pub const CRYSTAL_BLUE: Color32 = hex(0x7E, 0x9C, 0xD8); // functions / titles
-    pub const SPRING_BLUE: Color32 = hex(0x7F, 0xB4, 0xCA); // specials
-    pub const WAVE_AQUA2: Color32 = hex(0x7A, 0xA8, 0x9F); // types
-    pub const SPRING_GREEN: Color32 = hex(0x98, 0xBB, 0x6C); // strings
-    pub const BOAT_YELLOW2: Color32 = hex(0xC0, 0xA3, 0x6E); // operators
-    pub const CARP_YELLOW: Color32 = hex(0xE6, 0xC3, 0x84); // identifiers
-    pub const SAKURA_PINK: Color32 = hex(0xD2, 0x7E, 0x99); // numbers
-    pub const WAVE_RED: Color32 = hex(0xE4, 0x68, 0x76); // builtins
-    pub const SURIMI_ORANGE: Color32 = hex(0xFF, 0xA0, 0x66); // constants
+    pub const fn hex(r: u8, g: u8, b: u8) -> Color32 { Color32::from_rgb(r, g, b) }
+    pub const CRYSTAL_BLUE:   Color32 = hex(0x7E, 0x9C, 0xD8);
+    pub const ONI_VIOLET:     Color32 = hex(0x95, 0x7F, 0xB8);
+    pub const SPRING_GREEN:   Color32 = hex(0x98, 0xBB, 0x6C);
+    pub const WAVE_AQUA2:     Color32 = hex(0x7A, 0xA8, 0x9F);
+    pub const SAKURA_PINK:    Color32 = hex(0xD2, 0x7E, 0x99);
+    pub const SURIMI_ORANGE:  Color32 = hex(0xFF, 0xA0, 0x66);
+    pub const CARP_YELLOW:    Color32 = hex(0xE6, 0xC3, 0x84);
+    pub const WAVE_RED:       Color32 = hex(0xE4, 0x68, 0x76);
+    pub const SPRING_BLUE:    Color32 = hex(0x7F, 0xB4, 0xCA);
+    pub const BOAT_YELLOW2:   Color32 = hex(0xC0, 0xA3, 0x6E);
 }
 
-// ── Nerd Font glyph lookup ───────────────────────────────────────────────────
+// ── Nerd Font glyph lookup ────────────────────────────────────────────────────
 
 fn glyph_for_item(item: &LaunchItem) -> &'static str {
     match item {
-        LaunchItem::Clip(_) => "\u{F328}",  // nf-fa-clipboard
-        LaunchItem::Pass(_) => "\u{F0756}", // nf-md-lock
-        LaunchItem::App(a) => glyph_for_app(&a.name),
+        LaunchItem::Clip(_) => "\u{F328}",
+        LaunchItem::Pass(_) => "\u{F0756}",
+        LaunchItem::App(a)  => glyph_for_app(&a.name),
     }
 }
 
 fn glyph_for_app(name: &str) -> &'static str {
     let n = name.to_lowercase();
-    if n.contains("safari") {
-        "\u{E748}" // nf-dev-safari
-    } else if n.contains("firefox") {
-        "\u{E745}" // nf-dev-firefox
-    } else if n.contains("chrome") || n.contains("chromium") {
-        "\u{E743}" // nf-dev-chrome
-    } else if n.contains("terminal")
-        || n.contains("iterm")
-        || n.contains("alacritty")
-        || n.contains("warp")
-        || n.contains("kitty")
-        || n.contains("ghostty")
-    {
-        "\u{EA85}" // nf-cod-terminal
-    } else if n.contains("code") || n.contains("vscode") || n.contains("cursor") {
-        "\u{E8DA}" // nf-dev-vscode
-    } else if n.contains("xcode") {
-        "\u{E8E8}" // nf-dev-xcode
-    } else if n.contains("sublime") {
-        "\u{E7AA}" // nf-dev-sublime
-    } else if n.contains("finder") {
-        "\u{F0036}" // nf-md-apple_finder
-    } else if n.contains("mail") {
-        "\u{F0E0}" // nf-fa-envelope
-    } else if n.contains("messages") {
-        "\u{F27A}" // nf-fa-message
-    } else if n.contains("calendar") {
-        "\u{F073}" // nf-fa-calendar
-    } else if n.contains("music") {
-        "\u{F001}" // nf-fa-music
-    } else if n.contains("spotify") {
-        "\u{F1BC}" // nf-fa-spotify
-    } else if n.contains("discord") {
-        "\u{F1FF}" // nf-fa-discord
-    } else if n.contains("slack") {
-        "\u{E8A4}" // nf-dev-slack
-    } else if n.contains("docker") {
-        "\u{E7B0}" // nf-dev-docker
-    } else if n.contains("github desktop") || n.contains("github") {
-        "\u{E709}" // nf-dev-github
-    } else if n.contains("figma") {
-        "\u{E7DA}" // nf-dev-figma
-    } else if n.contains("system preferences") || n.contains("system settings") {
-        "\u{EB52}" // nf-cod-settings
-    } else if n.contains("app store") {
-        "\u{F0BD}" // nf-fa-app_store
-    } else if n.contains("photos") {
-        "\u{F03E}" // nf-fa-image
-    } else if n.contains("notes") {
-        "\u{F249}" // nf-fa-sticky_note
-    } else if n.contains("maps") {
-        "\u{F279}" // nf-fa-map
-    } else if n.contains("calculator") {
-        "\u{F1EC}" // nf-fa-calculator
-    } else if n.contains("disk utility") {
-        "\u{F02CA}" // nf-md-harddisk
-    } else if n.contains("activity monitor") {
-        "\u{F0128}" // nf-md-chart_bar
-    } else if n.contains("time machine") {
-        "\u{F006F}" // nf-md-backup_restore
-    } else if n.contains("vlc") {
-        "\u{F057C}" // nf-md-vlc
-    } else if n.contains("steam") {
-        "\u{F1B6}" // nf-fa-steam
-    } else if n.contains("postman") {
-        "\u{E86B}" // nf-dev-postman
-    } else if n.contains("1password") || n.contains("onepassword") {
-        "\u{F0881}" // nf-md-onepassword
-    } else if n.contains("dropbox") {
-        "\u{E707}" // nf-dev-dropbox
-    } else {
-        "\u{F2D0}" // nf-fa-window-maximize (fallback)
-    }
+    if n.contains("safari")                                            { "\u{E748}" }
+    else if n.contains("firefox")                                      { "\u{E745}" }
+    else if n.contains("chrome") || n.contains("chromium")             { "\u{E743}" }
+    else if n.contains("terminal") || n.contains("iterm")
+         || n.contains("alacritty") || n.contains("warp")
+         || n.contains("kitty") || n.contains("ghostty")               { "\u{EA85}" }
+    else if n.contains("code") || n.contains("vscode")
+         || n.contains("cursor")                                        { "\u{E8DA}" }
+    else if n.contains("xcode")                                        { "\u{E8E8}" }
+    else if n.contains("sublime")                                      { "\u{E7AA}" }
+    else if n.contains("finder")                                       { "\u{F0036}" }
+    else if n.contains("mail")                                         { "\u{F0E0}" }
+    else if n.contains("messages")                                     { "\u{F27A}" }
+    else if n.contains("calendar")                                     { "\u{F073}" }
+    else if n.contains("music")                                        { "\u{F001}" }
+    else if n.contains("spotify")                                      { "\u{F1BC}" }
+    else if n.contains("discord")                                      { "\u{F1FF}" }
+    else if n.contains("slack")                                        { "\u{E8A4}" }
+    else if n.contains("docker")                                       { "\u{E7B0}" }
+    else if n.contains("github desktop") || n.contains("github")      { "\u{E709}" }
+    else if n.contains("figma")                                        { "\u{E7DA}" }
+    else if n.contains("system preferences")
+         || n.contains("system settings")                              { "\u{EB52}" }
+    else if n.contains("app store")                                    { "\u{F0BD}" }
+    else if n.contains("photos")                                       { "\u{F03E}" }
+    else if n.contains("notes")                                        { "\u{F249}" }
+    else if n.contains("maps")                                         { "\u{F279}" }
+    else if n.contains("calculator")                                   { "\u{F1EC}" }
+    else if n.contains("disk utility")                                 { "\u{F02CA}" }
+    else if n.contains("activity monitor")                             { "\u{F0128}" }
+    else if n.contains("time machine")                                 { "\u{F006F}" }
+    else if n.contains("vlc")                                          { "\u{F057C}" }
+    else if n.contains("steam")                                        { "\u{F1B6}" }
+    else if n.contains("postman")                                      { "\u{E86B}" }
+    else if n.contains("1password") || n.contains("onepassword")       { "\u{F0881}" }
+    else if n.contains("dropbox")                                      { "\u{E707}" }
+    else                                                               { "\u{F2D0}" }
 }
 
-// ── Glyph colour (accent per-item) ──────────────────────────────────────────
-
-fn glyph_color_for_item(item: &LaunchItem) -> Color32 {
+fn glyph_color_for_item(item: &LaunchItem, t: &Theme) -> Color32 {
     match item {
-        LaunchItem::Clip(_) => kana::SPRING_BLUE,
-        LaunchItem::Pass(_) => kana::SPRING_GREEN,
-        LaunchItem::App(a) => accent_for_name(&a.name),
+        LaunchItem::Clip(_) => t.accent2,
+        LaunchItem::Pass(_) => t.toast,
+        LaunchItem::App(a)  => accent_for_name(&a.name),
     }
 }
 
 fn accent_for_name(name: &str) -> Color32 {
     let accents = [
-        kana::CRYSTAL_BLUE,
-        kana::ONI_VIOLET,
-        kana::SPRING_GREEN,
-        kana::WAVE_AQUA2,
-        kana::SAKURA_PINK,
-        kana::SURIMI_ORANGE,
-        kana::CARP_YELLOW,
-        kana::WAVE_RED,
-        kana::SPRING_BLUE,
+        kana::CRYSTAL_BLUE, kana::ONI_VIOLET,    kana::SPRING_GREEN,
+        kana::WAVE_AQUA2,   kana::SAKURA_PINK,   kana::SURIMI_ORANGE,
+        kana::CARP_YELLOW,  kana::WAVE_RED,      kana::SPRING_BLUE,
         kana::BOAT_YELLOW2,
     ];
     let idx = name.bytes().next().unwrap_or(0) as usize % accents.len();
     accents[idx]
 }
 
-// ── Font loading ─────────────────────────────────────────────────────────────
+fn dim_color(c: Color32) -> Color32 {
+    Color32::from_rgba_unmultiplied(
+        (c.r() as u16 * 2 / 3) as u8,
+        (c.g() as u16 * 2 / 3) as u8,
+        (c.b() as u16 * 2 / 3) as u8,
+        255,
+    )
+}
+
+// ── Font loading ──────────────────────────────────────────────────────────────
 
 fn load_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
-
     if let Ok(bytes) = std::fs::read(MAPLE_MONO_REGULAR) {
-        fonts
-            .font_data
-            .insert("MapleMono".to_owned(), FontData::from_owned(bytes));
-        fonts
-            .families
-            .entry(FontFamily::Proportional)
-            .or_default()
-            .insert(0, "MapleMono".to_owned());
-        fonts
-            .families
-            .entry(FontFamily::Monospace)
-            .or_default()
-            .insert(0, "MapleMono".to_owned());
+        fonts.font_data.insert("MapleMono".to_owned(), FontData::from_owned(bytes));
+        fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "MapleMono".to_owned());
+        fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "MapleMono".to_owned());
     }
-
     if let Ok(bytes) = std::fs::read(MAPLE_MONO_MEDIUM) {
-        fonts
-            .font_data
-            .insert("MapleMonoMedium".to_owned(), FontData::from_owned(bytes));
-        fonts.families.insert(
-            FontFamily::Name("medium".into()),
-            vec!["MapleMonoMedium".to_owned()],
-        );
+        fonts.font_data.insert("MapleMonoMedium".to_owned(), FontData::from_owned(bytes));
+        fonts.families.insert(FontFamily::Name("medium".into()), vec!["MapleMonoMedium".to_owned()]);
     }
-
     ctx.set_fonts(fonts);
 }
 
-// ── Mode ─────────────────────────────────────────────────────────────────────
+// ── Mode ──────────────────────────────────────────────────────────────────────
 
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum Mode {
@@ -231,6 +162,10 @@ pub enum Mode {
     Clipboard,
     Pass,
     About,
+    /// Activated by `mofi --input`.
+    Input,
+    /// Activated by `mofi --themes` — same as Input but with live theme preview.
+    Themes,
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -243,21 +178,25 @@ pub struct RofiApp {
     launcher: Launcher,
     mode: Mode,
     should_close: bool,
-    /// Shared clipboard history — updated by background poller.
     clip_history: ClipboardHistory,
-    /// Feedback message shown briefly after copying a password ("Copied!").
     toast: Option<(String, std::time::Instant)>,
-    /// Frame counter — ignore focus loss until the window has had time to appear.
     frame_count: u32,
-    /// SIGUSR1 toggle flag — set by signal handler, polled each frame.
     toggle: Arc<AtomicBool>,
-    /// Whether the window is currently visible.
     visible: bool,
-    /// The app that was frontmost before we showed — restored on hide.
     prev_app: Option<Retained<NSRunningApplication>>,
-    /// IPC slot: when a Pass entry is selected, daemon puts the name here
-    /// for the client to pick up and decrypt.
     pending_entry: Arc<Mutex<Option<Option<String>>>>,
+    pending_input: Arc<Mutex<Option<Vec<String>>>>,
+    input_result: Arc<Mutex<Option<Option<String>>>>,
+    pending_input_is_themes: Arc<Mutex<bool>>,
+    input_items: Vec<String>,
+    input_filtered: Vec<usize>,
+    /// True when the current Input session is a theme picker (mofi --themes).
+    input_is_themes: bool,
+    /// Theme that was active when the themes picker opened (restored on Escape).
+    theme_before_preview: Option<Theme>,
+    // ── Theme hot-reload ──
+    theme: Theme,
+    config_mtime: Option<SystemTime>,
 }
 
 impl RofiApp {
@@ -265,10 +204,12 @@ impl RofiApp {
         cc: &eframe::CreationContext,
         toggle: Arc<AtomicBool>,
         pending_entry: Arc<Mutex<Option<Option<String>>>>,
+        pending_input: Arc<Mutex<Option<Vec<String>>>>,
+        input_result: Arc<Mutex<Option<Option<String>>>>,
+        pending_input_is_themes: Arc<Mutex<bool>>,
     ) -> Self {
         load_fonts(&cc.egui_ctx);
 
-        // Accessory policy: no Dock icon, no Cmd-Tab entry — pure background utility.
         unsafe {
             use objc2::MainThreadMarker;
             let mtm = MainThreadMarker::new_unchecked();
@@ -276,28 +217,20 @@ impl RofiApp {
             app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
         }
 
-        // ── Clipboard history ──
         let history = Arc::new(Mutex::new(load_history()));
         start_poller(Arc::clone(&history));
 
-        // ── Build initial item list ──
-        let mut all_items: Vec<LaunchItem> = discover_apps()
-            .into_iter()
-            .map(LaunchItem::App)
-            .collect();
-
+        let mut all_items: Vec<LaunchItem> = discover_apps().into_iter().map(LaunchItem::App).collect();
         {
             let lock = history.lock().unwrap();
-            for e in lock.iter().cloned() {
-                all_items.push(LaunchItem::Clip(e));
-            }
+            for e in lock.iter().cloned() { all_items.push(LaunchItem::Clip(e)); }
         }
-
-        for e in discover_pass_entries() {
-            all_items.push(LaunchItem::Pass(e));
-        }
+        for e in discover_pass_entries() { all_items.push(LaunchItem::Pass(e)); }
 
         let filtered: Vec<usize> = (0..all_items.len()).collect();
+        let cfg = Config::load();
+        let theme = theme_by_name(cfg.active_theme_name());
+        let config_mtime = std::fs::metadata(config_path()).ok().and_then(|m| m.modified().ok());
 
         let mut app = Self {
             query: String::new(),
@@ -314,55 +247,47 @@ impl RofiApp {
             visible: false,
             prev_app: None,
             pending_entry,
+            pending_input,
+            input_result,
+            pending_input_is_themes,
+            input_items: Vec::new(),
+            input_filtered: Vec::new(),
+            input_is_themes: false,
+            theme_before_preview: None,
+            theme,
+            config_mtime,
         };
-
         app.refilter(true);
         app
     }
 
-    /// Rebuild the Clip items from the shared history, keeping App and Pass items.
+    // ── Sync helpers ──────────────────────────────────────────────────────────
+
     fn sync_clipboard(&mut self) {
-        let current_clips: Vec<ClipboardEntry> = {
-            let lock = self.clip_history.lock().unwrap();
-            lock.clone()
-        };
-        self.items
-            .retain(|i| matches!(i, LaunchItem::App(_) | LaunchItem::Pass(_)));
-        for entry in current_clips {
-            self.items.push(LaunchItem::Clip(entry));
-        }
+        let clips: Vec<ClipboardEntry> = self.clip_history.lock().unwrap().clone();
+        self.items.retain(|i| matches!(i, LaunchItem::App(_) | LaunchItem::Pass(_)));
+        for e in clips { self.items.push(LaunchItem::Clip(e)); }
     }
 
-    /// Refresh the App items from the filesystem (picks up newly installed apps).
     fn sync_apps(&mut self) {
-        let new_apps: Vec<LaunchItem> = discover_apps()
-            .into_iter()
-            .map(LaunchItem::App)
-            .collect();
+        let new_apps: Vec<LaunchItem> = discover_apps().into_iter().map(LaunchItem::App).collect();
         self.items.retain(|i| !matches!(i, LaunchItem::App(_)));
         self.items.extend(new_apps);
     }
 
     fn refilter(&mut self, reset_selection: bool) {
-        let mode_items: Vec<(usize, &LaunchItem)> = self
-            .items
-            .iter()
-            .enumerate()
+        let mode_items: Vec<(usize, &LaunchItem)> = self.items.iter().enumerate()
             .filter(|(_, item)| match self.mode {
-                Mode::Apps => matches!(item, LaunchItem::App(_)),
+                Mode::Apps      => matches!(item, LaunchItem::App(_)),
                 Mode::Clipboard => matches!(item, LaunchItem::Clip(_)),
-                Mode::Pass => matches!(item, LaunchItem::Pass(_)),
-                Mode::About => false,
+                Mode::Pass      => matches!(item, LaunchItem::Pass(_)),
+                Mode::About | Mode::Input | Mode::Themes => false,
             })
             .collect();
 
         let search_items: Vec<LaunchItem> = mode_items.iter().map(|(_, i)| (*i).clone()).collect();
-        let matched_local: Vec<usize> = self.launcher.search(&self.query, &search_items);
-
-        self.filtered = matched_local
-            .into_iter()
-            .map(|local_idx| mode_items[local_idx].0)
-            .collect();
+        let matched: Vec<usize> = self.launcher.search(&self.query, &search_items);
+        self.filtered = matched.into_iter().map(|li| mode_items[li].0).collect();
 
         if reset_selection {
             self.selected = 0;
@@ -371,21 +296,38 @@ impl RofiApp {
         }
     }
 
+    fn refilter_input(&mut self) {
+        if self.query.is_empty() {
+            self.input_filtered = (0..self.input_items.len()).collect();
+        } else {
+            let q = self.query.to_lowercase();
+            self.input_filtered = self.input_items.iter().enumerate()
+                .filter(|(_, s)| s.to_lowercase().contains(&q))
+                .map(|(i, _)| i)
+                .collect();
+        }
+        self.selected = 0;
+    }
+
     fn execute_selected(&mut self) {
+        if self.mode == Mode::Input || self.mode == Mode::Themes {
+            let result = self.input_filtered.get(self.selected)
+                .and_then(|&i| self.input_items.get(i))
+                .cloned();
+            // For themes mode, clear the preview backup — the chosen theme stays.
+            if self.mode == Mode::Themes {
+                self.theme_before_preview = None;
+            }
+            *self.input_result.lock().unwrap() = Some(result);
+            self.should_close = true;
+            return;
+        }
         if let Some(&idx) = self.filtered.get(self.selected) {
             match &self.items[idx] {
-                LaunchItem::App(app) => {
-                    launch_app(&app.path.clone());
-                    self.should_close = true;
-                }
-                LaunchItem::Clip(entry) => {
-                    let text = entry.text.clone();
-                    paste_text(&text);
-                    self.should_close = true;
-                }
-                LaunchItem::Pass(entry) => {
-                    let name = entry.name.clone();
-                    *self.pending_entry.lock().unwrap() = Some(Some(name));
+                LaunchItem::App(app) => { launch_app(&app.path.clone()); self.should_close = true; }
+                LaunchItem::Clip(e)  => { paste_text(&e.text.clone()); self.should_close = true; }
+                LaunchItem::Pass(e)  => {
+                    *self.pending_entry.lock().unwrap() = Some(Some(e.name.clone()));
                     self.should_close = true;
                 }
             }
@@ -393,91 +335,175 @@ impl RofiApp {
     }
 
     fn restore_focus(&mut self) {
-        if let Some(app) = self.prev_app.take() {
-            restore_app_focus(&app);
-        }
+        if let Some(app) = self.prev_app.take() { restore_app_focus(&app); }
     }
 
     fn hide(&mut self, ctx: &egui::Context) {
         self.visible = false;
         self.should_close = false;
         self.query.clear();
-        self.mode = Mode::Apps;
         self.frame_count = 0;
         self.toast = None;
-        self.refilter(true);
-        // If dismissed without selecting a pass entry, unblock the waiting client.
-        let mut lock = self.pending_entry.lock().unwrap();
-        if lock.is_none() {
-            *lock = Some(None);
+        // If we were in themes mode and the user cancelled, restore original theme.
+        if let Some(original) = self.theme_before_preview.take() {
+            self.theme = original;
         }
-        drop(lock);
+        self.input_is_themes = false;
+        self.mode = Mode::Apps;
+        self.refilter(true);
+        { let mut l = self.pending_entry.lock().unwrap(); if l.is_none() { *l = Some(None); } }
+        {
+            let mut l = self.input_result.lock().unwrap();
+            if l.is_none() && !self.input_items.is_empty() { *l = Some(None); }
+        }
+        self.input_items.clear();
+        self.input_filtered.clear();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         self.restore_focus();
     }
+
+    /// Switch into themes mode inline (no IPC — used when clicking the Themes tab directly).
+    fn enter_themes_mode(&mut self) {
+        use crate::config::{Config, THEME_NAMES};
+        let active = Config::load().active_theme_name().to_string();
+        self.input_items = THEME_NAMES.iter().map(|&name| {
+            if name == active { format!("* {}", name) } else { name.to_string() }
+        }).collect();
+        self.input_is_themes = true;
+        self.theme_before_preview = Some(self.theme.clone());
+        self.mode = Mode::Themes;
+        self.query.clear();
+        // Pre-select the active theme.
+        self.selected = self.input_items.iter()
+            .position(|s| s.starts_with("* "))
+            .unwrap_or(0);
+        self.refilter_input();
+    }
+
+    /// Poll config file mtime and reload theme if it changed.
+    fn maybe_reload_theme(&mut self) {
+        let mtime = std::fs::metadata(config_path()).ok().and_then(|m| m.modified().ok());
+        if mtime != self.config_mtime {
+            self.config_mtime = mtime;
+            let cfg = Config::load();
+            self.theme = theme_by_name(cfg.active_theme_name());
+        }
+    }
+
+    /// In themes mode: instantly apply the theme at the current selection as a preview.
+    fn preview_theme_at_selection(&mut self) {
+        if let Some(&item_idx) = self.input_filtered.get(self.selected) {
+            if let Some(raw) = self.input_items.get(item_idx) {
+                let name = raw.trim_start_matches("* ");
+                self.theme = crate::config::theme_by_name(name);
+            }
+        }
+    }
 }
 
-// ── eframe::App impl ─────────────────────────────────────────────────────────
+// ── eframe::App ───────────────────────────────────────────────────────────────
 
 impl eframe::App for RofiApp {
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+    fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
         egui::Rgba::TRANSPARENT.to_array()
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Hot-reload theme when config file changes (only when not in themes mode).
+        if !self.input_is_themes {
+            self.maybe_reload_theme();
+        }
+
         // ── SIGUSR1 toggle ────────────────────────────────────────────────────
         if self.toggle.swap(false, Ordering::Relaxed) {
             self.visible = !self.visible;
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(self.visible));
             if self.visible {
-                // Capture the frontmost app before we steal focus.
                 self.prev_app = capture_previous_app();
-                // Reset state every time the window is shown.
                 self.query.clear();
-                self.mode = Mode::Apps;
                 self.frame_count = 0;
                 self.toast = None;
-                // Refresh app list on every show.
-                self.sync_apps();
-                self.refilter(true);
+
+                let new_items = self.pending_input.lock().unwrap().take();
+                let is_themes = *self.pending_input_is_themes.lock().unwrap();
+                if let Some(items) = new_items {
+                    self.input_items = items;
+                    self.input_is_themes = is_themes;
+                    if is_themes {
+                        self.theme_before_preview = Some(self.theme.clone());
+                        self.mode = Mode::Themes;
+                        // Pre-select the currently active theme.
+                        let active = self.theme.name;
+                        if let Some(pos) = self.input_items.iter().position(|s| {
+                            s.trim_start_matches("* ") == active
+                        }) {
+                            self.selected = pos;
+                        } else {
+                            self.selected = 0;
+                        }
+                    } else {
+                        self.mode = Mode::Input;
+                        self.selected = 0;
+                    }
+                    self.refilter_input();
+                } else {
+                    self.input_is_themes = false;
+                    self.mode = Mode::Apps;
+                    self.sync_apps();
+                    self.refilter(true);
+                }
+                // Reset themes flag for next invocation.
+                *self.pending_input_is_themes.lock().unwrap() = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             } else {
                 self.restore_focus();
             }
         }
 
-        // Keep polling for the signal even when hidden.
+        if self.visible && self.mode != Mode::Input && self.mode != Mode::Themes {
+            let new_items = self.pending_input.lock().unwrap().take();
+            if let Some(items) = new_items {
+                let is_themes = *self.pending_input_is_themes.lock().unwrap();
+                self.input_items = items;
+                self.input_is_themes = is_themes;
+                if is_themes {
+                    self.theme_before_preview = Some(self.theme.clone());
+                    self.mode = Mode::Themes;
+                    let active = self.theme.name;
+                    if let Some(pos) = self.input_items.iter().position(|s| {
+                        s.trim_start_matches("* ") == active
+                    }) {
+                        self.selected = pos;
+                    } else {
+                        self.selected = 0;
+                    }
+                } else {
+                    self.mode = Mode::Input;
+                    self.selected = 0;
+                }
+                self.query.clear();
+                self.refilter_input();
+                *self.pending_input_is_themes.lock().unwrap() = false;
+            }
+        }
+
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        if !self.visible { return; }
 
-        if !self.visible {
-            return;
-        }
-
-        if self.should_close {
-            self.hide(ctx);
-            return;
-        }
+        if self.should_close { self.hide(ctx); return; }
 
         self.frame_count = self.frame_count.saturating_add(1);
 
-        if ctx.input(|i| i.key_pressed(Key::Escape)) {
-            self.hide(ctx);
-            return;
-        }
+        // ── Global key handling — MUST happen before any widget rendering ─────
+        // Escape / Cmd+R: hide.
+        if ctx.input(|i| i.key_pressed(Key::Escape)) { self.hide(ctx); return; }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::R)) { self.hide(ctx); return; }
+        if self.frame_count > 5 && !ctx.input(|i| i.focused) { self.hide(ctx); return; }
 
-        // Cmd+R toggles the launcher — pressing it again hides.
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::R)) {
-            self.hide(ctx);
-            return;
-        }
+        // Consume Ctrl+J / Ctrl+K here — before TextEdit steals them.
+        let ctrl_j = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::J));
+        let ctrl_k = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::K));
 
-        // Focus loss: hide and restore previous app.
-        if self.frame_count > 5 && !ctx.input(|i| i.focused) {
-            self.hide(ctx);
-            return;
-        }
-
-        // Sync clipboard live while in clipboard mode.
         if self.mode == Mode::Clipboard {
             self.sync_clipboard();
             self.refilter(false);
@@ -488,74 +514,77 @@ impl eframe::App for RofiApp {
         style.visuals = egui::Visuals::dark();
         ctx.set_style(style);
 
+        // Snapshot theme for this frame (avoids borrow issues inside closures).
+        let t = self.theme.clone();
+
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
                 let panel_rect = ui.max_rect();
 
-                // Window background: sumiInk0 with slight transparency
                 ui.painter().rect_filled(
-                    panel_rect,
-                    Rounding::ZERO,
-                    Color32::from_rgba_unmultiplied(0x16, 0x16, 0x1D, 210),
+                    panel_rect, Rounding::ZERO,
+                    Color32::from_rgba_unmultiplied(t.bg.r(), t.bg.g(), t.bg.b(), t.bg_alpha),
                 );
-                // Border: sumiInk4
                 ui.painter().rect_stroke(
-                    panel_rect,
-                    Rounding::ZERO,
-                    Stroke::new(1.5, kana::SUMI_INK4),
+                    panel_rect, Rounding::ZERO,
+                    Stroke::new(1.5, t.border),
                 );
 
                 let inner = panel_rect.shrink2(Vec2::new(16.0, 14.0));
                 ui.allocate_ui_at_rect(inner, |ui| {
                     ui.vertical(|ui| {
-                        // ── Mode tabs ──────────────────────────────────────
+
+                        // ── Mode tabs ─────────────────────────────────────
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
-                            for (mode, label) in [
-                                (Mode::Apps, "Apps"),
+
+                            let normal_tabs: &[(Mode, &str)] = &[
+                                (Mode::Apps,      "Apps"),
                                 (Mode::Clipboard, "Clipboard"),
-                                (Mode::Pass, "Pass"),
-                                (Mode::About, "About"),
-                            ] {
+                                (Mode::Pass,      "Pass"),
+                                (Mode::Themes,    "\u{F53F}  Themes"),
+                                (Mode::About,     "About"),
+                            ];
+                            // \u{F53F} = nf-md-palette (󰔿) — theme/palette icon
+                            let input_tab:  &[(Mode, &str)] = &[(Mode::Input,  "Input")];
+                            let themes_tab: &[(Mode, &str)] = &[(Mode::Themes, "\u{F53F}  Themes")];
+                            let tabs = match self.mode {
+                                Mode::Input  => input_tab,
+                                // Themes tab is now also in normal_tabs, so just fall through.
+                                _            => normal_tabs,
+                            };
+                            let _ = themes_tab; // suppress unused warning
+
+                            for &(mode, label) in tabs {
                                 let selected = self.mode == mode;
                                 let btn = egui::Button::new(
                                     egui::RichText::new(label)
                                         .font(FontId::new(10.0, FontFamily::Monospace))
-                                        .color(if selected {
-                                            kana::CRYSTAL_BLUE
-                                        } else {
-                                            kana::FUJI_GRAY
-                                        }),
+                                        .color(if selected { t.accent } else { t.fg_muted }),
                                 )
-                                .fill(if selected {
-                                    kana::WAVE_BLUE1
-                                } else {
-                                    Color32::TRANSPARENT
-                                })
-                                .stroke(if selected {
-                                    Stroke::new(1.0, kana::SUMI_INK4)
-                                } else {
-                                    Stroke::NONE
-                                })
+                                .fill(if selected { t.tab_active_bg } else { Color32::TRANSPARENT })
+                                .stroke(if selected { Stroke::new(1.0, t.border) } else { Stroke::NONE })
                                 .rounding(Rounding::ZERO);
 
-                                if ui.add(btn).clicked() {
-                                    self.mode = mode;
-                                    self.query.clear();
-                                    if mode == Mode::Clipboard {
-                                        self.sync_clipboard();
+                                let resp = ui.add(btn);
+                                if resp.clicked() && mode != Mode::Input {
+                                    if mode == Mode::Themes {
+                                        self.enter_themes_mode();
+                                    } else {
+                                        self.mode = mode;
+                                        self.query.clear();
+                                        if mode == Mode::Clipboard { self.sync_clipboard(); }
+                                        self.refilter(true);
                                     }
-                                    self.refilter(true);
                                 }
                             }
 
-                            // "Mofi" label pushed to the right.
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 ui.label(
                                     egui::RichText::new("Mofi")
                                         .font(FontId::new(11.0, FontFamily::Name("medium".into())))
-                                        .color(kana::SUMI_INK4),
+                                        .color(t.brand),
                                 );
                             });
                         });
@@ -563,266 +592,258 @@ impl eframe::App for RofiApp {
                         ui.add_space(10.0);
 
                         // ── Search bar ────────────────────────────────────
-                        // Consume C-j / C-k before TextEdit sees them.
-                        let ctrl_j = ctx.input_mut(|i| {
-                            i.consume_key(egui::Modifiers::CTRL, Key::J)
-                        });
-                        let ctrl_k = ctx.input_mut(|i| {
-                            i.consume_key(egui::Modifiers::CTRL, Key::K)
-                        });
-
                         let hint = match self.mode {
-                            Mode::Apps => "Search apps…",
+                            Mode::Apps      => "Search apps…",
                             Mode::Clipboard => "Filter clipboard…",
-                            Mode::Pass => "Search passwords…",
-                            Mode::About => "",
+                            Mode::Pass      => "Search passwords…",
+                            Mode::Input     => "Filter…",
+                            Mode::Themes    => "Filter themes…",
+                            Mode::About     => "",
                         };
 
                         let response = ui.add(
                             egui::TextEdit::singleline(&mut self.query)
-                                .hint_text(egui::RichText::new(hint).color(kana::FUJI_GRAY))
+                                .hint_text(egui::RichText::new(hint).color(t.fg_muted))
                                 .font(FontId::new(15.0, FontFamily::Monospace))
-                                .text_color(kana::FUJI_WHITE)
+                                .text_color(t.fg)
                                 .frame(false)
                                 .desired_width(f32::INFINITY),
                         );
                         response.request_focus();
 
-                        // Keyboard navigation
-                        let down = ctx.input(|i| i.key_pressed(Key::ArrowDown)) || ctrl_j;
-                        let up = ctx.input(|i| i.key_pressed(Key::ArrowUp)) || ctrl_k;
-                        let tab = ctx.input(|i| i.key_pressed(Key::Tab));
+                        let down  = ctx.input(|i| i.key_pressed(Key::ArrowDown)) || ctrl_j;
+                        let up    = ctx.input(|i| i.key_pressed(Key::ArrowUp))   || ctrl_k;
+                        let tab   = ctx.input(|i| i.key_pressed(Key::Tab));
                         let enter = ctx.input(|i| i.key_pressed(Key::Enter));
 
-                        // Tab cycles through mode tabs.
-                        if tab {
-                            self.mode = match self.mode {
-                                Mode::Apps => Mode::Clipboard,
+                        if tab && self.mode != Mode::Input {
+                            let next = match self.mode {
+                                Mode::Apps      => Mode::Clipboard,
                                 Mode::Clipboard => Mode::Pass,
-                                Mode::Pass => Mode::About,
-                                Mode::About => Mode::Apps,
+                                Mode::Pass      => Mode::Themes,
+                                Mode::Themes    => Mode::About,
+                                Mode::About     => Mode::Apps,
+                                Mode::Input     => Mode::Input,
                             };
-                            self.query.clear();
-                            if self.mode == Mode::Clipboard {
-                                self.sync_clipboard();
+                            if next == Mode::Themes {
+                                self.enter_themes_mode();
+                            } else {
+                                self.mode = next;
+                                self.query.clear();
+                                if self.mode == Mode::Clipboard { self.sync_clipboard(); }
+                                self.refilter(true);
                             }
-                            self.refilter(true);
                         }
-                        if down && !self.filtered.is_empty() {
-                            self.selected = (self.selected + 1) % self.filtered.len();
+
+                        if self.mode == Mode::Input || self.mode == Mode::Themes {
+                            let len = self.input_filtered.len();
+                            if down && len > 0 {
+                                self.selected = (self.selected + 1) % len;
+                                if self.mode == Mode::Themes { self.preview_theme_at_selection(); }
+                            }
+                            if up && len > 0 {
+                                self.selected = self.selected.checked_sub(1).unwrap_or(len - 1);
+                                if self.mode == Mode::Themes { self.preview_theme_at_selection(); }
+                            }
+                        } else {
+                            let len = self.filtered.len();
+                            if down && len > 0 { self.selected = (self.selected + 1) % len; }
+                            if up   && len > 0 { self.selected = self.selected.checked_sub(1).unwrap_or(len - 1); }
                         }
-                        if up && !self.filtered.is_empty() {
-                            self.selected = self
-                                .selected
-                                .checked_sub(1)
-                                .unwrap_or(self.filtered.len() - 1);
-                        }
-                        if enter {
-                            self.execute_selected();
-                            return;
-                        }
+
+                        if enter { self.execute_selected(); return; }
                         if response.changed() {
-                            self.refilter(true);
+                            if self.mode == Mode::Input || self.mode == Mode::Themes {
+                                self.refilter_input();
+                                if self.mode == Mode::Themes { self.preview_theme_at_selection(); }
+                            } else {
+                                self.refilter(true);
+                            }
                         }
 
                         ui.add_space(6.0);
-
-                        // Separator
                         let sep_y = ui.cursor().top();
-                        ui.painter().hline(
-                            ui.max_rect().x_range(),
-                            sep_y,
-                            Stroke::new(1.0, kana::SUMI_INK3),
-                        );
+                        ui.painter().hline(ui.max_rect().x_range(), sep_y, Stroke::new(1.0, t.separator));
                         ui.add_space(6.0);
 
-                        // ── Results list / About panel ────────────────────
+                        // ── Panels ────────────────────────────────────────
                         let max_list_height = ROW_HEIGHT * MAX_VISIBLE_ROWS as f32;
 
                         if self.mode == Mode::About {
                             ui.add_space(18.0);
                             ui.vertical_centered(|ui| {
-                                ui.label(
-                                    egui::RichText::new("Mofi")
-                                        .font(FontId::new(22.0, FontFamily::Name("medium".into())))
-                                        .color(kana::CRYSTAL_BLUE),
-                                );
+                                ui.label(egui::RichText::new("Mofi")
+                                    .font(FontId::new(22.0, FontFamily::Name("medium".into())))
+                                    .color(t.accent));
                                 ui.add_space(4.0);
-                                ui.label(
-                                    egui::RichText::new("v0.1.0")
-                                        .font(FontId::new(10.0, FontFamily::Monospace))
-                                        .color(kana::FUJI_GRAY),
-                                );
+                                ui.label(egui::RichText::new("v0.1.0")
+                                    .font(FontId::new(10.0, FontFamily::Monospace))
+                                    .color(t.fg_muted));
                                 ui.add_space(14.0);
-                                ui.label(
-                                    egui::RichText::new("App launcher · Clipboard · Pass")
-                                        .font(FontId::new(11.0, FontFamily::Monospace))
-                                        .color(kana::OLD_WHITE),
-                                );
+                                ui.label(egui::RichText::new("App launcher · Clipboard · Pass")
+                                    .font(FontId::new(11.0, FontFamily::Monospace))
+                                    .color(t.fg_dim));
                                 ui.add_space(14.0);
-                                ui.label(
-                                    egui::RichText::new("\u{F09B}  github.com/bechampion/mofi") // nf-fa-github
-                                        .font(FontId::new(11.0, FontFamily::Monospace))
-                                        .color(kana::SPRING_VIOLET1),
-                                );
-                                ui.add_space(18.0);
-                                ui.label(
-                                    egui::RichText::new("Cmd+Space / Cmd+R  open · Esc  close · Tab  cycle tabs")
-                                        .font(FontId::new(9.0, FontFamily::Monospace))
-                                        .color(kana::FUJI_GRAY),
-                                );
+                                ui.label(egui::RichText::new("\u{F09B}  github.com/bechampion/mofi")
+                                    .font(FontId::new(11.0, FontFamily::Monospace))
+                                    .color(t.accent2));
+                                ui.add_space(14.0);
+                                ui.label(egui::RichText::new(
+                                        format!("Theme: {}", t.name))
+                                    .font(FontId::new(10.0, FontFamily::Monospace))
+                                    .color(t.fg_muted));
+                                ui.add_space(8.0);
+                                ui.label(egui::RichText::new(
+                                        "Cmd+Space / Cmd+R  open · Esc  close · Tab  cycle tabs")
+                                    .font(FontId::new(9.0, FontFamily::Monospace))
+                                    .color(t.fg_muted));
                             });
-                        } else {
-
-                        egui::ScrollArea::vertical()
-                            .max_height(max_list_height)
-                            .show(ui, |ui| {
+                        } else if self.mode == Mode::Input || self.mode == Mode::Themes {
+                            // ── Input / theme picker list ─────────────────
+                            egui::ScrollArea::vertical().max_height(max_list_height).show(ui, |ui| {
                                 ui.set_min_width(ui.available_width());
-
-                                if self.filtered.is_empty() {
+                                if self.input_filtered.is_empty() {
                                     ui.add_space(20.0);
                                     ui.centered_and_justified(|ui| {
-                                        ui.label(
-                                            egui::RichText::new("No results")
-                                                .font(FontId::new(11.0, FontFamily::Monospace))
-                                                .color(kana::FUJI_GRAY),
-                                        );
+                                        ui.label(egui::RichText::new("No results")
+                                            .font(FontId::new(11.0, FontFamily::Monospace))
+                                            .color(t.fg_muted));
                                     });
                                     return;
                                 }
-
-                                let available_width = ui.available_width();
-
-                                for (row_idx, &item_idx) in self.filtered.iter().enumerate() {
-                                    let is_selected = row_idx == self.selected;
-                                    let item = &self.items[item_idx];
-
-                                    let glyph = glyph_for_item(item);
-                                    let glyph_color = if is_selected {
-                                        glyph_color_for_item(item)
-                                    } else {
-                                        let c = glyph_color_for_item(item);
-                                        Color32::from_rgba_unmultiplied(
-                                            (c.r() as u16 * 2 / 3) as u8,
-                                            (c.g() as u16 * 2 / 3) as u8,
-                                            (c.b() as u16 * 2 / 3) as u8,
-                                            255,
-                                        )
-                                    };
-
-                                    let display = item.display_name();
-                                    let subtitle = item.subtitle();
-
-                                    let (row_rect, _) = ui.allocate_exact_size(
-                                        Vec2::new(available_width, ROW_HEIGHT),
-                                        egui::Sense::hover(),
-                                    );
-
-                                    if is_selected {
-                                        ui.scroll_to_rect(row_rect, None);
+                                let aw = ui.available_width();
+                                // Use palette icon for themes mode, list icon for input mode.
+                                let row_icon = if self.mode == Mode::Themes { "\u{F53F}" } else { "\u{F0CA}" };
+                                // Collect a snapshot so we don't hold a borrow on self.input_filtered
+                                // while potentially mutating self inside the loop.
+                                let rows: Vec<(usize, usize)> = self.input_filtered.iter()
+                                    .copied()
+                                    .enumerate()
+                                    .collect();
+                                for (row_idx, item_idx) in rows {
+                                    let sel = row_idx == self.selected;
+                                    let text = self.input_items[item_idx].clone();
+                                    let (rr, _) = ui.allocate_exact_size(Vec2::new(aw, ROW_HEIGHT), egui::Sense::hover());
+                                    if sel { ui.scroll_to_rect(rr, None); }
+                                    if sel {
+                                        ui.painter().rect_filled(rr, Rounding::ZERO, t.row_sel);
+                                        ui.painter().rect_filled(
+                                            egui::Rect::from_min_size(egui::pos2(rr.left(), rr.top() + 4.0), Vec2::new(3.0, rr.height() - 8.0)),
+                                            Rounding::ZERO, t.accent,
+                                        );
+                                    } else if ui.rect_contains_pointer(rr) {
+                                        ui.painter().rect_filled(rr, Rounding::ZERO, t.row_hover);
                                     }
-
-                                    // Row background
-                                    if is_selected {
-                                        ui.painter().rect_filled(
-                                            row_rect,
-                                            Rounding::ZERO,
-                                            kana::WAVE_BLUE2,
-                                        );
-                                        let bar = egui::Rect::from_min_size(
-                                            egui::pos2(
-                                                row_rect.left(),
-                                                row_rect.top() + 4.0,
-                                            ),
-                                            Vec2::new(3.0, row_rect.height() - 8.0),
-                                        );
-                                        ui.painter().rect_filled(
-                                            bar,
-                                            Rounding::ZERO,
-                                            kana::CRYSTAL_BLUE,
-                                        );
-                                    } else if ui.rect_contains_pointer(row_rect) {
-                                        ui.painter().rect_filled(
-                                            row_rect,
-                                            Rounding::ZERO,
-                                            kana::SUMI_INK2,
-                                        );
-                                    }
-
-                                    // ── Glyph icon ──
-                                    let icon_x = row_rect.left() + 14.0;
-                                    let icon_center = egui::pos2(
-                                        icon_x + ICON_SIZE / 2.0,
-                                        row_rect.center().y,
+                                    let ix = rr.left() + 14.0;
+                                    ui.painter().text(
+                                        egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
+                                        egui::Align2::CENTER_CENTER,
+                                        row_icon,
+                                        FontId::new(ICON_SIZE * 0.75, FontFamily::Monospace),
+                                        if sel { t.icon_sel } else { t.icon_dim },
                                     );
                                     ui.painter().text(
-                                        icon_center,
+                                        egui::pos2(ix + ICON_SIZE + 12.0, rr.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        &text,
+                                        FontId::new(12.0, FontFamily::Name("medium".into())),
+                                        if sel { t.fg } else { t.fg_dim },
+                                    );
+                                    let click = ui.interact(rr, egui::Id::new(("input_row", row_idx)), egui::Sense::click());
+                                    if click.hovered() {
+                                        if self.mode == Mode::Themes && self.selected != row_idx {
+                                            self.selected = row_idx;
+                                            self.preview_theme_at_selection();
+                                        } else {
+                                            self.selected = row_idx;
+                                        }
+                                    }
+                                    if click.double_clicked() { self.selected = row_idx; self.execute_selected(); return; }
+                                }
+                            });
+                        } else {
+                            // ── Normal results list ───────────────────────
+                            egui::ScrollArea::vertical().max_height(max_list_height).show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                if self.filtered.is_empty() {
+                                    ui.add_space(20.0);
+                                    ui.centered_and_justified(|ui| {
+                                        ui.label(egui::RichText::new("No results")
+                                            .font(FontId::new(11.0, FontFamily::Monospace))
+                                            .color(t.fg_muted));
+                                    });
+                                    return;
+                                }
+                                let aw = ui.available_width();
+                                for (row_idx, &item_idx) in self.filtered.iter().enumerate() {
+                                    let sel = row_idx == self.selected;
+                                    let item = &self.items[item_idx];
+                                    let glyph = glyph_for_item(item);
+                                    let gc = glyph_color_for_item(item, &t);
+                                    let gc = if sel { gc } else { dim_color(gc) };
+                                    let display  = item.display_name();
+                                    let subtitle = item.subtitle();
+
+                                    let (rr, _) = ui.allocate_exact_size(Vec2::new(aw, ROW_HEIGHT), egui::Sense::hover());
+                                    if sel { ui.scroll_to_rect(rr, None); }
+
+                                    if sel {
+                                        ui.painter().rect_filled(rr, Rounding::ZERO, t.row_sel);
+                                        ui.painter().rect_filled(
+                                            egui::Rect::from_min_size(egui::pos2(rr.left(), rr.top() + 4.0), Vec2::new(3.0, rr.height() - 8.0)),
+                                            Rounding::ZERO, t.accent,
+                                        );
+                                    } else if ui.rect_contains_pointer(rr) {
+                                        ui.painter().rect_filled(rr, Rounding::ZERO, t.row_hover);
+                                    }
+
+                                    let ix = rr.left() + 14.0;
+                                    ui.painter().text(
+                                        egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
                                         egui::Align2::CENTER_CENTER,
                                         glyph,
                                         FontId::new(ICON_SIZE * 0.75, FontFamily::Monospace),
-                                        glyph_color,
+                                        gc,
                                     );
 
-                                    // ── Text ──
-                                    let text_x = icon_x + ICON_SIZE + 12.0;
-
+                                    let tx = ix + ICON_SIZE + 12.0;
                                     if let Some(sub) = subtitle {
-                                        let name_y = row_rect.center().y - 7.0;
-                                        let sub_y = row_rect.center().y + 7.0;
                                         ui.painter().text(
-                                            egui::pos2(text_x, name_y),
-                                            egui::Align2::LEFT_CENTER,
-                                            &display,
+                                            egui::pos2(tx, rr.center().y - 7.0),
+                                            egui::Align2::LEFT_CENTER, &display,
                                             FontId::new(12.0, FontFamily::Name("medium".into())),
-                                            if is_selected { kana::FUJI_WHITE } else { kana::OLD_WHITE },
+                                            if sel { t.fg } else { t.fg_dim },
                                         );
                                         ui.painter().text(
-                                            egui::pos2(text_x, sub_y),
-                                            egui::Align2::LEFT_CENTER,
-                                            &sub,
+                                            egui::pos2(tx, rr.center().y + 7.0),
+                                            egui::Align2::LEFT_CENTER, &sub,
                                             FontId::new(9.0, FontFamily::Monospace),
-                                            if is_selected { kana::SPRING_VIOLET1 } else { kana::FUJI_GRAY },
+                                            if sel { t.accent2 } else { t.fg_muted },
                                         );
                                     } else {
                                         ui.painter().text(
-                                            egui::pos2(text_x, row_rect.center().y),
-                                            egui::Align2::LEFT_CENTER,
-                                            &display,
+                                            egui::pos2(tx, rr.center().y),
+                                            egui::Align2::LEFT_CENTER, &display,
                                             FontId::new(12.0, FontFamily::Name("medium".into())),
-                                            if is_selected { kana::FUJI_WHITE } else { kana::OLD_WHITE },
+                                            if sel { t.fg } else { t.fg_dim },
                                         );
                                     }
 
-                                    // ── Click interaction ──
-                                    let click = ui.interact(
-                                        row_rect,
-                                        egui::Id::new(("row", row_idx)),
-                                        egui::Sense::click(),
-                                    );
-                                    if click.hovered() {
-                                        self.selected = row_idx;
-                                    }
-                                    if click.double_clicked() {
-                                        self.selected = row_idx;
-                                        self.execute_selected();
-                                        return;
-                                    }
+                                    let click = ui.interact(rr, egui::Id::new(("row", row_idx)), egui::Sense::click());
+                                    if click.hovered() { self.selected = row_idx; }
+                                    if click.double_clicked() { self.selected = row_idx; self.execute_selected(); return; }
                                 }
                             });
-
-                        } // end else (not About mode)
+                        }
 
                         // ── Toast ─────────────────────────────────────────
                         if let Some((msg, since)) = &self.toast {
-                            let elapsed = since.elapsed().as_secs_f32();
-                            if elapsed < 1.5 {
+                            if since.elapsed().as_secs_f32() < 1.5 {
                                 ui.add_space(8.0);
                                 ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(msg.as_str())
-                                            .font(FontId::new(11.0, FontFamily::Monospace))
-                                            .color(kana::SPRING_GREEN),
-                                    );
+                                    ui.label(egui::RichText::new(msg.as_str())
+                                        .font(FontId::new(11.0, FontFamily::Monospace))
+                                        .color(t.toast));
                                 });
                                 ctx.request_repaint_after(std::time::Duration::from_millis(50));
                             } else {
