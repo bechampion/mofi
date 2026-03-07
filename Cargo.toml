@@ -1,0 +1,26 @@
+[package]
+name = "mofi"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mofi"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.27", features = ["default"] }
+egui = "0.27"
+fuzzy-matcher = "0.3"
+walkdir = "2"
+dirs = "5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+signal-hook = "0.3"
+libc = "0.2"
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSRunningApplication", "NSWorkspace"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
