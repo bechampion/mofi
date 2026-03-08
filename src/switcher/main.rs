@@ -1,11 +1,12 @@
-/// mofisw — Option+Tab window switcher for macOS.
+/// mofisw — Option+Tab / Cmd+Tab window switcher for macOS.
 ///
-/// Hold Option and press Tab to cycle through windows.
-/// Release Option to activate the selected window and dismiss.
+/// Hold Option (or Cmd) and press Tab to cycle through windows forward.
+/// Hold Option (or Cmd) and press Shift+Tab to cycle backwards.
+/// Release the modifier to activate the selected window and dismiss.
 ///
-/// On the first Option+Tab press the overlay appears with the previously
-/// focused window pre-selected.  Release Option immediately to quick-swap
-/// back to it, or keep pressing Tab to cycle through all windows.
+/// On the first press the overlay appears with the previously focused window
+/// pre-selected.  Release the modifier immediately to quick-swap back to it,
+/// or keep pressing Tab to cycle through all windows.
 ///
 /// Requires Accessibility permission (System Settings → Privacy → Accessibility).
 use std::collections::{HashMap, VecDeque};
@@ -57,6 +58,8 @@ mod ffi {
     pub const kCGEventFlagsChanged:        CGEventType = 12;
     pub const kCGKeyboardEventKeycode:     CGEventField = 9;
     pub const kCGEventFlagMaskAlternate:   CGEventFlags = 0x00080000;
+    pub const kCGEventFlagMaskCommand:     CGEventFlags = 0x00100000;
+    pub const kCGEventFlagMaskShift:       CGEventFlags = 0x00020000;
 
     pub const kCFNumberSInt32Type: CFNumberType = 3;
     pub const kCFNumberSInt64Type: CFNumberType = 4;
@@ -178,11 +181,13 @@ mod ffi {
 
 #[derive(Clone, PartialEq)]
 enum KeyMsg {
-    /// Option+Tab pressed — carries a Z-order snapshot taken at tap time,
-    /// before mofisw gains focus and pollutes the window list.
-    TabPressed(Vec<WinEntry>),
+    /// Option+Tab or Cmd+Tab pressed — carries a snapshot taken at tap time.
+    /// `reverse` is true when Shift was held (cycle backwards).
+    TabPressed { windows: Vec<WinEntry>, reverse: bool },
     /// Option key released — commit and dismiss
     OptionReleased,
+    /// Cmd key released — commit and dismiss
+    CmdReleased,
 }
 
 // ── Focus history ─────────────────────────────────────────────────────────────
@@ -270,6 +275,7 @@ fn start_focus_tracker(history: FocusHistory) {
 struct TapContext {
     tx:          std::sync::mpsc::Sender<KeyMsg>,
     option_down: bool,
+    cmd_down:    bool,
     /// Shared with the UI thread so it can read live Option key state.
     option_down_shared: Arc<AtomicBool>,
 }
@@ -285,6 +291,8 @@ unsafe extern "C" fn event_tap_callback(
     match event_type {
         ffi::kCGEventFlagsChanged => {
             let flags = unsafe { ffi::CGEventGetFlags(event) };
+
+            // ── Option ────────────────────────────────────────────────────────
             let alt_now = (flags & ffi::kCGEventFlagMaskAlternate) != 0;
             if !alt_now && ctx.option_down {
                 ctx.option_down = false;
@@ -294,21 +302,37 @@ unsafe extern "C" fn event_tap_callback(
                 ctx.option_down = true;
                 ctx.option_down_shared.store(true, Ordering::Relaxed);
             }
+
+            // ── Cmd ───────────────────────────────────────────────────────────
+            let cmd_now = (flags & ffi::kCGEventFlagMaskCommand) != 0;
+            if !cmd_now && ctx.cmd_down {
+                ctx.cmd_down = false;
+                let _ = ctx.tx.send(KeyMsg::CmdReleased);
+            } else if cmd_now && !ctx.cmd_down {
+                ctx.cmd_down = true;
+            }
         }
         ffi::kCGEventKeyDown => {
+            let flags   = unsafe { ffi::CGEventGetFlags(event) };
             let keycode = unsafe {
                 ffi::CGEventGetIntegerValueField(event, ffi::kCGKeyboardEventKeycode)
             };
+            let shift = (flags & ffi::kCGEventFlagMaskShift) != 0;
+
             // 48 = kVK_Tab
-            if keycode == 48 && ctx.option_down {
-                // Capture the Z-order snapshot NOW — before mofisw gains focus
-                // and before update() runs.  This is the only moment where the
-                // window list accurately reflects what the user sees.
-                let snapshot = list_windows_raw();
-                let _ = ctx.tx.send(KeyMsg::TabPressed(snapshot));
-                // Swallow the event — return null so it never reaches the
-                // focused application.
-                return std::ptr::null_mut();
+            if keycode == 48 {
+                if ctx.option_down {
+                    // Option+Tab or Option+Shift+Tab
+                    let snapshot = list_windows_raw();
+                    let _ = ctx.tx.send(KeyMsg::TabPressed { windows: snapshot, reverse: shift });
+                    return std::ptr::null_mut(); // swallow
+                }
+                if ctx.cmd_down {
+                    // Cmd+Tab or Cmd+Shift+Tab — intercept the native app switcher
+                    let snapshot = list_windows_raw();
+                    let _ = ctx.tx.send(KeyMsg::TabPressed { windows: snapshot, reverse: shift });
+                    return std::ptr::null_mut(); // swallow
+                }
             }
         }
         _ => {}
@@ -327,7 +351,7 @@ fn check_accessibility() -> bool {
 // ── Start key listener (own thread + CFRunLoop) ───────────────────────────────
 
 fn start_key_listener(tx: std::sync::mpsc::Sender<KeyMsg>, option_down_shared: Arc<AtomicBool>) {
-    let ctx = Box::new(TapContext { tx, option_down: false, option_down_shared });
+    let ctx = Box::new(TapContext { tx, option_down: false, cmd_down: false, option_down_shared });
     // Store as usize so the closure is Send (raw pointers are not Send).
     let ctx_addr: usize = Box::into_raw(ctx) as usize;
 
@@ -860,23 +884,33 @@ impl eframe::App for SwitcherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let mut do_tab:   bool          = false;
         let mut tab_snap: Vec<WinEntry> = Vec::new();
+        let mut tab_rev:  bool          = false;
         let mut do_hide = false;
 
         while let Ok(msg) = self.msg_rx.try_recv() {
             match msg {
-                KeyMsg::TabPressed(snap) => { do_tab = true; tab_snap = snap; }
-                KeyMsg::OptionReleased   => do_hide = true,
+                KeyMsg::TabPressed { windows: snap, reverse } => {
+                    do_tab = true;
+                    tab_snap = snap;
+                    tab_rev = reverse;
+                }
+                KeyMsg::OptionReleased | KeyMsg::CmdReleased => do_hide = true,
             }
         }
 
         // ── Tab pressed ───────────────────────────────────────────────────────
         if do_tab {
             if self.visible.load(Ordering::Relaxed) {
-                // Overlay already showing — cycle to next window.
+                // Overlay already showing — cycle forward or backward.
                 let len = self.windows.lock().unwrap().len();
                 if len > 0 {
                     let cur = self.selected.load(Ordering::Relaxed);
-                    self.selected.store((cur + 1) % len, Ordering::Relaxed);
+                    let next = if tab_rev {
+                        (cur + len - 1) % len
+                    } else {
+                        (cur + 1) % len
+                    };
+                    self.selected.store(next, Ordering::Relaxed);
                 }
             } else {
                 // tab_snap was captured at tap time before mofisw touched focus.
@@ -908,16 +942,19 @@ impl eframe::App for SwitcherApp {
                 self.prev_pid.store(prev_pid, Ordering::Relaxed);
 
                 // Build display list ordered by focus recency.
-                let (wins, sel) = build_window_list(raw, &self.focus_history, current_wid);
+                let (wins, mut sel) = build_window_list(raw, &self.focus_history, current_wid);
+                // Reverse: pre-select the last window (the current is at end,
+                // so last-but-one is the "previous" in reverse direction).
+                if tab_rev && wins.len() > 1 {
+                    sel = wins.len() - 2;
+                }
                 let colors = build_window_colors(&wins);
                 *self.windows.lock().unwrap()    = wins;
                 *self.win_colors.lock().unwrap() = colors;
                 self.selected.store(sel, Ordering::Relaxed);
 
-                // If OptionReleased arrived in the same frame as TabPressed,
+                // If modifier released arrived in the same frame as TabPressed,
                 // it was an instant tap — silent swap, no overlay.
-                // Otherwise show the overlay and let the do_hide block handle
-                // dismissal when Option is eventually released.
                 if do_hide {
                     // Silent swap — jump straight to previously focused window.
                     if self.pending_prev_pid > 0 {
@@ -929,7 +966,7 @@ impl eframe::App for SwitcherApp {
                     // Mark do_hide consumed so the block below doesn't double-fire.
                     do_hide = false;
                 } else {
-                    // Option is still held — show the overlay.
+                    // Modifier is still held — show the overlay.
                     self.visible.store(true, Ordering::Relaxed);
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -937,7 +974,7 @@ impl eframe::App for SwitcherApp {
             }
         }
 
-        // ── Option released ───────────────────────────────────────────────────
+        // ── Modifier released — commit selection and hide ─────────────────────
         if do_hide {
             if self.visible.load(Ordering::Relaxed) {
                 // Overlay was shown — activate selected window.
