@@ -118,6 +118,14 @@ mod ffi {
             attribute: CFStringRef,
             value: *mut CFTypeRef,
         ) -> AXError;
+        pub fn AXUIElementPerformAction(
+            element: AXUIElementRef,
+            action: CFStringRef,
+        ) -> AXError;
+        pub fn AXUIElementGetPid(
+            element: AXUIElementRef,
+            pid: *mut i32,
+        ) -> AXError;
     }
 
     #[link(name = "CoreFoundation", kind = "framework")]
@@ -280,6 +288,7 @@ fn start_key_listener(tx: std::sync::mpsc::Sender<KeyMsg>, option_down_shared: A
 #[derive(Clone, Debug)]
 struct WinEntry {
     pid:       i32,
+    wid:       u32,   // CGWindowID — unique per window, used for rotation & raise
     app_name:  String,
     win_title: String,
 }
@@ -330,7 +339,6 @@ fn ax_window_titles(pid: i32) -> Vec<String> {
         let app_elem = ffi::AXUIElementCreateApplication(pid);
         if app_elem.is_null() { return vec![]; }
 
-        // kAXWindowsAttribute
         let attr_name = std::ffi::CString::new("AXWindows").unwrap();
         let cf_attr = ffi::CFStringCreateWithCString(
             std::ptr::null(),
@@ -391,6 +399,81 @@ fn ax_window_titles(pid: i32) -> Vec<String> {
     }
 }
 
+/// Raise and focus a specific window identified by its CGWindowID.
+/// Iterates the AX window list for `pid`, matches on kAXWindowIdentifier,
+/// calls AXRaise, then activates the app.
+fn raise_window(pid: i32, wid: u32) {
+    unsafe {
+        let app_elem = ffi::AXUIElementCreateApplication(pid);
+        if app_elem.is_null() { activate_pid(pid); return; }
+
+        let ax_windows_name = std::ffi::CString::new("AXWindows").unwrap();
+        let cf_windows_attr = ffi::CFStringCreateWithCString(
+            std::ptr::null(),
+            ax_windows_name.as_ptr() as *const _,
+            ffi::kCFStringEncodingUTF8,
+        );
+        let mut windows_val: ffi::CFTypeRef = std::ptr::null();
+        let err = ffi::AXUIElementCopyAttributeValue(app_elem, cf_windows_attr, &mut windows_val);
+        ffi::CFRelease(cf_windows_attr);
+
+        if err != ffi::kAXErrorSuccess || windows_val.is_null() {
+            ffi::CFRelease(app_elem as ffi::CFTypeRef);
+            activate_pid(pid);
+            return;
+        }
+
+        let cf_wid_attr = {
+            let s = std::ffi::CString::new("AXWindowIdentifier").unwrap();
+            ffi::CFStringCreateWithCString(std::ptr::null(), s.as_ptr() as *const _, ffi::kCFStringEncodingUTF8)
+        };
+        let cf_raise_action = {
+            let s = std::ffi::CString::new("AXRaise").unwrap();
+            ffi::CFStringCreateWithCString(std::ptr::null(), s.as_ptr() as *const _, ffi::kCFStringEncodingUTF8)
+        };
+
+        let count = ffi::CFArrayGetCount(windows_val as ffi::CFArrayRef);
+        let mut raised = false;
+        for i in 0..count {
+            let win = ffi::CFArrayGetValueAtIndex(windows_val as ffi::CFArrayRef, i);
+            if win.is_null() { continue; }
+
+            // Read AXWindowIdentifier (a CFNumber == CGWindowID)
+            let mut id_val: ffi::CFTypeRef = std::ptr::null();
+            let e2 = ffi::AXUIElementCopyAttributeValue(
+                win as ffi::AXUIElementRef, cf_wid_attr, &mut id_val,
+            );
+            if e2 == ffi::kAXErrorSuccess && !id_val.is_null() {
+                if ffi::CFGetTypeID(id_val) == ffi::CFNumberGetTypeID() {
+                    let mut win_id: i32 = 0;
+                    ffi::CFNumberGetValue(
+                        id_val as ffi::CFNumberRef,
+                        ffi::kCFNumberSInt32Type,
+                        &mut win_id as *mut _ as *mut _,
+                    );
+                    ffi::CFRelease(id_val);
+                    if win_id as u32 == wid {
+                        ffi::AXUIElementPerformAction(win as ffi::AXUIElementRef, cf_raise_action);
+                        raised = true;
+                        break;
+                    }
+                } else {
+                    ffi::CFRelease(id_val);
+                }
+            }
+        }
+
+        ffi::CFRelease(cf_wid_attr);
+        ffi::CFRelease(cf_raise_action);
+        ffi::CFRelease(windows_val);
+        ffi::CFRelease(app_elem as ffi::CFTypeRef);
+
+        // Always activate the app regardless (brings it to front).
+        let _ = raised;
+        activate_pid(pid);
+    }
+}
+
 /// Returns the raw on-screen window list **without** rotation.
 /// Index 0 = currently focused window (CGWindowList Z-order).
 fn list_windows_raw() -> Vec<WinEntry> {
@@ -417,9 +500,10 @@ fn list_windows_raw() -> Vec<WinEntry> {
         let app_name = unsafe { dict_string(dict, "kCGWindowOwnerName") }.unwrap_or_default();
         if app_name.is_empty() { continue; }
 
+        let wid = unsafe { dict_i32(dict, "kCGWindowNumber") }.unwrap_or(0) as u32;
         let win_title = unsafe { dict_string(dict, "kCGWindowName") }.unwrap_or_default();
 
-        out.push(WinEntry { pid, app_name, win_title });
+        out.push(WinEntry { pid, wid, app_name, win_title });
     }
     unsafe { ffi::CFRelease(array) };
 
@@ -619,6 +703,8 @@ struct SwitcherApp {
     /// prev_pid captured at first Tab press for silent swap if Option was
     /// already released by the time update() runs.
     pending_prev_pid: i32,
+    /// wid (CGWindowID) counterpart to pending_prev_pid.
+    pending_prev_wid: u32,
 }
 
 impl eframe::App for SwitcherApp {
@@ -650,8 +736,10 @@ impl eframe::App for SwitcherApp {
                 // Capture window list once — raw[0] is current foreground window,
                 // raw[1] is previously focused (our silent-swap target).
                 let raw  = list_windows_raw();
-                let prev = raw.get(1).map(|e| e.pid).unwrap_or(0);
+                let prev     = raw.get(1).map(|e| e.pid).unwrap_or(0);
+                let prev_wid = raw.get(1).map(|e| e.wid).unwrap_or(0);
                 self.pending_prev_pid = prev;
+                self.pending_prev_wid = prev_wid;
                 self.prev_pid.store(prev, Ordering::Relaxed);
 
                 // Pass raw into build_window_list so it strips the current app
@@ -670,9 +758,10 @@ impl eframe::App for SwitcherApp {
                 } else {
                     // Option already released before update() ran — silent swap.
                     if self.pending_prev_pid > 0 {
-                        activate_pid(self.pending_prev_pid);
+                        raise_window(self.pending_prev_pid, self.pending_prev_wid);
                     }
                     self.pending_prev_pid = 0;
+                    self.pending_prev_wid = 0;
                 }
             }
         }
@@ -686,10 +775,11 @@ impl eframe::App for SwitcherApp {
                 let wins = self.windows.lock().unwrap().clone();
                 let sel  = self.selected.load(Ordering::Relaxed);
                 if let Some(e) = wins.get(sel) {
-                    activate_pid(e.pid);
+                    raise_window(e.pid, e.wid);
                 }
             }
             self.pending_prev_pid = 0;
+            self.pending_prev_wid = 0;
         }
 
         ctx.request_repaint_after(if self.visible.load(Ordering::Relaxed) {
@@ -859,17 +949,18 @@ fn main() -> eframe::Result<()> {
                 let app = NSApplication::sharedApplication(mtm);
                 app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
             }
-            Box::new(SwitcherApp {
-                visible,
-                selected,
-                windows,
-                win_colors,
-                msg_rx: rx,
-                colors: Colors::kanagawa(),
-                prev_pid,
-                option_down,
-                pending_prev_pid: 0,
-            })
+                Box::new(SwitcherApp {
+                    visible,
+                    selected,
+                    windows,
+                    win_colors,
+                    msg_rx: rx,
+                    colors: Colors::kanagawa(),
+                    prev_pid,
+                    option_down,
+                    pending_prev_pid: 0,
+                    pending_prev_wid: 0,
+                })
         }),
     )
 }
