@@ -7,10 +7,6 @@ edition = "2021"
 name = "mofi"
 path = "src/main.rs"
 
-[[bin]]
-name = "mofisw"
-path = "src/switcher/main.rs"
-
 [dependencies]
 eframe = { version = "0.27", features = ["default"] }
 egui = "0.27"
@@ -24,9 +20,10 @@ signal-hook = "0.3"
 libc = "0.2"
 shellexpand = "3"
 objc2 = "0.6.4"
-objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSRunningApplication", "NSWorkspace"] }
-core-foundation = "0.10"
-core-graphics = { version = "0.25", features = ["highsierra"] }
+objc2-foundation = { version = "0.3.2", features = ["NSString", "NSData"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSRunningApplication", "NSWorkspace", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSMenu", "NSMenuItem", "NSButton", "NSImage", "NSControl"] }
+ab_glyph = "0.2"
+png = "0.17"
 
 [profile.release]
 opt-level = 3

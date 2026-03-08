@@ -448,6 +448,181 @@ pub enum SocketMsg {
     InputItems(Vec<String>),
 }
 
+/// Render a square PNG icon — Kanagawa dark background, crystalBlue border,
+/// bold "M" in Maple Mono NF Bold — and return the raw PNG bytes.
+fn render_menubar_icon() -> Vec<u8> {
+    use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
+
+    // ── Kanagawa palette ─────────────────────────────────────────────────────
+    const BG:  [u8; 4] = [147,  96, 220, 255]; // oniViolet
+    const BRD: [u8; 4] = [147,  96, 220, 255]; // same as BG — no visible border
+    const FG:  [u8; 4] = [220, 215, 186, 255]; // fujiWhite
+
+    // ── Canvas: 22×22 pt @ 2× retina → 44×44 physical pixels ────────────────
+    const SIZE: usize = 44;
+
+    let mut buf = vec![0u8; SIZE * SIZE * 4];
+
+    // Fill background
+    for px in buf.chunks_exact_mut(4) {
+        px.copy_from_slice(&BG);
+    }
+
+    // Draw 1-px border on all four sides
+    for i in 0..SIZE {
+        let set = |buf: &mut Vec<u8>, x: usize, y: usize| {
+            let off = (y * SIZE + x) * 4;
+            buf[off..off + 4].copy_from_slice(&BRD);
+        };
+        set(&mut buf, i, 0);          // top
+        set(&mut buf, i, SIZE - 1);   // bottom
+        set(&mut buf, 0, i);          // left
+        set(&mut buf, SIZE - 1, i);   // right
+    }
+
+    // ── Load Maple Mono NF Bold ───────────────────────────────────────────────
+    let home = dirs::home_dir().unwrap();
+    let font_path = home.join("Library/Fonts/MapleMono-NF-Bold.ttf");
+    let font_bytes = match std::fs::read(&font_path) {
+        Ok(b) => b,
+        Err(_) => return encode_png(&buf, SIZE),
+    };
+    let font = match FontRef::try_from_slice(&font_bytes) {
+        Ok(f) => f,
+        Err(_) => return encode_png(&buf, SIZE),
+    };
+
+    // ── Render a single bold "M" centred in the square ───────────────────────
+    // Scale so the glyph body fills most of the 44-px square (inset 4 px each side).
+    let scale  = PxScale::from(34.0);
+    let scaled = font.as_scaled(scale);
+
+    let glyph_id = font.glyph_id('M');
+
+    // Centre horizontally and vertically
+    let glyph_w  = scaled.h_advance(glyph_id);
+    let ascent   = scaled.ascent();
+    let descent  = scaled.descent();
+    let glyph_h  = ascent - descent;
+
+    let origin_x = ((SIZE as f32 - glyph_w) / 2.0).round();
+    let origin_y = ((SIZE as f32 - glyph_h) / 2.0 + ascent).round();
+
+    let glyph = glyph_id.with_scale_and_position(scale, ab_glyph::point(origin_x, origin_y));
+
+    if let Some(outlined) = font.outline_glyph(glyph) {
+        let bounds = outlined.px_bounds();
+        outlined.draw(|gx, gy, cov| {
+            let px = bounds.min.x as i32 + gx as i32;
+            let py = bounds.min.y as i32 + gy as i32;
+            if px < 0 || py < 0 || px >= SIZE as i32 || py >= SIZE as i32 {
+                return;
+            }
+            let off = (py as usize * SIZE + px as usize) * 4;
+            let alpha = (cov * 255.0).round() as u32;
+            let inv   = 255 - alpha;
+            for i in 0..3 {
+                buf[off + i] = ((FG[i] as u32 * alpha + buf[off + i] as u32 * inv) / 255) as u8;
+            }
+            buf[off + 3] = 255;
+        });
+    }
+
+    encode_png(&buf, SIZE)
+}
+
+/// Encode a raw RGBA buffer to PNG bytes.
+fn encode_png(rgba: &[u8], size: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, size as u32, size as u32);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        if let Ok(mut writer) = enc.write_header() {
+            writer.write_image_data(rgba).ok();
+        }
+    }
+    out
+}
+
+// ── ObjC target for status-bar button click ───────────────────────────────────
+
+objc2::define_class!(
+    /// ObjC object that receives the "buttonClicked:" action from the status bar button.
+    #[unsafe(super(objc2::runtime::NSObject))]
+    #[name = "MofiStatusTarget"]
+    struct MofiStatusTarget;
+
+    impl MofiStatusTarget {
+        /// Called when the user clicks the menu-bar icon.
+        /// Sends `show:about\n` to the daemon socket and then signals SIGUSR1.
+        #[unsafe(method(buttonClicked:))]
+        fn button_clicked(&self, _sender: *mut objc2::runtime::AnyObject) {
+            use std::io::Write as _;
+
+            // 1. Send "show:about\n" to the daemon socket (fire-and-forget).
+            if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(SOCK_FILE) {
+                stream.write_all(b"show:about\n").ok();
+            }
+
+            // 2. Signal the daemon to wake up.
+            if let Ok(contents) = std::fs::read_to_string(PID_FILE) {
+                if let Ok(pid) = contents.trim().parse::<i32>() {
+                    unsafe { libc::kill(pid, libc::SIGUSR1) };
+                }
+            }
+        }
+    }
+);
+
+impl MofiStatusTarget {
+    fn new() -> objc2::rc::Retained<Self> {
+        use objc2::AnyThread as _;
+        let this = Self::alloc();
+        unsafe { objc2::msg_send![this, init] }
+    }
+}
+
+/// Create a persistent NSStatusItem with a custom rendered icon.
+/// Must be called on the main thread. The item is leaked intentionally.
+fn setup_status_bar() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSImage, NSStatusBar, NSVariableStatusItemLength};
+    use objc2_foundation::{NSData, NSSize};
+
+    let png_bytes = render_menubar_icon();
+
+    unsafe {
+        let mtm = MainThreadMarker::new_unchecked();
+
+        let bar  = NSStatusBar::systemStatusBar();
+        let item = bar.statusItemWithLength(NSVariableStatusItemLength);
+
+        // Build NSImage from PNG bytes
+        let ns_data = NSData::with_bytes(&png_bytes);
+        let alloc = <NSImage as objc2::AnyThread>::alloc();
+        if let Some(img) = NSImage::initWithData(alloc, &ns_data) {
+            // Tell AppKit this is a 2× (retina) image by setting its logical size
+            // to half the pixel size (22×22 pt from 44×44 px).
+            img.setSize(NSSize { width: 22.0, height: 22.0 });
+
+            if let Some(btn) = item.button(mtm) {
+                btn.setImage(Some(&img));
+
+                // Wire up the click handler.
+                let target = MofiStatusTarget::new();
+                btn.setTarget(Some(&*(objc2::rc::Retained::as_ptr(&target) as *const objc2::runtime::AnyObject)));
+                btn.setAction(Some(objc2::sel!(buttonClicked:)));
+                // Leak the target so it lives as long as the button.
+                let _ = objc2::rc::Retained::into_raw(target);
+            }
+        }
+
+        // Leak so the item stays alive forever.
+        let _ = objc2::rc::Retained::into_raw(item);
+    }
+}
+
 fn run_daemon() -> eframe::Result<()> {
     let pid = std::process::id();
     fs::write(PID_FILE, pid.to_string()).ok();
@@ -517,6 +692,8 @@ fn run_daemon() -> eframe::Result<()> {
         "mofi",
         options,
         Box::new(move |cc| {
+            // Create the status bar item on the main thread inside the eframe constructor.
+            setup_status_bar();
             Box::new(ui::RofiApp::new(
                 cc,
                 toggle,

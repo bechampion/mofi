@@ -551,6 +551,9 @@ impl eframe::App for RofiApp {
                             self.mode = Mode::Clipboard;
                             self.sync_clipboard();
                         }
+                        Some("about") => {
+                            self.mode = Mode::About;
+                        }
                         _ => {
                             self.mode = Mode::Apps;
                         }
