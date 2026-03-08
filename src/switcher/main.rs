@@ -1,11 +1,11 @@
-/// mofisw — Option+Tab / Cmd+Tab window switcher for macOS.
+/// mofisw — Option+Tab window switcher for macOS.
 ///
-/// Hold Option (or Cmd) and press Tab to cycle through windows forward.
-/// Hold Option (or Cmd) and press Shift+Tab to cycle backwards.
-/// Release the modifier to activate the selected window and dismiss.
+/// Hold Option and press Tab to cycle through windows forward.
+/// Hold Option and press Shift+Tab to cycle backwards.
+/// Release Option to activate the selected window and dismiss.
 ///
 /// On the first press the overlay appears with the previously focused window
-/// pre-selected.  Release the modifier immediately to quick-swap back to it,
+/// pre-selected.  Release Option immediately to quick-swap back to it,
 /// or keep pressing Tab to cycle through all windows.
 ///
 /// Requires Accessibility permission (System Settings → Privacy → Accessibility).
@@ -58,7 +58,6 @@ mod ffi {
     pub const kCGEventFlagsChanged:        CGEventType = 12;
     pub const kCGKeyboardEventKeycode:     CGEventField = 9;
     pub const kCGEventFlagMaskAlternate:   CGEventFlags = 0x00080000;
-    pub const kCGEventFlagMaskCommand:     CGEventFlags = 0x00100000;
     pub const kCGEventFlagMaskShift:       CGEventFlags = 0x00020000;
 
     pub const kCFNumberSInt32Type: CFNumberType = 3;
@@ -181,13 +180,11 @@ mod ffi {
 
 #[derive(Clone, PartialEq)]
 enum KeyMsg {
-    /// Option+Tab or Cmd+Tab pressed — carries a snapshot taken at tap time.
+    /// Option+Tab pressed — carries a snapshot taken at tap time.
     /// `reverse` is true when Shift was held (cycle backwards).
     TabPressed { windows: Vec<WinEntry>, reverse: bool },
     /// Option key released — commit and dismiss
     OptionReleased,
-    /// Cmd key released — commit and dismiss
-    CmdReleased,
 }
 
 // ── Focus history ─────────────────────────────────────────────────────────────
@@ -275,7 +272,6 @@ fn start_focus_tracker(history: FocusHistory) {
 struct TapContext {
     tx:          std::sync::mpsc::Sender<KeyMsg>,
     option_down: bool,
-    cmd_down:    bool,
     /// Shared with the UI thread so it can read live Option key state.
     option_down_shared: Arc<AtomicBool>,
 }
@@ -292,7 +288,6 @@ unsafe extern "C" fn event_tap_callback(
         ffi::kCGEventFlagsChanged => {
             let flags = unsafe { ffi::CGEventGetFlags(event) };
 
-            // ── Option ────────────────────────────────────────────────────────
             let alt_now = (flags & ffi::kCGEventFlagMaskAlternate) != 0;
             if !alt_now && ctx.option_down {
                 ctx.option_down = false;
@@ -301,15 +296,6 @@ unsafe extern "C" fn event_tap_callback(
             } else if alt_now && !ctx.option_down {
                 ctx.option_down = true;
                 ctx.option_down_shared.store(true, Ordering::Relaxed);
-            }
-
-            // ── Cmd ───────────────────────────────────────────────────────────
-            let cmd_now = (flags & ffi::kCGEventFlagMaskCommand) != 0;
-            if !cmd_now && ctx.cmd_down {
-                ctx.cmd_down = false;
-                let _ = ctx.tx.send(KeyMsg::CmdReleased);
-            } else if cmd_now && !ctx.cmd_down {
-                ctx.cmd_down = true;
             }
         }
         ffi::kCGEventKeyDown => {
@@ -320,19 +306,10 @@ unsafe extern "C" fn event_tap_callback(
             let shift = (flags & ffi::kCGEventFlagMaskShift) != 0;
 
             // 48 = kVK_Tab
-            if keycode == 48 {
-                if ctx.option_down {
-                    // Option+Tab or Option+Shift+Tab
-                    let snapshot = list_windows_raw();
-                    let _ = ctx.tx.send(KeyMsg::TabPressed { windows: snapshot, reverse: shift });
-                    return std::ptr::null_mut(); // swallow
-                }
-                if ctx.cmd_down {
-                    // Cmd+Tab or Cmd+Shift+Tab — intercept the native app switcher
-                    let snapshot = list_windows_raw();
-                    let _ = ctx.tx.send(KeyMsg::TabPressed { windows: snapshot, reverse: shift });
-                    return std::ptr::null_mut(); // swallow
-                }
+            if keycode == 48 && ctx.option_down {
+                let snapshot = list_windows_raw();
+                let _ = ctx.tx.send(KeyMsg::TabPressed { windows: snapshot, reverse: shift });
+                return std::ptr::null_mut(); // swallow
             }
         }
         _ => {}
@@ -351,7 +328,7 @@ fn check_accessibility() -> bool {
 // ── Start key listener (own thread + CFRunLoop) ───────────────────────────────
 
 fn start_key_listener(tx: std::sync::mpsc::Sender<KeyMsg>, option_down_shared: Arc<AtomicBool>) {
-    let ctx = Box::new(TapContext { tx, option_down: false, cmd_down: false, option_down_shared });
+    let ctx = Box::new(TapContext { tx, option_down: false, option_down_shared });
     // Store as usize so the closure is Send (raw pointers are not Send).
     let ctx_addr: usize = Box::into_raw(ctx) as usize;
 
@@ -894,7 +871,7 @@ impl eframe::App for SwitcherApp {
                     tab_snap = snap;
                     tab_rev = reverse;
                 }
-                KeyMsg::OptionReleased | KeyMsg::CmdReleased => do_hide = true,
+                KeyMsg::OptionReleased => do_hide = true,
             }
         }
 
