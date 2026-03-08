@@ -585,27 +585,23 @@ fn list_windows_raw() -> Vec<WinEntry> {
 ///
 /// `raw` is the unmodified CGWindowList (index 0 = current foreground window).
 ///
-/// The currently focused window (raw[0], identified by wid) is removed from
-/// the display list — you can't switch to what you already have.  The list is
-/// then rotated so that `prev_wid` (the window focused just before the current
-/// one) lands at index 0 and is pre-selected.
-fn build_window_list(raw: Vec<WinEntry>, prev_wid: u32) -> (Vec<WinEntry>, usize) {
+/// All windows are shown.  The current window (raw[0], by wid) is moved to
+/// the end of the list.  The result is:
+///
+///   [prev (raw[1]), raw[2], …, current (raw[0])]
+///
+/// Index 0 is pre-selected, so a single tap always goes to the previous
+/// window.  After that switch CGWindowList naturally reflects the new
+/// Z-order, so subsequent taps cycle correctly.
+fn build_window_list(raw: Vec<WinEntry>) -> (Vec<WinEntry>, usize) {
     if raw.is_empty() { return (raw, 0); }
 
-    // Strip the currently focused window (raw[0]) by its unique wid so that
-    // other windows of the same app are preserved.
     let current_wid = raw[0].wid;
-    let mut out: Vec<WinEntry> = raw.into_iter().filter(|e| e.wid != current_wid).collect();
 
-    if out.is_empty() { return (out, 0); }
-
-    // Rotate so prev_wid is at index 0.
-    if prev_wid > 0 {
-        if let Some(idx) = out.iter().position(|e| e.wid == prev_wid) {
-            if idx > 0 {
-                out.rotate_left(idx);
-            }
-        }
+    // Partition: everything except the current window, then the current window.
+    let mut out: Vec<WinEntry> = raw.iter().filter(|e| e.wid != current_wid).cloned().collect();
+    if let Some(cur) = raw.into_iter().find(|e| e.wid == current_wid) {
+        out.push(cur);
     }
 
     (out, 0)
@@ -788,9 +784,9 @@ impl eframe::App for SwitcherApp {
                 self.pending_prev_title = prev_title;
                 self.prev_pid.store(prev, Ordering::Relaxed);
 
-                // Pass raw into build_window_list — it strips the current
-                // window and rotates prev_wid to index 0.
-                let (wins, sel) = build_window_list(raw, prev_wid);
+                // Pass raw into build_window_list — it moves the current
+                // window to the end, leaving prev (raw[1]) at index 0.
+                let (wins, sel) = build_window_list(raw);
                 let colors = build_window_colors(&wins);
                 *self.windows.lock().unwrap()    = wins;
                 *self.win_colors.lock().unwrap() = colors;
