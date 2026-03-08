@@ -62,60 +62,43 @@ fn relative_name(root: &Path, file: &Path) -> Option<String> {
 }
 
 /// Copy the first line (the password) of a pass entry to the clipboard.
-/// This version is for the CLIENT — uses `pass show` which correctly sets up
-/// the GPG_AGENT_INFO / SSH_AUTH_SOCK environment so pinentry-mac can pop up
-/// its GUI dialog even without a TTY.
+/// This version is for the CLIENT — uses `pass show -c` which handles
+/// pinentry-mac GUI prompting and clipboard copy natively.
 /// Returns true on success.
 pub fn copy_password_client(name: &str) -> bool {
-    // `pass show <name>` decrypts and prints the full entry to stdout.
-    // We capture stdout, take the first line (the password), and pipe to pbcopy.
-    let gpg_agent_socket = gpgconf_agent_socket();
-
-    let mut cmd = std::process::Command::new("pass");
-    cmd.arg("show").arg(name);
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
-
-    // Ensure the gpg-agent socket is reachable even if the environment is sparse.
-    if let Some(sock) = gpg_agent_socket {
-        cmd.env("GPG_AGENT_INFO", format!("{}:0:1", sock));
-    }
-
-    let output = match cmd.output() {
-        Ok(o) if o.status.success() => o,
-        _ => return false,
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return false,
     };
 
-    let text = String::from_utf8_lossy(&output.stdout);
-    let password = text.lines().next().unwrap_or("").to_string();
-    if password.is_empty() {
-        return false;
-    }
+    // Build a sane PATH that includes Homebrew so `gpg`, `pass`, `pinentry-mac`
+    // are all resolvable even when launched from a sparse launchd/skhd env.
+    let path_env = format!(
+        "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:{}/.local/bin",
+        home.display()
+    );
 
-    use std::io::Write;
-    if let Ok(mut child) = std::process::Command::new("pbcopy")
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-    {
-        if let Some(stdin) = child.stdin.as_mut() {
-            let _ = stdin.write_all(password.as_bytes());
-        }
-        let _ = child.wait();
-        return true;
-    }
-    false
-}
+    let gnupghome = std::env::var("GNUPGHOME")
+        .unwrap_or_else(|_| home.join(".gnupg").to_string_lossy().into_owned());
 
-/// Ask `gpgconf` for the agent socket path (avoids hard-coding ~/.gnupg).
-fn gpgconf_agent_socket() -> Option<String> {
-    let out = std::process::Command::new("gpgconf")
-        .args(["--list-dirs", "agent-socket"])
-        .output()
-        .ok()?;
-    if out.status.success() {
-        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        None
-    }
+    // `pass show -c <name>` decrypts, copies the first line to clipboard via
+    // pbcopy, and triggers pinentry-mac for the GPG passphrase if needed.
+    // stderr is inherited so pinentry-mac can connect to the window server.
+    let status = std::process::Command::new("pass")
+        .args(["show", "-c", name])
+        .env("HOME",      home.to_str().unwrap_or("/"))
+        .env("PATH",      &path_env)
+        .env("GNUPGHOME", &gnupghome)
+        // Tell pinentry to use the GUI (not curses/loopback) even without a TTY.
+        .env("PINENTRY_USER_DATA", "USE_CURSES:0")
+        // Unset GPG_TTY so gpg-agent doesn't try a curses/tty pinentry.
+        .env_remove("GPG_TTY")
+        .stdin(std::process::Stdio::null())
+        // Do NOT suppress stderr — pinentry-mac needs it to reach the display.
+        .stderr(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::null())
+        .status();
+
+    matches!(status, Ok(s) if s.success())
 }
 
