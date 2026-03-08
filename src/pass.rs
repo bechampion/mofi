@@ -61,9 +61,12 @@ fn relative_name(root: &Path, file: &Path) -> Option<String> {
     without_ext.to_str().map(|s| s.to_string())
 }
 
-/// Copy the first line (the password) of a pass entry to the clipboard.
-/// This version is for the CLIENT — uses `pass show -c` which handles
-/// pinentry-mac GUI prompting and clipboard copy natively.
+/// Copy the first line (the password) of a pass entry to the clipboard,
+/// marked with `org.nspasteboard.ConcealedType` so clipboard history managers
+/// (Raycast, Pasta, Yippy, etc.) skip recording it.
+///
+/// Strategy: decrypt with `pass show <name>` (stdout), grab line 1 in Rust,
+/// then write to NSPasteboard ourselves with the concealment type set.
 /// Returns true on success.
 pub fn copy_password_client(name: &str) -> bool {
     let home = match dirs::home_dir() {
@@ -71,8 +74,6 @@ pub fn copy_password_client(name: &str) -> bool {
         None => return false,
     };
 
-    // Build a sane PATH that includes Homebrew so `gpg`, `pass`, `pinentry-mac`
-    // are all resolvable even when launched from a sparse launchd/skhd env.
     let path_env = format!(
         "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:{}/.local/bin",
         home.display()
@@ -81,24 +82,65 @@ pub fn copy_password_client(name: &str) -> bool {
     let gnupghome = std::env::var("GNUPGHOME")
         .unwrap_or_else(|_| home.join(".gnupg").to_string_lossy().into_owned());
 
-    // `pass show -c <name>` decrypts, copies the first line to clipboard via
-    // pbcopy, and triggers pinentry-mac for the GPG passphrase if needed.
-    // stderr is inherited so pinentry-mac can connect to the window server.
-    let status = std::process::Command::new("pass")
-        .args(["show", "-c", name])
+    // Decrypt to stdout — pinentry-mac still works because stderr is inherited.
+    let output = std::process::Command::new("pass")
+        .args(["show", name])
         .env("HOME",      home.to_str().unwrap_or("/"))
         .env("PATH",      &path_env)
         .env("GNUPGHOME", &gnupghome)
-        // Tell pinentry to use the GUI (not curses/loopback) even without a TTY.
         .env("PINENTRY_USER_DATA", "USE_CURSES:0")
-        // Unset GPG_TTY so gpg-agent doesn't try a curses/tty pinentry.
         .env_remove("GPG_TTY")
         .stdin(std::process::Stdio::null())
-        // Do NOT suppress stderr — pinentry-mac needs it to reach the display.
         .stderr(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::null())
-        .status();
+        .stdout(std::process::Stdio::piped())
+        .output();
 
-    matches!(status, Ok(s) if s.success())
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+
+    // First line of the decrypted file is the password.
+    let text = match std::str::from_utf8(&output.stdout) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let password = match text.lines().next() {
+        Some(l) => l.to_string(),
+        None => return false,
+    };
+
+    // Write to NSPasteboard with org.nspasteboard.ConcealedType so clipboard
+    // history managers see the concealment marker and skip recording.
+    write_concealed_to_pasteboard(&password)
+}
+
+/// Write `text` to the general pasteboard as plain UTF-8 text, but also set
+/// the `org.nspasteboard.ConcealedType` marker so history managers skip it.
+fn write_concealed_to_pasteboard(text: &str) -> bool {
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+    use objc2_foundation::NSString;
+
+    unsafe {
+        let pb = NSPasteboard::generalPasteboard();
+        pb.clearContents();
+
+        // The concealment marker — no data needed, presence of the type is the signal.
+        let concealed_type = NSString::from_str("org.nspasteboard.ConcealedType");
+        // The actual password as plain text.
+        let string_type = NSPasteboardTypeString;
+        let ns_text = NSString::from_str(text);
+
+        // Write both items in one declareTypes call so they land in the same
+        // pasteboard change count and are atomic.
+        let types = objc2_foundation::NSArray::from_retained_slice(&[
+            objc2::rc::Retained::cast_unchecked(concealed_type),
+            objc2::rc::Retained::cast_unchecked(string_type.to_owned()),
+        ]);
+        pb.declareTypes_owner(&types, None);
+        pb.setString_forType(&ns_text, string_type);
+    }
+
+    true
 }
 
