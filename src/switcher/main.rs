@@ -585,26 +585,28 @@ fn list_windows_raw() -> Vec<WinEntry> {
 ///
 /// `raw` is the unmodified CGWindowList (index 0 = current foreground window).
 ///
-/// All windows are shown — nothing is filtered out.  The list is rotated so
-/// that `prev_pid` (the window focused just before the current one) lands at
-/// index 0 and is pre-selected.  The current window ends up somewhere later
-/// in the list (wherever it naturally falls after the rotation).
-fn build_window_list(raw: Vec<WinEntry>, prev_pid: i32) -> (Vec<WinEntry>, usize) {
+/// The currently focused window (raw[0], identified by wid) is removed from
+/// the display list — you can't switch to what you already have.  The list is
+/// then rotated so that `prev_wid` (the window focused just before the current
+/// one) lands at index 0 and is pre-selected.
+fn build_window_list(raw: Vec<WinEntry>, prev_wid: u32) -> (Vec<WinEntry>, usize) {
     if raw.is_empty() { return (raw, 0); }
 
-    let mut out = raw;
+    // Strip the currently focused window (raw[0]) by its unique wid so that
+    // other windows of the same app are preserved.
+    let current_wid = raw[0].wid;
+    let mut out: Vec<WinEntry> = raw.into_iter().filter(|e| e.wid != current_wid).collect();
 
-    // Rotate so prev_pid is at index 0.
-    if prev_pid > 0 {
-        if let Some(idx) = out.iter().position(|e| e.pid == prev_pid) {
+    if out.is_empty() { return (out, 0); }
+
+    // Rotate so prev_wid is at index 0.
+    if prev_wid > 0 {
+        if let Some(idx) = out.iter().position(|e| e.wid == prev_wid) {
             if idx > 0 {
-                let len = out.len();
-                out.rotate_left(idx.min(len - 1));
+                out.rotate_left(idx);
             }
         }
     }
-    // If prev_pid not found (first launch, single window, etc.) index 0 is
-    // whatever CGWindowList returns first after the current window — fine.
 
     (out, 0)
 }
@@ -786,9 +788,9 @@ impl eframe::App for SwitcherApp {
                 self.pending_prev_title = prev_title;
                 self.prev_pid.store(prev, Ordering::Relaxed);
 
-                // Pass raw into build_window_list so it strips the current app
-                // and uses the same snapshot (no second CGWindowList call).
-                let (wins, sel) = build_window_list(raw, prev);
+                // Pass raw into build_window_list — it strips the current
+                // window and rotates prev_wid to index 0.
+                let (wins, sel) = build_window_list(raw, prev_wid);
                 let colors = build_window_colors(&wins);
                 *self.windows.lock().unwrap()    = wins;
                 *self.win_colors.lock().unwrap() = colors;
