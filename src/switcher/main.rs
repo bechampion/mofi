@@ -153,7 +153,7 @@ mod ffi {
 
 #[derive(Clone, Copy, PartialEq)]
 enum KeyMsg {
-    /// Option+Tab — show overlay or advance selection
+    /// Option+Tab pressed — swallow and notify
     TabPressed,
     /// Option key released — commit and dismiss
     OptionReleased,
@@ -504,16 +504,26 @@ const HINT_H:   f32 = 20.0;
 // ── Switcher app ──────────────────────────────────────────────────────────────
 
 struct SwitcherApp {
-    visible:   Arc<AtomicBool>,
-    selected:  Arc<AtomicUsize>,
-    windows:   Arc<Mutex<Vec<WinEntry>>>,
+    visible:    Arc<AtomicBool>,
+    selected:   Arc<AtomicUsize>,
+    windows:    Arc<Mutex<Vec<WinEntry>>>,
     win_colors: Arc<Mutex<Vec<egui::Color32>>>,
-    msg_rx:    std::sync::mpsc::Receiver<KeyMsg>,
-    colors:    Colors,
+    msg_rx:     std::sync::mpsc::Receiver<KeyMsg>,
+    colors:     Colors,
     /// PID of the window that was focused before the *current* foreground app.
     /// Populated when the overlay opens by reading the raw window list.
-    prev_pid:  Arc<AtomicI32>,
+    prev_pid:   Arc<AtomicI32>,
+    /// Timestamp of the first Tab press in the current Option-hold session.
+    /// None when no session is in progress.
+    tab_time:   Option<std::time::Instant>,
+    /// prev_pid captured at first Tab press (used for silent swap if Option
+    /// is released before the overlay threshold).
+    pending_prev_pid: i32,
 }
+
+/// How long Option must be held after the first Tab before the overlay
+/// appears.  A quicker release performs a silent swap instead.
+const OVERLAY_DELAY: std::time::Duration = std::time::Duration::from_millis(1000);
 
 impl eframe::App for SwitcherApp {
     fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
@@ -521,58 +531,85 @@ impl eframe::App for SwitcherApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let mut do_show = false;
+        let mut do_tab  = false;
         let mut do_hide = false;
 
         while let Ok(msg) = self.msg_rx.try_recv() {
             match msg {
-                KeyMsg::TabPressed    => do_show = true,
+                KeyMsg::TabPressed     => do_tab  = true,
                 KeyMsg::OptionReleased => do_hide = true,
             }
         }
 
-        if do_show {
-            if !self.visible.load(Ordering::Relaxed) {
-                // First press: capture prev_pid from the raw Z-order *before*
-                // building the rotated display list.
-                let raw = list_windows_raw();
-                // index 0 = current focus, index 1 = previously focused
-                let prev = raw.get(1).map(|e| e.pid).unwrap_or(0);
-                self.prev_pid.store(prev, Ordering::Relaxed);
+        // ── First Tab press: start the hold timer ─────────────────────────────
+        if do_tab && self.tab_time.is_none() && !self.visible.load(Ordering::Relaxed) {
+            // Capture window state now so the overlay is instantaneous once
+            // the threshold is reached.
+            let raw  = list_windows_raw();
+            let prev = raw.get(1).map(|e| e.pid).unwrap_or(0);
+            self.pending_prev_pid = prev;
+            self.prev_pid.store(prev, Ordering::Relaxed);
 
-                let (wins, sel) = build_window_list(prev);
-                let colors = build_window_colors(&wins);
-                *self.windows.lock().unwrap()    = wins;
-                *self.win_colors.lock().unwrap() = colors;
-                self.selected.store(sel, Ordering::Relaxed);
-                self.visible.store(true, Ordering::Relaxed);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            } else {
-                // Subsequent Tab presses: cycle forward.
-                let len = self.windows.lock().unwrap().len();
-                if len > 0 {
-                    let cur = self.selected.load(Ordering::Relaxed);
-                    self.selected.store((cur + 1) % len, Ordering::Relaxed);
+            let (wins, sel) = build_window_list(prev);
+            let colors = build_window_colors(&wins);
+            *self.windows.lock().unwrap()    = wins;
+            *self.win_colors.lock().unwrap() = colors;
+            self.selected.store(sel, Ordering::Relaxed);
+
+            self.tab_time = Some(std::time::Instant::now());
+        }
+
+        // ── Subsequent Tab presses while overlay is already visible ───────────
+        if do_tab && self.visible.load(Ordering::Relaxed) {
+            let len = self.windows.lock().unwrap().len();
+            if len > 0 {
+                let cur = self.selected.load(Ordering::Relaxed);
+                self.selected.store((cur + 1) % len, Ordering::Relaxed);
+            }
+        }
+
+        // ── Check hold threshold — show overlay if time has elapsed ───────────
+        if !self.visible.load(Ordering::Relaxed) {
+            if let Some(t) = self.tab_time {
+                if t.elapsed() >= OVERLAY_DELAY {
+                    self.visible.store(true, Ordering::Relaxed);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
             }
         }
 
-        if do_hide && self.visible.load(Ordering::Relaxed) {
-            self.visible.store(false, Ordering::Relaxed);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            let wins = self.windows.lock().unwrap().clone();
-            let sel  = self.selected.load(Ordering::Relaxed);
-            if let Some(e) = wins.get(sel) {
-                activate_pid(e.pid);
+        // ── Option released ───────────────────────────────────────────────────
+        if do_hide {
+            if self.visible.load(Ordering::Relaxed) {
+                // Overlay was shown — activate selected window.
+                self.visible.store(false, Ordering::Relaxed);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                let wins = self.windows.lock().unwrap().clone();
+                let sel  = self.selected.load(Ordering::Relaxed);
+                if let Some(e) = wins.get(sel) {
+                    activate_pid(e.pid);
+                }
+            } else if self.tab_time.is_some() {
+                // Option released before threshold — silent swap to prev window.
+                if self.pending_prev_pid > 0 {
+                    activate_pid(self.pending_prev_pid);
+                }
             }
+            // Reset session state regardless.
+            self.tab_time         = None;
+            self.pending_prev_pid = 0;
         }
 
-        ctx.request_repaint_after(if self.visible.load(Ordering::Relaxed) {
-            std::time::Duration::from_millis(16)
+        // Repaint quickly while timer is pending so we don't miss the threshold.
+        let repaint_ms = if self.tab_time.is_some() && !self.visible.load(Ordering::Relaxed) {
+            16  // polling until overlay threshold
+        } else if self.visible.load(Ordering::Relaxed) {
+            16  // overlay active
         } else {
-            std::time::Duration::from_millis(50)
-        });
+            50  // idle
+        };
+        ctx.request_repaint_after(std::time::Duration::from_millis(repaint_ms));
 
         if !self.visible.load(Ordering::Relaxed) { return; }
 
@@ -750,6 +787,8 @@ fn main() -> eframe::Result<()> {
                 msg_rx: rx,
                 colors: Colors::kanagawa(),
                 prev_pid,
+                tab_time: None,
+                pending_prev_pid: 0,
             })
         }),
     )
