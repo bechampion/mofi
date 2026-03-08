@@ -499,11 +499,11 @@ impl Colors {
 
 // ── Layout ────────────────────────────────────────────────────────────────────
 
-const CARD_W:   f32 = 110.0;
-const CARD_H:   f32 = 100.0;  // slightly taller to fit title subtitle
-const CARD_PAD: f32 = 10.0;
-const WIN_PAD:  f32 = 16.0;
-const HINT_H:   f32 = 20.0;
+const CARD_W:   f32 = 130.0;
+const CARD_H:   f32 = 120.0;
+const CARD_PAD: f32 = 12.0;
+const WIN_PAD:  f32 = 20.0;
+const HINT_H:   f32 = 0.0;  // legend removed
 
 // ── Switcher app ──────────────────────────────────────────────────────────────
 
@@ -658,44 +658,37 @@ impl eframe::App for SwitcherApp {
 
                         // Glyph (app icon)
                         ui.painter().text(
-                            egui::pos2(r.center().x, r.top() + 34.0),
+                            egui::pos2(r.center().x, r.top() + 40.0),
                             egui::Align2::CENTER_CENTER,
                             glyph_for(&entry.app_name),
-                            egui::FontId::proportional(26.0),
+                            egui::FontId::proportional(30.0),
                             if is_sel { win_color } else { c.fg },
                         );
 
                         // App name
                         ui.painter().text(
-                            egui::pos2(r.center().x, r.top() + 60.0),
+                            egui::pos2(r.center().x, r.top() + 72.0),
                             egui::Align2::CENTER_CENTER,
-                            truncate(&entry.app_name, 13),
+                            truncate(&entry.app_name, 15),
                             egui::FontId::proportional(11.0),
                             c.fg,
                         );
 
                         // Window title — always shown, color-tinted on selected
                         let title_text = if entry.win_title.is_empty() {
-                            // No title from the OS — use a dash placeholder
                             "—".to_string()
                         } else {
-                            truncate(&entry.win_title, 14)
+                            truncate(&entry.win_title, 16)
                         };
                         ui.painter().text(
-                            egui::pos2(r.center().x, r.top() + 76.0),
+                            egui::pos2(r.center().x, r.top() + 89.0),
                             egui::Align2::CENTER_CENTER,
                             title_text,
-                            egui::FontId::proportional(9.0),
+                            egui::FontId::proportional(10.0),
                             if is_sel { win_color } else { c.fg_dim },
                         );
                     }
                 });
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new("release ⌥ to switch   ⌥Tab to cycle")
-                        .color(c.fg_dim)
-                        .size(9.0),
-                );
             });
     }
 }
