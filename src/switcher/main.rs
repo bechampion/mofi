@@ -175,10 +175,11 @@ mod ffi {
 
 // ── Key messages ──────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum KeyMsg {
-    /// Option+Tab pressed — swallow and notify
-    TabPressed,
+    /// Option+Tab pressed — carries a Z-order snapshot taken at tap time,
+    /// before mofisw gains focus and pollutes the window list.
+    TabPressed(Vec<WinEntry>),
     /// Option key released — commit and dismiss
     OptionReleased,
 }
@@ -219,7 +220,11 @@ unsafe extern "C" fn event_tap_callback(
             };
             // 48 = kVK_Tab
             if keycode == 48 && ctx.option_down {
-                let _ = ctx.tx.send(KeyMsg::TabPressed);
+                // Capture the Z-order snapshot NOW — before mofisw gains focus
+                // and before update() runs.  This is the only moment where the
+                // window list accurately reflects what the user sees.
+                let snapshot = list_windows_raw();
+                let _ = ctx.tx.send(KeyMsg::TabPressed(snapshot));
                 // Swallow the event — return null so it never reaches the
                 // focused application.
                 return std::ptr::null_mut();
@@ -286,7 +291,7 @@ fn start_key_listener(tx: std::sync::mpsc::Sender<KeyMsg>, option_down_shared: A
 
 // ── CGWindowList ──────────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct WinEntry {
     pid:       i32,
     wid:       u32,   // CGWindowID — unique per window, used for rotation & raise
@@ -753,13 +758,14 @@ impl eframe::App for SwitcherApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let mut do_tab  = false;
+        let mut do_tab:   bool          = false;
+        let mut tab_snap: Vec<WinEntry> = Vec::new();
         let mut do_hide = false;
 
         while let Ok(msg) = self.msg_rx.try_recv() {
             match msg {
-                KeyMsg::TabPressed     => do_tab  = true,
-                KeyMsg::OptionReleased => do_hide = true,
+                KeyMsg::TabPressed(snap) => { do_tab = true; tab_snap = snap; }
+                KeyMsg::OptionReleased   => do_hide = true,
             }
         }
 
@@ -773,9 +779,9 @@ impl eframe::App for SwitcherApp {
                     self.selected.store((cur + 1) % len, Ordering::Relaxed);
                 }
             } else {
-                // Capture window list once — raw[0] is current foreground window,
-                // raw[1] is previously focused (our silent-swap target).
-                let raw  = list_windows_raw();
+                // Use the snapshot captured at tap time — the Z-order was
+                // clean then, before mofisw gained focus.
+                let raw        = tab_snap;
                 let prev        = raw.get(1).map(|e| e.pid).unwrap_or(0);
                 let prev_wid    = raw.get(1).map(|e| e.wid).unwrap_or(0);
                 let prev_title  = raw.get(1).map(|e| e.win_title.clone()).unwrap_or_default();
