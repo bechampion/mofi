@@ -451,15 +451,14 @@ pub enum SocketMsg {
 /// Render a square PNG icon — Kanagawa dark background, crystalBlue border,
 /// bold "M" in Maple Mono NF Bold — and return the raw PNG bytes.
 fn render_menubar_icon() -> Vec<u8> {
-    render_icon_colors([147, 96, 220, 255], [220, 215, 186, 255], 'M', None, 34.0)
+    // Dimmed oniViolet bg, lightBlue border, fujiWhite M
+    render_icon_colors([88, 57, 132, 255], [220, 215, 186, 255], 'M', None, 34.0)
 }
 
-/// Render the icon with explicit bg/fg RGBA colours, glyph, optional font path override,
-/// and px scale.
+/// Render the icon with explicit bg/fg/border RGBA colours, glyph, optional font path override,
+/// and px scale. Border color is always lightBlue (173,205,247).
 fn render_icon_colors(bg: [u8; 4], fg: [u8; 4], glyph: char, font_path_override: Option<&std::path::Path>, scale_px: f32) -> Vec<u8> {
     use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
-
-    // ── Kanagawa palette ─────────────────────────────────────────────────────
 
     // ── Canvas: 22×22 pt @ 2× retina → 44×44 physical pixels ────────────────
     const SIZE: usize = 44;
@@ -471,12 +470,12 @@ fn render_icon_colors(bg: [u8; 4], fg: [u8; 4], glyph: char, font_path_override:
         px.copy_from_slice(&bg);
     }
 
-    // 1-px fujiGray border
-    const BORDER: [u8; 4] = [84, 84, 109, 255];
+    // 1-px lightBlue border — brighter than the dimmed bg so it's visible
+    let border: [u8; 4] = [173, 205, 247, 255];
     for i in 0..SIZE {
         let set = |buf: &mut Vec<u8>, x: usize, y: usize| {
             let off = (y * SIZE + x) * 4;
-            buf[off..off + 4].copy_from_slice(&BORDER);
+            buf[off..off + 4].copy_from_slice(&border);
         };
         set(&mut buf, i, 0);
         set(&mut buf, i, SIZE - 1);
@@ -867,4 +866,15 @@ fn handle_client(
 extern "C" fn cleanup_files() {
     let _ = fs::remove_file(PID_FILE);
     let _ = fs::remove_file(SOCK_FILE);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn dump_icon() {
+        let png = render_menubar_icon();
+        std::fs::write("/tmp/mofi-icon-preview.png", &png).unwrap();
+        println!("Written {} bytes to /tmp/mofi-icon-preview.png", png.len());
+    }
 }
