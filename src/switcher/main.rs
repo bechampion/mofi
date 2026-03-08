@@ -3,9 +3,13 @@
 /// Hold Option and press Tab to cycle through windows.
 /// Release Option to activate the selected window and dismiss.
 ///
+/// On the first Option+Tab press the overlay appears with the previously
+/// focused window pre-selected.  Release Option immediately to quick-swap
+/// back to it, or keep pressing Tab to cycle through all windows.
+///
 /// Requires Accessibility permission (System Settings → Privacy → Accessibility).
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
@@ -199,8 +203,6 @@ unsafe extern "C" fn event_tap_callback(
 // ── Accessibility check ───────────────────────────────────────────────────────
 
 fn check_accessibility() -> bool {
-    // AXIsProcessTrustedWithOptions with prompt = true
-    // We pass NULL to skip the prompt (we'll print our own message).
     let trusted = unsafe { ffi::AXIsProcessTrustedWithOptions(std::ptr::null()) };
     trusted != 0
 }
@@ -214,7 +216,6 @@ fn start_key_listener(tx: std::sync::mpsc::Sender<KeyMsg>) {
 
     std::thread::spawn(move || {
         let ctx_raw = ctx_addr as *mut std::os::raw::c_void;
-        // Events we care about: key down + key up + flags changed
         let mask: ffi::CGEventMask = (1 << ffi::kCGEventKeyDown)
             | (1 << ffi::kCGEventKeyUp)
             | (1 << ffi::kCGEventFlagsChanged);
@@ -299,7 +300,9 @@ unsafe fn dict_i32(dict: ffi::CFDictionaryRef, key: &str) -> Option<i32> {
     if ok != 0 { Some(out) } else { None }
 }
 
-fn list_windows() -> Vec<WinEntry> {
+/// Returns the raw on-screen window list **without** rotation.
+/// Index 0 = currently focused window (CGWindowList Z-order).
+fn list_windows_raw() -> Vec<WinEntry> {
     let opts = ffi::kCGWindowListOptionOnScreenOnly | ffi::kCGWindowListExcludeDesktopElements;
     let array = unsafe { ffi::CGWindowListCopyWindowInfo(opts, ffi::kCGNullWindowID) };
     if array.is_null() { return vec![]; }
@@ -329,7 +332,7 @@ fn list_windows() -> Vec<WinEntry> {
     }
     unsafe { ffi::CFRelease(array) };
 
-    // Remove redundant titles (single-window app where title == app name).
+    // Clean up redundant titles (single-window app where title == app name).
     let count_per_pid: HashMap<i32, usize> = {
         let mut m: HashMap<i32, usize> = HashMap::new();
         for e in &out { *m.entry(e.pid).or_insert(0) += 1; }
@@ -340,7 +343,76 @@ fn list_windows() -> Vec<WinEntry> {
             e.win_title.clear();
         }
     }
+
     out
+}
+
+/// Build the display list for the switcher overlay.
+///
+/// Strategy:
+///  - `prev_pid` is the PID the user was on **before** the currently focused
+///    window (i.e., the one they'd most likely want to jump back to).
+///  - We rotate so `prev_pid`'s window is at index 0 (pre-selected).
+///  - If `prev_pid` is unknown or not in the list, fall back to rotate_left(1)
+///    so the second-most-recent window is still first.
+fn build_window_list(prev_pid: i32) -> (Vec<WinEntry>, usize) {
+    let raw = list_windows_raw();
+    if raw.is_empty() { return (raw, 0); }
+
+    let mut out = raw;
+
+    // Find where prev_pid sits in the raw list.
+    let target_idx = if prev_pid > 0 {
+        out.iter().position(|e| e.pid == prev_pid)
+    } else {
+        None
+    };
+
+    let rotate_by = match target_idx {
+        Some(idx) => idx,       // rotate that entry to the front
+        None      => 1,         // fallback: second window (skipping current)
+    };
+
+    if out.len() > 1 && rotate_by > 0 {
+        let len = out.len();
+        out.rotate_left(rotate_by.min(len - 1));
+    }
+
+    // Pre-select index 0 (the prev_pid window or best guess).
+    (out, 0)
+}
+
+// ── Per-window accent colour palette (Kanagawa-adjacent) ─────────────────────
+//
+// Used to visually distinguish multiple windows from the same application.
+// The palette cycles per-window *within* an app group (not globally).
+
+const WIN_PALETTE: &[egui::Color32] = &[
+    egui::Color32::from_rgb(126, 156, 216), // crystalBlue
+    egui::Color32::from_rgb(152, 187, 108), // springGreen
+    egui::Color32::from_rgb(229, 183, 103), // carpYellow
+    egui::Color32::from_rgb(210, 126, 153), // sakuraPink
+    egui::Color32::from_rgb(149, 127, 184), // oniViolet
+    egui::Color32::from_rgb(127, 180, 202), // dragonBlue
+    egui::Color32::from_rgb(255, 160, 102), // surimiOrange
+    egui::Color32::from_rgb(106, 153, 85),  // leafGreen
+];
+
+/// Returns a per-window accent color.
+/// Windows of the same app share a palette slot assignment so each window
+/// within an app gets a unique (cycling) color from WIN_PALETTE.
+fn build_window_colors(wins: &[WinEntry]) -> Vec<egui::Color32> {
+    // Count occurrences per app name so we can assign per-window offsets.
+    let mut app_counter: HashMap<String, usize> = HashMap::new();
+    let mut colors = Vec::with_capacity(wins.len());
+
+    for entry in wins {
+        let idx = app_counter.entry(entry.app_name.clone()).or_insert(0);
+        let color = WIN_PALETTE[*idx % WIN_PALETTE.len()];
+        colors.push(color);
+        *idx += 1;
+    }
+    colors
 }
 
 // ── App glyph ─────────────────────────────────────────────────────────────────
@@ -403,7 +475,6 @@ struct Colors {
     card_sel: egui::Color32,
     fg:       egui::Color32,
     fg_dim:   egui::Color32,
-    accent:   egui::Color32,
 }
 
 impl Colors {
@@ -415,7 +486,6 @@ impl Colors {
             card_sel: egui::Color32::from_rgba_premultiplied(42, 89, 137, 255),
             fg:       egui::Color32::from_rgb(220, 215, 186),
             fg_dim:   egui::Color32::from_rgb(114, 113, 105),
-            accent:   egui::Color32::from_rgb(126, 156, 216),
         }
     }
 }
@@ -423,7 +493,7 @@ impl Colors {
 // ── Layout ────────────────────────────────────────────────────────────────────
 
 const CARD_W:   f32 = 110.0;
-const CARD_H:   f32 = 90.0;
+const CARD_H:   f32 = 100.0;  // slightly taller to fit title subtitle
 const CARD_PAD: f32 = 10.0;
 const WIN_PAD:  f32 = 16.0;
 const HINT_H:   f32 = 20.0;
@@ -431,11 +501,15 @@ const HINT_H:   f32 = 20.0;
 // ── Switcher app ──────────────────────────────────────────────────────────────
 
 struct SwitcherApp {
-    visible:  Arc<AtomicBool>,
-    selected: Arc<AtomicUsize>,
-    windows:  Arc<Mutex<Vec<WinEntry>>>,
-    msg_rx:   std::sync::mpsc::Receiver<KeyMsg>,
-    colors:   Colors,
+    visible:   Arc<AtomicBool>,
+    selected:  Arc<AtomicUsize>,
+    windows:   Arc<Mutex<Vec<WinEntry>>>,
+    win_colors: Arc<Mutex<Vec<egui::Color32>>>,
+    msg_rx:    std::sync::mpsc::Receiver<KeyMsg>,
+    colors:    Colors,
+    /// PID of the window that was focused before the *current* foreground app.
+    /// Populated when the overlay opens by reading the raw window list.
+    prev_pid:  Arc<AtomicI32>,
 }
 
 impl eframe::App for SwitcherApp {
@@ -456,12 +530,23 @@ impl eframe::App for SwitcherApp {
 
         if do_show {
             if !self.visible.load(Ordering::Relaxed) {
-                *self.windows.lock().unwrap() = list_windows();
-                self.selected.store(0, Ordering::Relaxed);
+                // First press: capture prev_pid from the raw Z-order *before*
+                // building the rotated display list.
+                let raw = list_windows_raw();
+                // index 0 = current focus, index 1 = previously focused
+                let prev = raw.get(1).map(|e| e.pid).unwrap_or(0);
+                self.prev_pid.store(prev, Ordering::Relaxed);
+
+                let (wins, sel) = build_window_list(prev);
+                let colors = build_window_colors(&wins);
+                *self.windows.lock().unwrap()    = wins;
+                *self.win_colors.lock().unwrap() = colors;
+                self.selected.store(sel, Ordering::Relaxed);
                 self.visible.store(true, Ordering::Relaxed);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             } else {
+                // Subsequent Tab presses: cycle forward.
                 let len = self.windows.lock().unwrap().len();
                 if len > 0 {
                     let cur = self.selected.load(Ordering::Relaxed);
@@ -488,15 +573,23 @@ impl eframe::App for SwitcherApp {
 
         if !self.visible.load(Ordering::Relaxed) { return; }
 
-        let wins = self.windows.lock().unwrap().clone();
-        let sel  = self.selected.load(Ordering::Relaxed);
-        let c    = &self.colors;
+        let wins   = self.windows.lock().unwrap().clone();
+        let colors = self.win_colors.lock().unwrap().clone();
+        let sel    = self.selected.load(Ordering::Relaxed);
+        let c      = &self.colors;
 
         let n     = wins.len().max(1) as f32;
         let win_w = (n * (CARD_W + CARD_PAD) - CARD_PAD + WIN_PAD * 2.0).min(1200.0);
         let win_h = CARD_H + WIN_PAD * 2.0 + HINT_H;
 
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(win_w, win_h)));
+
+        // Re-center on screen every frame (InnerSize alone doesn't reposition).
+        if let Some(monitor) = ctx.input(|i| i.viewport().monitor_size) {
+            let x = (monitor.x - win_w) / 2.0;
+            let y = monitor.y * 0.42 - win_h / 2.0;
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
+        }
 
         egui::CentralPanel::default()
             .frame(
@@ -509,46 +602,65 @@ impl eframe::App for SwitcherApp {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(CARD_PAD, 0.0);
                     for (i, entry) in wins.iter().enumerate() {
-                        let is_sel = i == sel;
+                        let is_sel    = i == sel;
+                        let win_color = colors.get(i).copied()
+                            .unwrap_or(egui::Color32::from_rgb(126, 156, 216));
+
                         let (r, _) = ui.allocate_exact_size(
                             egui::vec2(CARD_W, CARD_H),
                             egui::Sense::hover(),
                         );
+
+                        // Card background
                         ui.painter().rect(
                             r,
                             egui::Rounding::ZERO,
                             if is_sel { c.card_sel } else { c.card_bg },
                             egui::Stroke::new(
                                 if is_sel { 2.0 } else { 1.0 },
-                                if is_sel { c.accent } else { c.border },
+                                if is_sel { win_color } else { c.border },
                             ),
                         );
-                        // Glyph
+
+                        // Thin color bar at top of card to identify the window
+                        let bar_rect = egui::Rect::from_min_size(
+                            r.min,
+                            egui::vec2(CARD_W, 3.0),
+                        );
+                        ui.painter().rect_filled(bar_rect, egui::Rounding::ZERO, win_color);
+
+                        // Glyph (app icon)
                         ui.painter().text(
-                            egui::pos2(r.center().x, r.top() + 30.0),
+                            egui::pos2(r.center().x, r.top() + 34.0),
                             egui::Align2::CENTER_CENTER,
                             glyph_for(&entry.app_name),
-                            egui::FontId::proportional(28.0),
-                            if is_sel { c.accent } else { c.fg },
+                            egui::FontId::proportional(26.0),
+                            if is_sel { win_color } else { c.fg },
                         );
+
                         // App name
                         ui.painter().text(
-                            egui::pos2(r.center().x, r.top() + 57.0),
+                            egui::pos2(r.center().x, r.top() + 60.0),
                             egui::Align2::CENTER_CENTER,
                             truncate(&entry.app_name, 13),
                             egui::FontId::proportional(11.0),
                             c.fg,
                         );
-                        // Window title
-                        if !entry.win_title.is_empty() {
-                            ui.painter().text(
-                                egui::pos2(r.center().x, r.top() + 71.0),
-                                egui::Align2::CENTER_CENTER,
-                                truncate(&entry.win_title, 14),
-                                egui::FontId::proportional(9.0),
-                                c.fg_dim,
-                            );
-                        }
+
+                        // Window title — always shown, color-tinted on selected
+                        let title_text = if entry.win_title.is_empty() {
+                            // No title from the OS — use a dash placeholder
+                            "—".to_string()
+                        } else {
+                            truncate(&entry.win_title, 14)
+                        };
+                        ui.painter().text(
+                            egui::pos2(r.center().x, r.top() + 76.0),
+                            egui::Align2::CENTER_CENTER,
+                            title_text,
+                            egui::FontId::proportional(9.0),
+                            if is_sel { win_color } else { c.fg_dim },
+                        );
                     }
                 });
                 ui.add_space(6.0);
@@ -582,7 +694,6 @@ fn activate_pid(pid: i32) {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() -> eframe::Result<()> {
-    // Check accessibility permission before attempting to create a CGEventTap.
     if !check_accessibility() {
         eprintln!(
             "mofisw: Accessibility permission not granted.\n\
@@ -595,9 +706,11 @@ fn main() -> eframe::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel::<KeyMsg>();
     start_key_listener(tx);
 
-    let visible  = Arc::new(AtomicBool::new(false));
-    let selected = Arc::new(AtomicUsize::new(0));
-    let windows: Arc<Mutex<Vec<WinEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let visible   = Arc::new(AtomicBool::new(false));
+    let selected  = Arc::new(AtomicUsize::new(0));
+    let prev_pid  = Arc::new(AtomicI32::new(0));
+    let windows: Arc<Mutex<Vec<WinEntry>>>         = Arc::new(Mutex::new(Vec::new()));
+    let win_colors: Arc<Mutex<Vec<egui::Color32>>> = Arc::new(Mutex::new(Vec::new()));
 
     let win_h = CARD_H + WIN_PAD * 2.0 + HINT_H;
 
@@ -626,7 +739,15 @@ fn main() -> eframe::Result<()> {
                 let app = NSApplication::sharedApplication(mtm);
                 app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
             }
-            Box::new(SwitcherApp { visible, selected, windows, msg_rx: rx, colors: Colors::kanagawa() })
+            Box::new(SwitcherApp {
+                visible,
+                selected,
+                windows,
+                win_colors,
+                msg_rx: rx,
+                colors: Colors::kanagawa(),
+                prev_pid,
+            })
         }),
     )
 }
