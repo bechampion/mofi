@@ -568,18 +568,9 @@ impl eframe::App for SwitcherApp {
             }
         }
 
-        // ── Check hold threshold — show overlay if time has elapsed ───────────
-        if !self.visible.load(Ordering::Relaxed) {
-            if let Some(t) = self.tab_time {
-                if t.elapsed() >= OVERLAY_DELAY {
-                    self.visible.store(true, Ordering::Relaxed);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
-            }
-        }
-
-        // ── Option released ───────────────────────────────────────────────────
+        // ── Option released — must be evaluated BEFORE threshold check ────────
+        // This prevents a same-frame race where a fast tap+release could
+        // trigger the threshold block and the hide block in the same update().
         if do_hide {
             if self.visible.load(Ordering::Relaxed) {
                 // Overlay was shown — activate selected window.
@@ -599,6 +590,18 @@ impl eframe::App for SwitcherApp {
             // Reset session state regardless.
             self.tab_time         = None;
             self.pending_prev_pid = 0;
+        }
+
+        // ── Check hold threshold — show overlay if time has elapsed ───────────
+        // Only runs if Option is still held (tab_time not cleared above).
+        if !self.visible.load(Ordering::Relaxed) {
+            if let Some(t) = self.tab_time {
+                if t.elapsed() >= OVERLAY_DELAY {
+                    self.visible.store(true, Ordering::Relaxed);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+            }
         }
 
         // Repaint quickly while timer is pending so we don't miss the threshold.
