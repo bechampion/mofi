@@ -582,6 +582,8 @@ fn handle_client(
 
     // "ready" (--client) or "tab:<x>" (--pass / --clip) — wait for selection.
     {
+        // Clear any stale value left from a previous session before waiting.
+        *pending_entry.lock().unwrap() = None;
         let mut waited = 0;
         let entry = loop {
             {
