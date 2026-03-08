@@ -737,6 +737,8 @@ struct SwitcherApp {
     /// PID of the window that was focused before the *current* foreground app.
     prev_pid:   Arc<AtomicI32>,
     /// Live Option key state written by the event tap thread.
+    /// Kept alive here so the Arc doesn't drop; no longer read in update().
+    #[allow(dead_code)]
     option_down: Arc<AtomicBool>,
     /// prev_pid captured at first Tab press for silent swap if Option was
     /// already released by the time update() runs.
@@ -793,11 +795,10 @@ impl eframe::App for SwitcherApp {
                 self.selected.store(sel, Ordering::Relaxed);
 
                 // If OptionReleased arrived in the same frame as TabPressed,
-                // or option_down is already false, do a silent swap instead of
-                // showing the overlay.  Checking do_hide here is race-free
-                // because both messages come from the same channel in order.
-                let instant_release = do_hide || !self.option_down.load(Ordering::Relaxed);
-                if instant_release {
+                // it was an instant tap — silent swap, no overlay.
+                // Otherwise show the overlay and let the do_hide block handle
+                // dismissal when Option is eventually released.
+                if do_hide {
                     // Silent swap — jump straight to previously focused window.
                     if self.pending_prev_pid > 0 {
                         raise_window(self.pending_prev_pid, self.pending_prev_wid, &self.pending_prev_title.clone());
