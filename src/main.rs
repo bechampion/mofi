@@ -8,7 +8,7 @@ mod ui;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
@@ -451,12 +451,15 @@ pub enum SocketMsg {
 /// Render a square PNG icon — Kanagawa dark background, crystalBlue border,
 /// bold "M" in Maple Mono NF Bold — and return the raw PNG bytes.
 fn render_menubar_icon() -> Vec<u8> {
+    render_icon_colors([147, 96, 220, 255], [220, 215, 186, 255], 'M', None, 34.0)
+}
+
+/// Render the icon with explicit bg/fg RGBA colours, glyph, optional font path override,
+/// and px scale.
+fn render_icon_colors(bg: [u8; 4], fg: [u8; 4], glyph: char, font_path_override: Option<&std::path::Path>, scale_px: f32) -> Vec<u8> {
     use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 
     // ── Kanagawa palette ─────────────────────────────────────────────────────
-    const BG:  [u8; 4] = [147,  96, 220, 255]; // oniViolet
-    const BRD: [u8; 4] = [147,  96, 220, 255]; // same as BG — no visible border
-    const FG:  [u8; 4] = [220, 215, 186, 255]; // fujiWhite
 
     // ── Canvas: 22×22 pt @ 2× retina → 44×44 physical pixels ────────────────
     const SIZE: usize = 44;
@@ -465,25 +468,27 @@ fn render_menubar_icon() -> Vec<u8> {
 
     // Fill background
     for px in buf.chunks_exact_mut(4) {
-        px.copy_from_slice(&BG);
+        px.copy_from_slice(&bg);
     }
 
-    // Draw 1-px border on all four sides
+    // 1-px fujiGray border
+    const BORDER: [u8; 4] = [84, 84, 109, 255];
     for i in 0..SIZE {
         let set = |buf: &mut Vec<u8>, x: usize, y: usize| {
             let off = (y * SIZE + x) * 4;
-            buf[off..off + 4].copy_from_slice(&BRD);
+            buf[off..off + 4].copy_from_slice(&BORDER);
         };
-        set(&mut buf, i, 0);          // top
-        set(&mut buf, i, SIZE - 1);   // bottom
-        set(&mut buf, 0, i);          // left
-        set(&mut buf, SIZE - 1, i);   // right
+        set(&mut buf, i, 0);
+        set(&mut buf, i, SIZE - 1);
+        set(&mut buf, 0, i);
+        set(&mut buf, SIZE - 1, i);
     }
 
-    // ── Load Maple Mono NF Bold ───────────────────────────────────────────────
+    // ── Load font ─────────────────────────────────────────────────────────────
     let home = dirs::home_dir().unwrap();
-    let font_path = home.join("Library/Fonts/MapleMono-NF-Bold.ttf");
-    let font_bytes = match std::fs::read(&font_path) {
+    let default_font = home.join("Library/Fonts/MapleMono-NF-SemiBold.ttf");
+    let font_path = font_path_override.unwrap_or(&default_font);
+    let font_bytes = match std::fs::read(font_path) {
         Ok(b) => b,
         Err(_) => return encode_png(&buf, SIZE),
     };
@@ -492,12 +497,11 @@ fn render_menubar_icon() -> Vec<u8> {
         Err(_) => return encode_png(&buf, SIZE),
     };
 
-    // ── Render a single bold "M" centred in the square ───────────────────────
-    // Scale so the glyph body fills most of the 44-px square (inset 4 px each side).
-    let scale  = PxScale::from(34.0);
+    // ── Render glyph centred in the square ────────────────────────────────────
+    let scale  = PxScale::from(scale_px);
     let scaled = font.as_scaled(scale);
 
-    let glyph_id = font.glyph_id('M');
+    let glyph_id = font.glyph_id(glyph);
 
     // Centre horizontally and vertically
     let glyph_w  = scaled.h_advance(glyph_id);
@@ -522,7 +526,7 @@ fn render_menubar_icon() -> Vec<u8> {
             let alpha = (cov * 255.0).round() as u32;
             let inv   = 255 - alpha;
             for i in 0..3 {
-                buf[off + i] = ((FG[i] as u32 * alpha + buf[off + i] as u32 * inv) / 255) as u8;
+                buf[off + i] = ((fg[i] as u32 * alpha + buf[off + i] as u32 * inv) / 255) as u8;
             }
             buf[off + 3] = 255;
         });
@@ -583,6 +587,76 @@ impl MofiStatusTarget {
     }
 }
 
+// ── Icon flash state ─────────────────────────────────────────────────────────
+/// Raw pointer to the NSStatusBarButton, set once in setup_status_bar().
+/// Accessed only from the main thread (inside update() and setup_status_bar()).
+static ICON_BTN: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+/// Set by a background thread after the flash delay; read and cleared by tick_icon_restore().
+static ICON_RESTORE: AtomicBool = AtomicBool::new(false);
+
+/// Swap the menu-bar icon to a flash glyph for 500 ms, then restore.
+/// `glyph` is rendered from Symbols Nerd Font.
+/// Must be called from the main thread.
+pub fn flash_icon(glyph: char) {
+    use objc2_app_kit::NSImage;
+    use objc2_foundation::{NSData, NSSize};
+
+    let ptr = ICON_BTN.load(Ordering::Relaxed);
+    if ptr.is_null() { return; }
+
+    // from Symbols Nerd Font.
+    let nf_font = dirs::home_dir()
+        .unwrap()
+        .join("Library/Fonts/SymbolsNerdFont-Regular.ttf");
+    let png = render_icon_colors(
+        [147, 96, 220, 255],  // oniViolet bg (unchanged)
+        [220, 215, 186, 255], // fujiWhite glyph
+        glyph,
+        Some(&nf_font),
+        28.0,
+    );
+
+    unsafe {
+        let btn = &*(ptr as *const objc2_app_kit::NSStatusBarButton);
+        let ns_data = NSData::with_bytes(&png);
+        let alloc = <NSImage as objc2::AnyThread>::alloc();
+        if let Some(img) = NSImage::initWithData(alloc, &ns_data) {
+            img.setSize(NSSize { width: 22.0, height: 22.0 });
+            btn.setImage(Some(&img));
+        }
+    }
+
+    // Restore after 500 ms.
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        ICON_RESTORE.store(true, Ordering::Relaxed);
+    });
+}
+
+/// Check if a restore is pending and swap back to the normal icon.
+/// Must be called from the main thread (e.g. inside egui update()).
+pub fn tick_icon_restore() {
+    if !ICON_RESTORE.swap(false, Ordering::Relaxed) { return; }
+
+    use objc2_app_kit::NSImage;
+    use objc2_foundation::{NSData, NSSize};
+
+    let ptr = ICON_BTN.load(Ordering::Relaxed);
+    if ptr.is_null() { return; }
+
+    let png = render_menubar_icon();
+
+    unsafe {
+        let btn = &*(ptr as *const objc2_app_kit::NSStatusBarButton);
+        let ns_data = NSData::with_bytes(&png);
+        let alloc = <NSImage as objc2::AnyThread>::alloc();
+        if let Some(img) = NSImage::initWithData(alloc, &ns_data) {
+            img.setSize(NSSize { width: 22.0, height: 22.0 });
+            btn.setImage(Some(&img));
+        }
+    }
+}
+
 /// Create a persistent NSStatusItem with a custom rendered icon.
 /// Must be called on the main thread. The item is leaked intentionally.
 fn setup_status_bar() {
@@ -608,6 +682,12 @@ fn setup_status_bar() {
 
             if let Some(btn) = item.button(mtm) {
                 btn.setImage(Some(&img));
+
+                // Store the raw button pointer for flash_icon() / tick_icon_restore().
+                ICON_BTN.store(
+                    objc2::rc::Retained::as_ptr(&btn) as *mut std::ffi::c_void,
+                    Ordering::Relaxed,
+                );
 
                 // Wire up the click handler.
                 let target = MofiStatusTarget::new();

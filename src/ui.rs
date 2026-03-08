@@ -417,10 +417,19 @@ impl RofiApp {
         }
         if let Some(&idx) = self.filtered.get(self.selected) {
             match &self.items[idx] {
-                LaunchItem::App(app) => { launch_app(&app.path.clone()); self.should_close = true; }
-                LaunchItem::Clip(e)  => { paste_text(&e.text.clone()); self.should_close = true; }
+                LaunchItem::App(app) => {
+                    launch_app(&app.path.clone());
+                    crate::flash_icon('\u{f0e7}'); // fa-bolt
+                    self.should_close = true;
+                }
+                LaunchItem::Clip(e)  => {
+                    paste_text(&e.text.clone());
+                    crate::flash_icon('\u{f0c6}'); // fa-paperclip
+                    self.should_close = true;
+                }
                 LaunchItem::Pass(e)  => {
                     *self.pending_entry.lock().unwrap() = Some(Some(e.name.clone()));
+                    crate::flash_icon('\u{f023}'); // fa-lock
                     self.should_close = true;
                 }
             }
@@ -597,6 +606,7 @@ impl eframe::App for RofiApp {
         }
 
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        crate::tick_icon_restore();
         if !self.visible { return; }
 
         if self.should_close { self.hide(ctx); return; }
