@@ -463,37 +463,26 @@ fn list_windows_raw() -> Vec<WinEntry> {
 ///
 /// `raw` is the unmodified CGWindowList (index 0 = current foreground window).
 ///
-/// Layout: [other apps' windows … | current app's windows]
-///   - Other apps come first, sorted by Z-order (most recent first).
-///   - Current app's windows are appended at the end so they are reachable
-///     by cycling all the way around but are never the default selection.
-///   - The previously focused window (prev_pid) is rotated to index 0
-///     within the "other" group so it is pre-selected.
+/// All windows are shown — nothing is filtered out.  The list is rotated so
+/// that `prev_pid` (the window focused just before the current one) lands at
+/// index 0 and is pre-selected.  The current window ends up somewhere later
+/// in the list (wherever it naturally falls after the rotation).
 fn build_window_list(raw: Vec<WinEntry>, prev_pid: i32) -> (Vec<WinEntry>, usize) {
     if raw.is_empty() { return (raw, 0); }
 
-    // The window at index 0 is the current foreground window.
-    let current_pid = raw[0].pid;
+    let mut out = raw;
 
-    // Partition: other apps first, current app at the end.
-    let (mut others, current): (Vec<WinEntry>, Vec<WinEntry>) =
-        raw.into_iter().partition(|e| e.pid != current_pid);
-
-    if others.is_empty() && current.is_empty() { return (others, 0); }
-
-    // Rotate "others" so prev_pid is at index 0.
-    if prev_pid > 0 && prev_pid != current_pid && !others.is_empty() {
-        if let Some(idx) = others.iter().position(|e| e.pid == prev_pid) {
+    // Rotate so prev_pid is at index 0.
+    if prev_pid > 0 {
+        if let Some(idx) = out.iter().position(|e| e.pid == prev_pid) {
             if idx > 0 {
-                let len = others.len();
-                others.rotate_left(idx.min(len - 1));
+                let len = out.len();
+                out.rotate_left(idx.min(len - 1));
             }
         }
     }
-
-    // Append current app's windows at the tail.
-    let mut out = others;
-    out.extend(current);
+    // If prev_pid not found (first launch, single window, etc.) index 0 is
+    // whatever CGWindowList returns first after the current window — fine.
 
     (out, 0)
 }
