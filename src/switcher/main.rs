@@ -162,8 +162,10 @@ enum KeyMsg {
 // ── CGEventTap callback context ───────────────────────────────────────────────
 
 struct TapContext {
-    tx: std::sync::mpsc::Sender<KeyMsg>,
+    tx:          std::sync::mpsc::Sender<KeyMsg>,
     option_down: bool,
+    /// Shared with the UI thread so it can read live Option key state.
+    option_down_shared: Arc<AtomicBool>,
 }
 
 unsafe extern "C" fn event_tap_callback(
@@ -180,9 +182,11 @@ unsafe extern "C" fn event_tap_callback(
             let alt_now = (flags & ffi::kCGEventFlagMaskAlternate) != 0;
             if !alt_now && ctx.option_down {
                 ctx.option_down = false;
+                ctx.option_down_shared.store(false, Ordering::Relaxed);
                 let _ = ctx.tx.send(KeyMsg::OptionReleased);
             } else if alt_now && !ctx.option_down {
                 ctx.option_down = true;
+                ctx.option_down_shared.store(true, Ordering::Relaxed);
             }
         }
         ffi::kCGEventKeyDown => {
@@ -212,8 +216,8 @@ fn check_accessibility() -> bool {
 
 // ── Start key listener (own thread + CFRunLoop) ───────────────────────────────
 
-fn start_key_listener(tx: std::sync::mpsc::Sender<KeyMsg>) {
-    let ctx = Box::new(TapContext { tx, option_down: false });
+fn start_key_listener(tx: std::sync::mpsc::Sender<KeyMsg>, option_down_shared: Arc<AtomicBool>) {
+    let ctx = Box::new(TapContext { tx, option_down: false, option_down_shared });
     // Store as usize so the closure is Send (raw pointers are not Send).
     let ctx_addr: usize = Box::into_raw(ctx) as usize;
 
@@ -511,19 +515,13 @@ struct SwitcherApp {
     msg_rx:     std::sync::mpsc::Receiver<KeyMsg>,
     colors:     Colors,
     /// PID of the window that was focused before the *current* foreground app.
-    /// Populated when the overlay opens by reading the raw window list.
     prev_pid:   Arc<AtomicI32>,
-    /// Timestamp of the first Tab press in the current Option-hold session.
-    /// None when no session is in progress.
-    tab_time:   Option<std::time::Instant>,
-    /// prev_pid captured at first Tab press (used for silent swap if Option
-    /// is released before the overlay threshold).
+    /// Live Option key state written by the event tap thread.
+    option_down: Arc<AtomicBool>,
+    /// prev_pid captured at first Tab press for silent swap if Option was
+    /// already released by the time update() runs.
     pending_prev_pid: i32,
 }
-
-/// How long Option must be held after the first Tab before the overlay
-/// appears.  A quicker release performs a silent swap instead.
-const OVERLAY_DELAY: std::time::Duration = std::time::Duration::from_millis(1000);
 
 impl eframe::App for SwitcherApp {
     fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
@@ -541,36 +539,45 @@ impl eframe::App for SwitcherApp {
             }
         }
 
-        // ── First Tab press: start the hold timer ─────────────────────────────
-        if do_tab && self.tab_time.is_none() && !self.visible.load(Ordering::Relaxed) {
-            // Capture window state now so the overlay is instantaneous once
-            // the threshold is reached.
-            let raw  = list_windows_raw();
-            let prev = raw.get(1).map(|e| e.pid).unwrap_or(0);
-            self.pending_prev_pid = prev;
-            self.prev_pid.store(prev, Ordering::Relaxed);
+        // ── Tab pressed ───────────────────────────────────────────────────────
+        if do_tab {
+            if self.visible.load(Ordering::Relaxed) {
+                // Overlay already showing — cycle to next window.
+                let len = self.windows.lock().unwrap().len();
+                if len > 0 {
+                    let cur = self.selected.load(Ordering::Relaxed);
+                    self.selected.store((cur + 1) % len, Ordering::Relaxed);
+                }
+            } else {
+                // Capture window list and prev_pid regardless — needed for
+                // both the overlay path and the silent-swap path.
+                let raw  = list_windows_raw();
+                let prev = raw.get(1).map(|e| e.pid).unwrap_or(0);
+                self.pending_prev_pid = prev;
+                self.prev_pid.store(prev, Ordering::Relaxed);
 
-            let (wins, sel) = build_window_list(prev);
-            let colors = build_window_colors(&wins);
-            *self.windows.lock().unwrap()    = wins;
-            *self.win_colors.lock().unwrap() = colors;
-            self.selected.store(sel, Ordering::Relaxed);
+                let (wins, sel) = build_window_list(prev);
+                let colors = build_window_colors(&wins);
+                *self.windows.lock().unwrap()    = wins;
+                *self.win_colors.lock().unwrap() = colors;
+                self.selected.store(sel, Ordering::Relaxed);
 
-            self.tab_time = Some(std::time::Instant::now());
-        }
-
-        // ── Subsequent Tab presses while overlay is already visible ───────────
-        if do_tab && self.visible.load(Ordering::Relaxed) {
-            let len = self.windows.lock().unwrap().len();
-            if len > 0 {
-                let cur = self.selected.load(Ordering::Relaxed);
-                self.selected.store((cur + 1) % len, Ordering::Relaxed);
+                if self.option_down.load(Ordering::Relaxed) {
+                    // Option is still held — show the overlay.
+                    self.visible.store(true, Ordering::Relaxed);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                } else {
+                    // Option already released before update() ran — silent swap.
+                    if self.pending_prev_pid > 0 {
+                        activate_pid(self.pending_prev_pid);
+                    }
+                    self.pending_prev_pid = 0;
+                }
             }
         }
 
-        // ── Option released — must be evaluated BEFORE threshold check ────────
-        // This prevents a same-frame race where a fast tap+release could
-        // trigger the threshold block and the hide block in the same update().
+        // ── Option released ───────────────────────────────────────────────────
         if do_hide {
             if self.visible.load(Ordering::Relaxed) {
                 // Overlay was shown — activate selected window.
@@ -581,38 +588,15 @@ impl eframe::App for SwitcherApp {
                 if let Some(e) = wins.get(sel) {
                     activate_pid(e.pid);
                 }
-            } else if self.tab_time.is_some() {
-                // Option released before threshold — silent swap to prev window.
-                if self.pending_prev_pid > 0 {
-                    activate_pid(self.pending_prev_pid);
-                }
             }
-            // Reset session state regardless.
-            self.tab_time         = None;
             self.pending_prev_pid = 0;
         }
 
-        // ── Check hold threshold — show overlay if time has elapsed ───────────
-        // Only runs if Option is still held (tab_time not cleared above).
-        if !self.visible.load(Ordering::Relaxed) {
-            if let Some(t) = self.tab_time {
-                if t.elapsed() >= OVERLAY_DELAY {
-                    self.visible.store(true, Ordering::Relaxed);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
-            }
-        }
-
-        // Repaint quickly while timer is pending so we don't miss the threshold.
-        let repaint_ms = if self.tab_time.is_some() && !self.visible.load(Ordering::Relaxed) {
-            16  // polling until overlay threshold
-        } else if self.visible.load(Ordering::Relaxed) {
-            16  // overlay active
+        ctx.request_repaint_after(if self.visible.load(Ordering::Relaxed) {
+            std::time::Duration::from_millis(16)
         } else {
-            50  // idle
-        };
-        ctx.request_repaint_after(std::time::Duration::from_millis(repaint_ms));
+            std::time::Duration::from_millis(50)
+        });
 
         if !self.visible.load(Ordering::Relaxed) { return; }
 
@@ -747,14 +731,14 @@ fn main() -> eframe::Result<()> {
     }
 
     let (tx, rx) = std::sync::mpsc::channel::<KeyMsg>();
-    start_key_listener(tx);
+    let option_down = Arc::new(AtomicBool::new(false));
+    start_key_listener(tx, Arc::clone(&option_down));
 
     let visible   = Arc::new(AtomicBool::new(false));
     let selected  = Arc::new(AtomicUsize::new(0));
     let prev_pid  = Arc::new(AtomicI32::new(0));
     let windows: Arc<Mutex<Vec<WinEntry>>>         = Arc::new(Mutex::new(Vec::new()));
     let win_colors: Arc<Mutex<Vec<egui::Color32>>> = Arc::new(Mutex::new(Vec::new()));
-
     let win_h = CARD_H + WIN_PAD * 2.0 + HINT_H;
 
     let options = eframe::NativeOptions {
@@ -790,7 +774,7 @@ fn main() -> eframe::Result<()> {
                 msg_rx: rx,
                 colors: Colors::kanagawa(),
                 prev_pid,
-                tab_time: None,
+                option_down,
                 pending_prev_pid: 0,
             })
         }),
