@@ -26,6 +26,14 @@ fn main() -> eframe::Result<()> {
             client_main();
             Ok(())
         }
+        "--pass" => {
+            show_tab_main("pass");
+            Ok(())
+        }
+        "--clip" => {
+            show_tab_main("clip");
+            Ok(())
+        }
         "--input" => {
             input_client_main();
             Ok(())
@@ -44,6 +52,33 @@ fn main() -> eframe::Result<()> {
         }
         _ => run_daemon(),
     }
+}
+
+// ── --pass / --clip (show on a specific tab) ─────────────────────────────────
+
+fn show_tab_main(tab: &str) {
+    let mut stream = match UnixStream::connect(SOCK_FILE) {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("mofi: daemon not running (socket not found at {})", SOCK_FILE);
+            std::process::exit(1);
+        }
+    };
+
+    let msg = format!("show:{}\n", tab);
+    stream.write_all(msg.as_bytes()).ok();
+
+    match fs::read_to_string(PID_FILE) {
+        Ok(contents) => {
+            let pid: i32 = contents.trim().parse().expect("Invalid PID");
+            unsafe { libc::kill(pid, libc::SIGUSR1) };
+        }
+        Err(_) => {
+            eprintln!("mofi: no PID file at {}", PID_FILE);
+            std::process::exit(1);
+        }
+    }
+    // No response expected — fire and forget.
 }
 
 // ── --client (existing toggle / pass flow) ────────────────────────────────────
@@ -290,7 +325,10 @@ fn install_main() {
     // ── 2. skhd hotkey ───────────────────────────────────────────────────────
     let skhdrc = PathBuf::from(shellexpand::tilde("~/.skhdrc").as_ref());
 
-    let hotkey_line = format!("cmd - space : {} --client", bin_str);
+    let hotkey_line = format!(
+        "cmd - space : {} --client\ncmd + shift - p : {} --pass\ncmd + shift - y : {} --clip",
+        bin_str, bin_str, bin_str
+    );
     let marker = "# mofi";
 
     let existing = fs::read_to_string(&skhdrc).unwrap_or_default();
@@ -418,6 +456,10 @@ fn run_daemon() -> eframe::Result<()> {
     let input_result: Arc<Mutex<Option<Option<String>>>> = Arc::new(Mutex::new(None));
     let input_result_sock = Arc::clone(&input_result);
 
+    // Shared slot for "show on tab" requests (--pass / --clip).
+    let pending_mode: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let pending_mode_sock = Arc::clone(&pending_mode);
+
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let stream = match stream {
@@ -428,7 +470,8 @@ fn run_daemon() -> eframe::Result<()> {
             let p_input = Arc::clone(&pending_input_sock);
             let p_is_themes = Arc::clone(&pending_input_is_themes_sock);
             let i_result = Arc::clone(&input_result_sock);
-            std::thread::spawn(move || handle_client(stream, pending, p_input, p_is_themes, i_result));
+            let p_mode = Arc::clone(&pending_mode_sock);
+            std::thread::spawn(move || handle_client(stream, pending, p_input, p_is_themes, i_result, p_mode));
         }
     });
 
@@ -461,6 +504,7 @@ fn run_daemon() -> eframe::Result<()> {
                 pending_input,
                 input_result,
                 pending_input_is_themes,
+                pending_mode,
             ))
         }),
     )
@@ -472,10 +516,17 @@ fn handle_client(
     pending_input: Arc<Mutex<Option<Vec<String>>>>,
     pending_input_is_themes: Arc<Mutex<bool>>,
     input_result: Arc<Mutex<Option<Option<String>>>>,
+    pending_mode: Arc<Mutex<Option<String>>>,
 ) {
     let mut buf = String::new();
     BufReader::new(&stream).read_line(&mut buf).ok();
     let line = buf.trim_end_matches('\n').to_string();
+
+    // show:<tab> — fire-and-forget, no response needed.
+    if let Some(tab) = line.strip_prefix("show:") {
+        *pending_mode.lock().unwrap() = Some(tab.to_string());
+        return;
+    }
 
     if let Some(rest) = line.strip_prefix("input\t").or_else(|| {
         if line.starts_with("themes\t") { Some(&line["themes\t".len()..]) } else { None }

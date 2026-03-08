@@ -277,6 +277,8 @@ pub struct RofiApp {
     pending_input: Arc<Mutex<Option<Vec<String>>>>,
     input_result: Arc<Mutex<Option<Option<String>>>>,
     pending_input_is_themes: Arc<Mutex<bool>>,
+    /// Requested tab to open when the window next shows ("pass" | "clip").
+    pending_mode: Arc<Mutex<Option<String>>>,
     input_items: Vec<String>,
     input_filtered: Vec<usize>,
     /// True when the current Input session is a theme picker (mofi --themes).
@@ -296,6 +298,7 @@ impl RofiApp {
         pending_input: Arc<Mutex<Option<Vec<String>>>>,
         input_result: Arc<Mutex<Option<Option<String>>>>,
         pending_input_is_themes: Arc<Mutex<bool>>,
+        pending_mode: Arc<Mutex<Option<String>>>,
     ) -> Self {
         load_fonts(&cc.egui_ctx);
 
@@ -339,6 +342,7 @@ impl RofiApp {
             pending_input,
             input_result,
             pending_input_is_themes,
+            pending_mode,
             input_items: Vec::new(),
             input_filtered: Vec::new(),
             input_is_themes: false,
@@ -537,7 +541,20 @@ impl eframe::App for RofiApp {
                     self.refilter_input();
                 } else {
                     self.input_is_themes = false;
-                    self.mode = Mode::Apps;
+                    // Check if --pass or --clip requested a specific tab.
+                    let requested = self.pending_mode.lock().unwrap().take();
+                    match requested.as_deref() {
+                        Some("pass") => {
+                            self.mode = Mode::Pass;
+                        }
+                        Some("clip") => {
+                            self.mode = Mode::Clipboard;
+                            self.sync_clipboard();
+                        }
+                        _ => {
+                            self.mode = Mode::Apps;
+                        }
+                    }
                     self.sync_apps();
                     self.refilter(true);
                 }
