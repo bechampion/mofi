@@ -22,7 +22,7 @@
 - **Theme picker** — 10 built-in themes with live preview; switch instantly from the Themes tab or `mofi --themes`
 - **Pipe-select mode** — `mofi --input` reads lines from stdin, presents them as a fuzzy-searchable list, and prints the selected line to stdout (exit 0) or exits 1 on cancel
 - **Maple Mono NF** — Nerd Font glyphs for every icon, no PNG loading
-- **Daemon architecture** — persistent background process toggled via `skhd`; no Dock icon, no Cmd-Tab entry (`NSApplicationActivationPolicyAccessory`)
+- **Daemon architecture** — persistent background process toggled via `skhd`; no Dock icon, no Cmd-Tab entry (`NSApplicationActivationPolicyAccessory`). Hotkeys open directly on Apps (`Cmd+Space`), Pass (`Cmd+Shift+P`), or Clipboard (`Cmd+Shift+Y`)
 - **Focus restore** — returns focus to the previously active app on dismiss
 
 ---
@@ -79,7 +79,10 @@ cargo build --release
 `--install` does everything automatically:
 
 1. Writes `~/Library/LaunchAgents/com.user.mofi.plist` pointing at the current binary and loads it via `launchctl` — the daemon starts immediately and survives reboots.
-2. Appends a `cmd - space` hotkey to `~/.skhdrc` (only if a `# mofi` block isn't already present) and reloads `skhd`.
+2. Appends three hotkeys to `~/.skhdrc` (only if a `# mofi` block isn't already present) and reloads `skhd`:
+   - `Cmd+Space` → `--client` (Apps tab)
+   - `Cmd+Shift+P` → `--pass` (Pass tab)
+   - `Cmd+Shift+Y` → `--clip` (Clipboard tab)
 3. Creates `~/.config/mofi/config.toml` with `theme = "kanagawa"` if it doesn't exist yet.
 
 Re-running `--install` after rebuilding the binary is safe — it unloads the old agent before overwriting the plist.
@@ -127,7 +130,9 @@ Add to `~/.skhdrc`:
 
 ```
 # mofi
-cmd - space : /path/to/mofi/target/release/mofi --client
+cmd - space       : /path/to/mofi/target/release/mofi --client
+cmd + shift - p   : /path/to/mofi/target/release/mofi --pass
+cmd + shift - y   : /path/to/mofi/target/release/mofi --clip
 ```
 
 ```bash
@@ -158,7 +163,9 @@ gpgconf --kill gpg-agent
 
 | Key | Action |
 |-----|--------|
-| `Cmd+Space` | Open mofi (via skhd) |
+| `Cmd+Space` | Open mofi on Apps tab (via skhd) |
+| `Cmd+Shift+P` | Open mofi on Pass tab (via skhd) |
+| `Cmd+Shift+Y` | Open mofi on Clipboard tab (via skhd) |
 | `Escape` | Close / dismiss |
 | `Tab` | Cycle tabs: Apps → Clipboard → Pass → Themes → About |
 | `↓` / `Ctrl+J` | Move selection down |
@@ -210,10 +217,12 @@ Exit codes: `0` = item selected (selected text on stdout), `1` = cancelled.
 
 ```
 mofi --daemon     persistent egui window (hidden by default), started via launchd
-mofi --client     toggle show/hide — sends socket message then SIGUSR1
+mofi --client     toggle show/hide on Apps tab — sends socket message then SIGUSR1
+mofi --pass       show mofi landing on the Pass tab (Cmd+Shift+P)
+mofi --clip       show mofi landing on the Clipboard tab (Cmd+Shift+Y)
 mofi --input      pipe-select: reads stdin, sends items to daemon, prints selection to stdout
 mofi --themes     theme picker: presents built-in themes with live preview, writes chosen theme to config
-mofi --install    install plist, load launchd agent, append skhd hotkey, create config
+mofi --install    install plist, load launchd agent, append skhd hotkeys, create config
 mofi --restart    unload and reload the launchd agent, then print the new daemon PID
 ```
 
@@ -247,7 +256,9 @@ When a Pass entry is selected, the daemon sends the entry name back to the `--cl
 
 | Message | Direction | Description |
 |---------|-----------|-------------|
-| `ready\n` | client → daemon | Toggle show/hide; wait for a pass-entry name in response |
+| `ready\n` | client → daemon | Toggle show/hide on Apps tab; wait for a pass-entry name in response |
+| `show:pass\n` | client → daemon | Show window and switch to Pass tab (`--pass`) |
+| `show:clip\n` | client → daemon | Show window and switch to Clipboard tab (`--clip`) |
 | `input\t<l1>\t<l2>\t...\n` | client → daemon | Pipe-select mode |
 | `themes\t<l1>\t<l2>\t...\n` | client → daemon | Theme-picker mode (live preview enabled) |
 | `ok:<selected>\n` | daemon → client | Item was selected |
