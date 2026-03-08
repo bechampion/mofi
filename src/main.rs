@@ -54,7 +54,7 @@ fn main() -> eframe::Result<()> {
     }
 }
 
-// ── --pass / --clip (show on a specific tab) ─────────────────────────────────
+// ── --pass / --clip (show on a specific tab, wait for selection) ──────────────
 
 fn show_tab_main(tab: &str) {
     let mut stream = match UnixStream::connect(SOCK_FILE) {
@@ -65,7 +65,9 @@ fn show_tab_main(tab: &str) {
         }
     };
 
-    let msg = format!("show:{}\n", tab);
+    // Send "tab:<name>" — daemon opens on that tab and waits for a selection,
+    // then writes the selected entry name back over the socket.
+    let msg = format!("tab:{}\n", tab);
     stream.write_all(msg.as_bytes()).ok();
 
     match fs::read_to_string(PID_FILE) {
@@ -78,7 +80,25 @@ fn show_tab_main(tab: &str) {
             std::process::exit(1);
         }
     }
-    // No response expected — fire and forget.
+
+    // Wait for the daemon to send back the selected entry name (or empty = cancel).
+    let mut response = String::new();
+    BufReader::new(&stream).read_line(&mut response).ok();
+    let entry = response.trim().to_string();
+
+    if entry.is_empty() {
+        return;
+    }
+
+    // Only pass entries need decryption; clip entries are already in clipboard.
+    if tab == "pass" {
+        if pass::copy_password_client(&entry) {
+            println!("Copied {}", entry);
+        } else {
+            eprintln!("mofi: failed to decrypt {}", entry);
+            std::process::exit(1);
+        }
+    }
 }
 
 // ── --client (existing toggle / pass flow) ────────────────────────────────────
@@ -522,39 +542,32 @@ fn handle_client(
     BufReader::new(&stream).read_line(&mut buf).ok();
     let line = buf.trim_end_matches('\n').to_string();
 
-    // show:<tab> — fire-and-forget, no response needed.
+    // show:<tab> — legacy fire-and-forget protocol, kept for compatibility.
     if let Some(tab) = line.strip_prefix("show:") {
         *pending_mode.lock().unwrap() = Some(tab.to_string());
         return;
     }
 
-    if let Some(rest) = line.strip_prefix("input\t").or_else(|| {
-        if line.starts_with("themes\t") { Some(&line["themes\t".len()..]) } else { None }
-    }) {
+    // tab:<tab> — open on a specific tab and wait for the user's selection.
+    // Used by --pass and --clip so the client can act on the result.
+    if let Some(tab) = line.strip_prefix("tab:") {
+        *pending_mode.lock().unwrap() = Some(tab.to_string());
+        // Fall through to the pending_entry wait loop below.
+    } else if line.starts_with("input\t") || line.starts_with("themes\t") {
         let is_themes = line.starts_with("themes\t");
+        let rest = if is_themes { &line["themes\t".len()..] } else { &line["input\t".len()..] };
         let items: Vec<String> = rest.split('\t').map(|s| s.to_string()).collect();
 
         // Clear any previous result, set the themes flag, then post the items.
-        {
-            let mut r = input_result.lock().unwrap();
-            *r = None;
-        }
-        {
-            let mut flag = pending_input_is_themes.lock().unwrap();
-            *flag = is_themes;
-        }
-        {
-            let mut p = pending_input.lock().unwrap();
-            *p = Some(items);
-        }
+        { *input_result.lock().unwrap() = None; }
+        { *pending_input_is_themes.lock().unwrap() = is_themes; }
+        { *pending_input.lock().unwrap() = Some(items); }
 
         // Wait for the UI to post a result (selected string or None for cancel).
         let result = loop {
             {
                 let mut lock = input_result.lock().unwrap();
-                if let Some(val) = lock.take() {
-                    break val;
-                }
+                if let Some(val) = lock.take() { break val; }
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
@@ -564,8 +577,11 @@ fn handle_client(
             None => "cancel\n".to_string(),
         };
         stream.write_all(response.as_bytes()).ok();
-    } else {
-        // Regular "ready" / pass flow.
+        return;
+    }
+
+    // "ready" (--client) or "tab:<x>" (--pass / --clip) — wait for selection.
+    {
         let mut waited = 0;
         let entry = loop {
             {
