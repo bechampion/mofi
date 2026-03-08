@@ -8,7 +8,7 @@
 /// back to it, or keep pressing Tab to cycle through all windows.
 ///
 /// Requires Accessibility permission (System Settings → Privacy → Accessibility).
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -127,6 +127,7 @@ mod ffi {
             element: AXUIElementRef,
             pid: *mut i32,
         ) -> AXError;
+
     }
 
     #[link(name = "CoreFoundation", kind = "framework")]
@@ -182,6 +183,86 @@ enum KeyMsg {
     TabPressed(Vec<WinEntry>),
     /// Option key released — commit and dismiss
     OptionReleased,
+}
+
+// ── Focus history ─────────────────────────────────────────────────────────────
+//
+// Tracks (pid, wid) pairs in most-recently-used order.
+// Index 0 = currently focused window (updated continuously).
+// Index 1 = previously focused window (Alt+Tab target).
+
+const FOCUS_HISTORY_MAX: usize = 64;
+
+type FocusHistory = Arc<Mutex<VecDeque<(i32, u32)>>>;
+
+/// Push (pid, wid) to the front of the history, removing any existing entry
+/// for that wid so there are no duplicates.
+fn focus_push(history: &FocusHistory, pid: i32, wid: u32) {
+    let mut h = history.lock().unwrap();
+    h.retain(|e| e.1 != wid);
+    h.push_front((pid, wid));
+    if h.len() > FOCUS_HISTORY_MAX { h.pop_back(); }
+}
+
+/// Start a background thread that observes NSWorkspace app-activation
+/// notifications and AX window-focus changes, keeping `history` up to date.
+fn start_focus_tracker(history: FocusHistory) {
+    // We need to observe two things:
+    //   1. NSWorkspace didActivateApplication → app-level switch, then find
+    //      its focused window via AXFocusedWindow.
+    //   2. AXFocusedWindowChanged on each active app → intra-app window switch.
+    //
+    // Strategy: poll on a tight timer from a background thread.
+    // This avoids the complexity of NSNotificationCenter across threads and
+    // AXObserver lifecycle management.  50ms poll is imperceptible to users
+    // and cheap (just one AX call per tick).
+
+    std::thread::spawn(move || {
+        let our_pid = std::process::id() as i32;
+        let mut last_wid: u32 = 0;
+
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+
+            // Find the frontmost app via NSWorkspace.
+            // We can't use objc2 here (wrong thread/no autorelease pool),
+            // so we use CGWindowList: raw[0] is always the frontmost window.
+            let opts = ffi::kCGWindowListOptionOnScreenOnly
+                | ffi::kCGWindowListExcludeDesktopElements;
+            let array = unsafe { ffi::CGWindowListCopyWindowInfo(opts, ffi::kCGNullWindowID) };
+            if array.is_null() { continue; }
+
+            let count = unsafe { ffi::CFArrayGetCount(array) };
+            let mut found_pid: i32 = 0;
+            let mut found_wid: u32 = 0;
+
+            'outer: for i in 0..count {
+                let item = unsafe { ffi::CFArrayGetValueAtIndex(array, i) };
+                if item.is_null() { continue; }
+                if unsafe { ffi::CFGetTypeID(item) } != unsafe { ffi::CFDictionaryGetTypeID() } { continue; }
+                let dict = item as ffi::CFDictionaryRef;
+
+                let layer = unsafe { dict_i32(dict, "kCGWindowLayer") }.unwrap_or(999);
+                if layer != 0 { continue; }
+
+                let pid = unsafe { dict_i32(dict, "kCGWindowOwnerPID") }.unwrap_or(0);
+                if pid == 0 || pid == our_pid { continue; }
+
+                let wid = unsafe { dict_i32(dict, "kCGWindowNumber") }.unwrap_or(0) as u32;
+                if wid == 0 { continue; }
+
+                found_pid = pid;
+                found_wid = wid;
+                break 'outer;
+            }
+            unsafe { ffi::CFRelease(array) };
+
+            if found_wid != 0 && found_wid != last_wid {
+                last_wid = found_wid;
+                focus_push(&history, found_pid, found_wid);
+            }
+        }
+    });
 }
 
 // ── CGEventTap callback context ───────────────────────────────────────────────
@@ -588,25 +669,43 @@ fn list_windows_raw() -> Vec<WinEntry> {
 
 /// Build the display list for the switcher overlay.
 ///
-/// `raw` is the unmodified CGWindowList (index 0 = current foreground window).
+/// Windows are ordered by focus recency (most-recently-used first), using
+/// the tracked history.  The currently focused window (current_wid) is moved
+/// to the end so it's always visible but not pre-selected.
 ///
-/// All windows are shown.  The current window (raw[0], by wid) is moved to
-/// the end of the list.  The result is:
+/// Any on-screen windows not in the history are appended at the end (before
+/// the current window) in CGWindowList Z-order.
 ///
-///   [prev (raw[1]), raw[2], …, current (raw[0])]
-///
-/// Index 0 is pre-selected, so a single tap always goes to the previous
-/// window.  After that switch CGWindowList naturally reflects the new
-/// Z-order, so subsequent taps cycle correctly.
-fn build_window_list(raw: Vec<WinEntry>) -> (Vec<WinEntry>, usize) {
+/// Result: [prev, ..., current]   — index 0 pre-selected.
+fn build_window_list(raw: Vec<WinEntry>, history: &FocusHistory, current_wid: u32) -> (Vec<WinEntry>, usize) {
     if raw.is_empty() { return (raw, 0); }
 
-    let current_wid = raw[0].wid;
+    // Build a wid→WinEntry map from the live window list.
+    let mut win_map: HashMap<u32, WinEntry> = raw.iter().map(|e| (e.wid, e.clone())).collect();
 
-    // Partition: everything except the current window, then the current window.
-    let mut out: Vec<WinEntry> = raw.iter().filter(|e| e.wid != current_wid).cloned().collect();
-    if let Some(cur) = raw.into_iter().find(|e| e.wid == current_wid) {
-        out.push(cur);
+    let history_order: Vec<(i32, u32)> = history.lock().unwrap().iter().cloned().collect();
+
+    let mut out: Vec<WinEntry> = Vec::new();
+
+    // 1. Add windows in focus-recency order, skipping the current window.
+    for (_pid, wid) in &history_order {
+        if *wid == current_wid { continue; }
+        if let Some(e) = win_map.remove(wid) {
+            out.push(e);
+        }
+    }
+
+    // 2. Append any remaining on-screen windows not yet in history (Z-order).
+    //    Exclude the current window.
+    for e in &raw {
+        if e.wid != current_wid && win_map.contains_key(&e.wid) {
+            out.push(win_map.remove(&e.wid).unwrap());
+        }
+    }
+
+    // 3. Current window goes last.
+    if let Some(cur) = raw.iter().find(|e| e.wid == current_wid) {
+        out.push(cur.clone());
     }
 
     (out, 0)
@@ -737,6 +836,7 @@ struct SwitcherApp {
     win_colors: Arc<Mutex<Vec<egui::Color32>>>,
     msg_rx:     std::sync::mpsc::Receiver<KeyMsg>,
     colors:     Colors,
+    focus_history: FocusHistory,
     /// PID of the window that was focused before the *current* foreground app.
     prev_pid:   Arc<AtomicI32>,
     /// Live Option key state written by the event tap thread.
@@ -779,20 +879,36 @@ impl eframe::App for SwitcherApp {
                     self.selected.store((cur + 1) % len, Ordering::Relaxed);
                 }
             } else {
-                // Use the snapshot captured at tap time — the Z-order was
-                // clean then, before mofisw gained focus.
-                let raw        = tab_snap;
-                let prev        = raw.get(1).map(|e| e.pid).unwrap_or(0);
-                let prev_wid    = raw.get(1).map(|e| e.wid).unwrap_or(0);
-                let prev_title  = raw.get(1).map(|e| e.win_title.clone()).unwrap_or_default();
-                self.pending_prev_pid   = prev;
+                // tab_snap was captured at tap time before mofisw touched focus.
+                let raw = tab_snap;
+
+                // Current window is raw[0].  Use focus history to find prev.
+                let current_wid = raw.get(0).map(|e| e.wid).unwrap_or(0);
+                let (prev_pid, prev_wid, prev_title) = {
+                    let h = self.focus_history.lock().unwrap();
+                    // history[0] is current (just pushed by the poller).
+                    // Find the first entry whose wid differs from current.
+                    h.iter()
+                        .find(|(_, wid)| *wid != current_wid)
+                        .and_then(|(pid, wid)| {
+                            raw.iter().find(|e| e.wid == *wid)
+                                .map(|e| (*pid, *wid, e.win_title.clone()))
+                        })
+                        .unwrap_or_else(|| {
+                            // History empty or no match — fall back to raw[1]
+                            raw.get(1)
+                                .map(|e| (e.pid, e.wid, e.win_title.clone()))
+                                .unwrap_or((0, 0, String::new()))
+                        })
+                };
+
+                self.pending_prev_pid   = prev_pid;
                 self.pending_prev_wid   = prev_wid;
                 self.pending_prev_title = prev_title;
-                self.prev_pid.store(prev, Ordering::Relaxed);
+                self.prev_pid.store(prev_pid, Ordering::Relaxed);
 
-                // Pass raw into build_window_list — it moves the current
-                // window to the end, leaving prev (raw[1]) at index 0.
-                let (wins, sel) = build_window_list(raw);
+                // Build display list ordered by focus recency.
+                let (wins, sel) = build_window_list(raw, &self.focus_history, current_wid);
                 let colors = build_window_colors(&wins);
                 *self.windows.lock().unwrap()    = wins;
                 *self.win_colors.lock().unwrap() = colors;
@@ -973,6 +1089,9 @@ fn main() -> eframe::Result<()> {
     let option_down = Arc::new(AtomicBool::new(false));
     start_key_listener(tx, Arc::clone(&option_down));
 
+    let focus_history: FocusHistory = Arc::new(Mutex::new(VecDeque::new()));
+    start_focus_tracker(Arc::clone(&focus_history));
+
     let visible   = Arc::new(AtomicBool::new(false));
     let selected  = Arc::new(AtomicUsize::new(0));
     let prev_pid  = Arc::new(AtomicI32::new(0));
@@ -1005,19 +1124,20 @@ fn main() -> eframe::Result<()> {
                 let app = NSApplication::sharedApplication(mtm);
                 app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
             }
-                Box::new(SwitcherApp {
-                    visible,
-                    selected,
-                    windows,
-                    win_colors,
-                    msg_rx: rx,
-                    colors: Colors::kanagawa(),
-                    prev_pid,
-                    option_down,
-                    pending_prev_pid:   0,
-                    pending_prev_wid:   0,
-                    pending_prev_title: String::new(),
-                })
+            Box::new(SwitcherApp {
+                visible,
+                selected,
+                windows,
+                win_colors,
+                msg_rx: rx,
+                colors: Colors::kanagawa(),
+                focus_history,
+                prev_pid,
+                option_down,
+                pending_prev_pid:   0,
+                pending_prev_wid:   0,
+                pending_prev_title: String::new(),
+            })
         }),
     )
 }
