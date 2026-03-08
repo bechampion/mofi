@@ -427,8 +427,8 @@ fn raise_window(pid: i32, wid: u32, win_title: &str) {
             return;
         }
 
-        let cf_wid_attr    = cf_str("AXWindowIdentifier");
-        let cf_title_attr  = cf_str("AXTitle");
+        let cf_wid_attr     = cf_str("AXWindowIdentifier");
+        let cf_title_attr   = cf_str("AXTitle");
         let cf_raise_action = cf_str("AXRaise");
 
         let count = ffi::CFArrayGetCount(windows_val as ffi::CFArrayRef);
@@ -792,19 +792,26 @@ impl eframe::App for SwitcherApp {
                 *self.win_colors.lock().unwrap() = colors;
                 self.selected.store(sel, Ordering::Relaxed);
 
-                if self.option_down.load(Ordering::Relaxed) {
-                    // Option is still held — show the overlay.
-                    self.visible.store(true, Ordering::Relaxed);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                } else {
-                    // Option already released before update() ran — silent swap.
+                // If OptionReleased arrived in the same frame as TabPressed,
+                // or option_down is already false, do a silent swap instead of
+                // showing the overlay.  Checking do_hide here is race-free
+                // because both messages come from the same channel in order.
+                let instant_release = do_hide || !self.option_down.load(Ordering::Relaxed);
+                if instant_release {
+                    // Silent swap — jump straight to previously focused window.
                     if self.pending_prev_pid > 0 {
                         raise_window(self.pending_prev_pid, self.pending_prev_wid, &self.pending_prev_title.clone());
                     }
                     self.pending_prev_pid   = 0;
                     self.pending_prev_wid   = 0;
                     self.pending_prev_title = String::new();
+                    // Mark do_hide consumed so the block below doesn't double-fire.
+                    do_hide = false;
+                } else {
+                    // Option is still held — show the overlay.
+                    self.visible.store(true, Ordering::Relaxed);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
             }
         }
