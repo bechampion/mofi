@@ -451,8 +451,8 @@ pub enum SocketMsg {
 /// Render a square PNG icon — Kanagawa dark background, crystalBlue border,
 /// bold "M" in Maple Mono NF Bold — and return the raw PNG bytes.
 fn render_menubar_icon() -> Vec<u8> {
-    // Dimmed oniViolet bg, lightBlue border, fujiWhite M
-    render_icon_colors([88, 57, 132, 255], [220, 215, 186, 255], 'M', None, 34.0)
+    // Very dark violet bg, border same color as bg, fujiWhite M
+    render_icon_colors([45, 28, 70, 255], [220, 215, 186, 255], 'M', None, 34.0)
 }
 
 /// Render the icon with explicit bg/fg/border RGBA colours, glyph, optional font path override,
@@ -470,8 +470,8 @@ fn render_icon_colors(bg: [u8; 4], fg: [u8; 4], glyph: char, font_path_override:
         px.copy_from_slice(&bg);
     }
 
-    // 1-px lightBlue border — brighter than the dimmed bg so it's visible
-    let border: [u8; 4] = [173, 205, 247, 255];
+    // 1-px border — same color as bg (subtle inset shape, no color contrast)
+    let border: [u8; 4] = bg;
     for i in 0..SIZE {
         let set = |buf: &mut Vec<u8>, x: usize, y: usize| {
             let off = (y * SIZE + x) * 4;
@@ -608,7 +608,7 @@ pub fn flash_icon(glyph: char) {
         .unwrap()
         .join("Library/Fonts/SymbolsNerdFont-Regular.ttf");
     let png = render_icon_colors(
-        [147, 96, 220, 255],  // oniViolet bg (unchanged)
+        [45, 28, 70, 255],    // same dark bg as normal icon
         [220, 215, 186, 255], // fujiWhite glyph
         glyph,
         Some(&nf_font),
