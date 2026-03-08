@@ -5,62 +5,84 @@ mod launcher;
 mod pass;
 mod ui;
 
+#[cfg(target_os = "linux")]
+mod layer_window;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-
-use eframe::egui;
-use signal_hook::consts::SIGUSR1;
 
 const PID_FILE: &str = "/tmp/mofi.pid";
 const SOCK_FILE: &str = "/tmp/mofi.sock";
 
-fn main() -> eframe::Result<()> {
+fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(|s| s.as_str()).unwrap_or("--daemon");
 
     match mode {
         "--client" => {
+            #[cfg(target_os = "linux")]
+            client_oneshot(ui::Mode::Apps);
+            #[cfg(not(target_os = "linux"))]
             client_main();
-            Ok(())
+        }
+        "--password" => {
+            #[cfg(target_os = "linux")]
+            client_oneshot(ui::Mode::Pass);
+            #[cfg(not(target_os = "linux"))]
+            show_tab_main("pass");
+        }
+        "--clipboard" => {
+            #[cfg(target_os = "linux")]
+            client_oneshot(ui::Mode::Clipboard);
+            #[cfg(not(target_os = "linux"))]
+            show_tab_main("clip");
         }
         "--pass" => {
             show_tab_main("pass");
-            Ok(())
         }
         "--clip" => {
             show_tab_main("clip");
-            Ok(())
         }
         "--input" => {
             input_client_main();
-            Ok(())
         }
         "--themes" => {
             themes_client_main();
-            Ok(())
         }
         "--install" => {
             install_main();
-            Ok(())
         }
         "--restart" => {
             restart_main();
-            Ok(())
         }
         _ => run_daemon(),
     }
 }
 
+fn connect_with_retry() -> Option<UnixStream> {
+    // Retry for up to ~2 seconds in case the daemon is still starting up.
+    for _ in 0..20 {
+        match UnixStream::connect(SOCK_FILE) {
+            Ok(s) => return Some(s),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+    None
+}
+
 // ── --pass / --clip (show on a specific tab, wait for selection) ──────────────
 
 fn show_tab_main(tab: &str) {
-    let mut stream = match UnixStream::connect(SOCK_FILE) {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("mofi: daemon not running (socket not found at {})", SOCK_FILE);
+    let mut stream = match connect_with_retry() {
+        Some(s) => s,
+        None => {
+            eprintln!(
+                "mofi: daemon not running (socket not found at {})",
+                SOCK_FILE
+            );
             std::process::exit(1);
         }
     };
@@ -101,13 +123,47 @@ fn show_tab_main(tab: &str) {
     }
 }
 
-// ── --client (existing toggle / pass flow) ────────────────────────────────────
+// ── --client daemonless (Linux one-shot) ─────────────────────────────────────
 
+#[cfg(target_os = "linux")]
+fn client_oneshot(initial_mode: ui::Mode) {
+    let app = ui::RofiApp::new_oneshot_with_mode(initial_mode);
+    let app = layer_window::run_oneshot(app);
+
+    // Inspect the result and act on it.
+    match app.oneshot_result {
+        Some(Some(entry)) => {
+            // Pass entry selected — decrypt and copy.
+            if pass::copy_password_client(&entry) {
+                println!("Copied {}", entry);
+                std::process::exit(0);
+            } else {
+                eprintln!("mofi: failed to decrypt {}", entry);
+                std::process::exit(1);
+            }
+        }
+        Some(None) => {
+            // Cancelled or non-pass selection (app/clip handled inline).
+            std::process::exit(0);
+        }
+        None => {
+            // Should not happen — means the window closed without setting a result.
+            std::process::exit(1);
+        }
+    }
+}
+
+// ── --client (existing daemon toggle / pass flow — macOS / fallback) ─────────
+
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn client_main() {
-    let mut stream = match UnixStream::connect(SOCK_FILE) {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("mofi: daemon not running (socket not found at {})", SOCK_FILE);
+    let mut stream = match connect_with_retry() {
+        Some(s) => s,
+        None => {
+            eprintln!(
+                "mofi: daemon not running (socket not found at {})",
+                SOCK_FILE
+            );
             std::process::exit(1);
         }
     };
@@ -157,10 +213,13 @@ fn input_client_main() {
         std::process::exit(1);
     }
 
-    let mut stream = match UnixStream::connect(SOCK_FILE) {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("mofi: daemon not running (socket not found at {})", SOCK_FILE);
+    let mut stream = match connect_with_retry() {
+        Some(s) => s,
+        None => {
+            eprintln!(
+                "mofi: daemon not running (socket not found at {})",
+                SOCK_FILE
+            );
             std::process::exit(1);
         }
     };
@@ -219,9 +278,9 @@ fn themes_client_main() {
 
     // Send via the --input protocol: pipe to ourselves as a subprocess.
     // We talk directly to the daemon socket so we don't need to fork.
-    let mut stream = match std::os::unix::net::UnixStream::connect(SOCK_FILE) {
-        Ok(s) => s,
-        Err(_) => {
+    let mut stream = match connect_with_retry() {
+        Some(s) => s,
+        None => {
             eprintln!("mofi: daemon not running");
             std::process::exit(1);
         }
@@ -268,11 +327,24 @@ fn themes_client_main() {
     // Escape → exit silently with 0 (no change).
 }
 
-
-
 // ── --install ─────────────────────────────────────────────────────────────────
 
 fn install_main() {
+    #[cfg(target_os = "macos")]
+    install_macos();
+
+    #[cfg(target_os = "linux")]
+    install_linux();
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        eprintln!("mofi: --install is not supported on this platform");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_macos() {
     use std::path::PathBuf;
 
     // Resolve the absolute path to this binary.
@@ -282,13 +354,11 @@ fn install_main() {
         .expect("cannot canonicalize binary path");
     let bin_str = bin.to_string_lossy();
 
-    println!("mofi --install");
+    println!("mofi --install (macOS)");
     println!("  binary: {}", bin_str);
 
     // ── 1. launchd plist ──────────────────────────────────────────────────────
-    let launch_agents = PathBuf::from(
-        shellexpand::tilde("~/Library/LaunchAgents").as_ref()
-    );
+    let launch_agents = PathBuf::from(shellexpand::tilde("~/Library/LaunchAgents").as_ref());
     fs::create_dir_all(&launch_agents).ok();
     let plist_path = launch_agents.join("com.user.mofi.plist");
 
@@ -328,8 +398,10 @@ fn install_main() {
         println!("  [plist] unloaded existing agent");
     }
 
-    fs::write(&plist_path, &plist)
-        .unwrap_or_else(|e| { eprintln!("mofi: failed to write plist: {}", e); std::process::exit(1); });
+    fs::write(&plist_path, &plist).unwrap_or_else(|e| {
+        eprintln!("mofi: failed to write plist: {}", e);
+        std::process::exit(1);
+    });
     println!("  [plist] written → {}", plist_path.display());
 
     // Load the new agent.
@@ -362,21 +434,125 @@ fn install_main() {
             .create(true)
             .append(true)
             .open(&skhdrc)
-            .unwrap_or_else(|e| { eprintln!("mofi: cannot open ~/.skhdrc: {}", e); std::process::exit(1); });
+            .unwrap_or_else(|e| {
+                eprintln!("mofi: cannot open ~/.skhdrc: {}", e);
+                std::process::exit(1);
+            });
         use std::io::Write as _;
-        file.write_all(block.as_bytes())
-            .unwrap_or_else(|e| { eprintln!("mofi: cannot write ~/.skhdrc: {}", e); std::process::exit(1); });
+        file.write_all(block.as_bytes()).unwrap_or_else(|e| {
+            eprintln!("mofi: cannot write ~/.skhdrc: {}", e);
+            std::process::exit(1);
+        });
         println!("  [skhd]  appended hotkey → ~/.skhdrc");
 
         // Reload skhd if it is running.
         let reload = std::process::Command::new("skhd").arg("--reload").status();
         match reload {
             Ok(s) if s.success() => println!("  [skhd]  reloaded"),
-            Ok(_) | Err(_)       => println!("  [skhd]  skhd not running — start it with: skhd --start-service"),
+            Ok(_) | Err(_) => {
+                println!("  [skhd]  skhd not running — start it with: skhd --start-service")
+            }
         }
     }
 
     // ── 3. mofi config dir ───────────────────────────────────────────────────
+    install_config();
+
+    println!();
+    println!("Done. mofi is installed and running.");
+    println!("  Open with: Cmd+Space");
+    println!("  Pick a theme: mofi --themes");
+}
+
+#[cfg(target_os = "linux")]
+fn install_linux() {
+    use std::path::PathBuf;
+
+    let bin = std::env::current_exe()
+        .expect("cannot resolve current binary path")
+        .canonicalize()
+        .expect("cannot canonicalize binary path");
+    let bin_str = bin.to_string_lossy();
+
+    println!("mofi --install (Linux)");
+    println!("  binary: {}", bin_str);
+
+    // ── 1. systemd user service ───────────────────────────────────────────────
+    let systemd_dir = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from(shellexpand::tilde("~/.config").as_ref()))
+        .join("systemd/user");
+    fs::create_dir_all(&systemd_dir).ok();
+    let service_path = systemd_dir.join("mofi.service");
+
+    let service = format!(
+        r#"[Unit]
+Description=mofi launcher daemon
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart={bin} --daemon
+Restart=on-failure
+RestartSec=3s
+
+[Install]
+WantedBy=graphical-session.target
+"#,
+        bin = bin_str
+    );
+
+    fs::write(&service_path, &service).unwrap_or_else(|e| {
+        eprintln!("mofi: failed to write service file: {}", e);
+        std::process::exit(1);
+    });
+    println!("  [systemd] written → {}", service_path.display());
+
+    // Reload and enable.
+    let reload = std::process::Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status();
+    match reload {
+        Ok(s) if s.success() => println!("  [systemd] daemon-reload ok"),
+        _ => eprintln!("  [systemd] daemon-reload failed (is systemd --user running?)"),
+    }
+
+    let enable = std::process::Command::new("systemctl")
+        .args(["--user", "enable", "--now", "mofi.service"])
+        .status();
+    match enable {
+        Ok(s) if s.success() => println!("  [systemd] enabled & started mofi.service"),
+        Ok(s) => eprintln!("  [systemd] enable/start exited {}", s),
+        Err(e) => eprintln!("  [systemd] error: {}", e),
+    }
+
+    // ── 2. hotkey hint ────────────────────────────────────────────────────────
+    println!();
+    println!("  Hotkey: bind a key in your compositor/WM to run:");
+    println!("    {} --client", bin_str);
+    println!("  Examples:");
+    println!(
+        "    Hyprland  → bind = SUPER, Space, exec, {} --client",
+        bin_str
+    );
+    println!(
+        "    Sway      → bindsym Mod4+space exec {} --client",
+        bin_str
+    );
+    println!(
+        "    keyd / sxhkd — add a binding to call {} --client",
+        bin_str
+    );
+
+    // ── 3. mofi config dir ───────────────────────────────────────────────────
+    install_config();
+
+    println!();
+    println!("Done. mofi is installed.");
+    println!("  Pick a theme: mofi --themes");
+}
+
+fn install_config() {
+    use std::path::PathBuf;
     let config_dir = PathBuf::from(shellexpand::tilde("~/.config/mofi").as_ref());
     fs::create_dir_all(&config_dir).ok();
     let config_file = config_dir.join("config.toml");
@@ -387,24 +563,36 @@ fn install_main() {
     } else {
         println!("  [config] already exists — skipping");
     }
-
-    println!();
-    println!("Done. mofi is installed and running.");
-    println!("  Open with: Cmd+Space");
-    println!("  Pick a theme: mofi --themes");
 }
 
 // ── --restart ─────────────────────────────────────────────────────────────────
 
 fn restart_main() {
+    #[cfg(target_os = "macos")]
+    restart_macos();
+
+    #[cfg(target_os = "linux")]
+    restart_linux();
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        eprintln!("mofi: --restart is not supported on this platform");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn restart_macos() {
     use std::path::PathBuf;
 
-    let plist = PathBuf::from(
-        shellexpand::tilde("~/Library/LaunchAgents/com.user.mofi.plist").as_ref()
-    );
+    let plist =
+        PathBuf::from(shellexpand::tilde("~/Library/LaunchAgents/com.user.mofi.plist").as_ref());
 
     if !plist.exists() {
-        eprintln!("mofi: plist not found at {} — run `mofi --install` first", plist.display());
+        eprintln!(
+            "mofi: plist not found at {} — run `mofi --install` first",
+            plist.display()
+        );
         std::process::exit(1);
     }
 
@@ -418,7 +606,10 @@ fn restart_main() {
     match unload {
         Ok(s) if s.success() => println!("ok"),
         Ok(s) => println!("exited {}", s),
-        Err(e) => { eprintln!("error: {}", e); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        }
     }
 
     print!("  [restart] loading...   ");
@@ -428,15 +619,47 @@ fn restart_main() {
         .status();
     match load {
         Ok(s) if s.success() => println!("ok"),
-        Ok(s) => { eprintln!("launchctl load exited {}", s); std::process::exit(1); }
-        Err(e) => { eprintln!("error: {}", e); std::process::exit(1); }
+        Ok(s) => {
+            eprintln!("launchctl load exited {}", s);
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        }
     }
 
     // Give the daemon a moment to write its PID file, then confirm.
     std::thread::sleep(std::time::Duration::from_millis(400));
     match fs::read_to_string(PID_FILE) {
         Ok(pid) => println!("  [restart] daemon running (PID {})", pid.trim()),
-        Err(_)  => println!("  [restart] daemon started (PID file not yet written)"),
+        Err(_) => println!("  [restart] daemon started (PID file not yet written)"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn restart_linux() {
+    print!("  [restart] restarting mofi.service... ");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let status = std::process::Command::new("systemctl")
+        .args(["--user", "restart", "mofi.service"])
+        .status();
+    match status {
+        Ok(s) if s.success() => println!("ok"),
+        Ok(s) => {
+            eprintln!("systemctl restart exited {}", s);
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    match fs::read_to_string(PID_FILE) {
+        Ok(pid) => println!("  [restart] daemon running (PID {})", pid.trim()),
+        Err(_) => println!("  [restart] daemon started (PID file not yet written)"),
     }
 }
 
@@ -448,17 +671,36 @@ pub enum SocketMsg {
     InputItems(Vec<String>),
 }
 
-fn run_daemon() -> eframe::Result<()> {
-    let pid = std::process::id();
-    fs::write(PID_FILE, pid.to_string()).ok();
-    let _ = unsafe { libc::atexit(cleanup_files) };
-
-    let toggle = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(SIGUSR1, Arc::clone(&toggle))
-        .expect("Failed to register SIGUSR1 handler");
-
+fn run_daemon() {
+    // Bind the socket FIRST so the PID file is only written once the daemon is
+    // ready to accept connections.  This eliminates the race where a client
+    // reads a valid PID but the socket is not yet listening.
     let _ = fs::remove_file(SOCK_FILE);
     let listener = UnixListener::bind(SOCK_FILE).expect("Failed to bind Unix socket");
+
+    // Write PID now that we are listening.
+    let pid = std::process::id();
+    fs::write(PID_FILE, pid.to_string()).ok();
+
+    // Clean up on SIGTERM (systemctl stop).  We register a flag and check it
+    // in the event loop so cleanup happens in the main thread — no background
+    // thread that could race with the next daemon instance's startup.
+    let sigterm_fired = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&sigterm_fired))
+        .expect("Failed to register SIGTERM handler");
+
+    // Each SIGUSR1 increments the counter; the UI thread drains it one toggle
+    // at a time so rapid double-presses are not collapsed into a single event.
+    let toggle = Arc::new(AtomicUsize::new(0));
+    {
+        let t = Arc::clone(&toggle);
+        unsafe {
+            signal_hook::low_level::register(libc::SIGUSR1, move || {
+                t.fetch_add(1, Ordering::Relaxed);
+            })
+            .expect("Failed to register SIGUSR1 handler");
+        }
+    }
 
     // Shared slot for the pass-entry result (existing mechanism).
     let pending_entry: Arc<Mutex<Option<Option<String>>>> = Arc::new(Mutex::new(None));
@@ -491,43 +733,65 @@ fn run_daemon() -> eframe::Result<()> {
             let p_is_themes = Arc::clone(&pending_input_is_themes_sock);
             let i_result = Arc::clone(&input_result_sock);
             let p_mode = Arc::clone(&pending_mode_sock);
-            std::thread::spawn(move || handle_client(stream, pending, p_input, p_is_themes, i_result, p_mode));
+            std::thread::spawn(move || {
+                handle_client(stream, pending, p_input, p_is_themes, i_result, p_mode)
+            });
         }
     });
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([560.0, 320.0])
-            .with_min_inner_size([360.0, 160.0])
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_always_on_top()
-            .with_resizable(false)
-            .with_active(true)
-            .with_visible(false),
-        centered: true,
-        vsync: false,
-        multisampling: 0,
-        depth_buffer: 0,
-        hardware_acceleration: eframe::HardwareAcceleration::Preferred,
-        ..Default::default()
-    };
+    #[cfg(target_os = "linux")]
+    {
+        let app = ui::RofiApp::new_linux(
+            toggle,
+            pending_entry,
+            pending_input,
+            input_result,
+            pending_input_is_themes,
+            pending_mode,
+        );
+        layer_window::run(app, sigterm_fired);
+        // Clean up runtime files when the event loop exits (SIGTERM or normal close).
+        let _ = fs::remove_file(SOCK_FILE);
+        let _ = fs::remove_file(PID_FILE);
+    }
 
-    eframe::run_native(
-        "mofi",
-        options,
-        Box::new(move |cc| {
-            Box::new(ui::RofiApp::new(
-                cc,
-                toggle,
-                pending_entry,
-                pending_input,
-                input_result,
-                pending_input_is_themes,
-                pending_mode,
-            ))
-        }),
-    )
+    #[cfg(target_os = "macos")]
+    {
+        use eframe::egui as feframe_egui;
+        let options = eframe::NativeOptions {
+            viewport: feframe_egui::ViewportBuilder::default()
+                .with_inner_size([1.0, 1.0])
+                .with_min_inner_size([1.0, 1.0])
+                .with_decorations(false)
+                .with_transparent(true)
+                .with_always_on_top()
+                .with_resizable(true)
+                .with_app_id("mofi"),
+            centered: false,
+            vsync: false,
+            multisampling: 0,
+            depth_buffer: 0,
+            hardware_acceleration: eframe::HardwareAcceleration::Preferred,
+            ..Default::default()
+        };
+
+        eframe::run_native(
+            "mofi",
+            options,
+            Box::new(move |cc| {
+                Box::new(ui::RofiApp::new(
+                    cc,
+                    toggle,
+                    pending_entry,
+                    pending_input,
+                    input_result,
+                    pending_input_is_themes,
+                    pending_mode,
+                ))
+            }),
+        )
+        .unwrap();
+    }
 }
 
 fn handle_client(
@@ -555,19 +819,31 @@ fn handle_client(
         // Fall through to the pending_entry wait loop below.
     } else if line.starts_with("input\t") || line.starts_with("themes\t") {
         let is_themes = line.starts_with("themes\t");
-        let rest = if is_themes { &line["themes\t".len()..] } else { &line["input\t".len()..] };
+        let rest = if is_themes {
+            &line["themes\t".len()..]
+        } else {
+            &line["input\t".len()..]
+        };
         let items: Vec<String> = rest.split('\t').map(|s| s.to_string()).collect();
 
         // Clear any previous result, set the themes flag, then post the items.
-        { *input_result.lock().unwrap() = None; }
-        { *pending_input_is_themes.lock().unwrap() = is_themes; }
-        { *pending_input.lock().unwrap() = Some(items); }
+        {
+            *input_result.lock().unwrap() = None;
+        }
+        {
+            *pending_input_is_themes.lock().unwrap() = is_themes;
+        }
+        {
+            *pending_input.lock().unwrap() = Some(items);
+        }
 
         // Wait for the UI to post a result (selected string or None for cancel).
         let result = loop {
             {
                 let mut lock = input_result.lock().unwrap();
-                if let Some(val) = lock.take() { break val; }
+                if let Some(val) = lock.take() {
+                    break val;
+                }
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
@@ -582,8 +858,25 @@ fn handle_client(
 
     // "ready" (--client) or "tab:<x>" (--pass / --clip) — wait for selection.
     {
-        // Clear any stale value left from a previous session before waiting.
-        *pending_entry.lock().unwrap() = None;
+        // Clear any stale *pass-entry name* left from a previous session.
+        // IMPORTANT: do NOT clear Some(None) — that means hide() already fired
+        // while we were waiting to be scheduled; in that case exit immediately.
+        {
+            let mut l = pending_entry.lock().unwrap();
+            match *l {
+                Some(None) => {
+                    // hide() already fired before we even started waiting — return now.
+                    drop(l);
+                    stream.write_all(b"\n").ok();
+                    return;
+                }
+                Some(Some(_)) => {
+                    // Stale entry name from a prior session — discard it.
+                    *l = None;
+                }
+                None => {} // normal: no stale value
+            }
+        }
         let mut waited = 0;
         let entry = loop {
             {
@@ -605,9 +898,4 @@ fn handle_client(
         };
         stream.write_all(response.as_bytes()).ok();
     }
-}
-
-extern "C" fn cleanup_files() {
-    let _ = fs::remove_file(PID_FILE);
-    let _ = fs::remove_file(SOCK_FILE);
 }

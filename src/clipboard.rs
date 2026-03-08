@@ -76,21 +76,126 @@ fn push_entry(history: &mut Vec<ClipboardEntry>, text: String) {
         .unwrap_or_default()
         .as_secs();
 
-    history.insert(0, ClipboardEntry { text, captured_at: ts });
+    history.insert(
+        0,
+        ClipboardEntry {
+            text,
+            captured_at: ts,
+        },
+    );
     history.truncate(MAX_HISTORY);
     save_history(history);
 }
 
-/// Read current clipboard content via `pbpaste`.
-fn read_current() -> Option<String> {
-    let out = std::process::Command::new("pbpaste")
-        .output()
-        .ok()?;
+// ── Platform clipboard read ───────────────────────────────────────────────────
+
+/// Read current clipboard content.
+pub fn read_current() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("pbpaste").output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout).to_string();
+        if s.trim().is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Try wl-paste (Wayland) first, fall back to xclip (X11).
+        if let Some(s) = run_paste_cmd("wl-paste", &["--no-newline"]) {
+            return Some(s);
+        }
+        if let Some(s) = run_paste_cmd("xclip", &["-selection", "clipboard", "-o"]) {
+            return Some(s);
+        }
+        // arboard as last resort (links libxcb / wayland at compile time).
+        if let Ok(mut cb) = arboard::Clipboard::new() {
+            if let Ok(text) = cb.get_text() {
+                if !text.trim().is_empty() {
+                    return Some(text);
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_paste_cmd(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(cmd).args(args).output().ok()?;
     if !out.status.success() {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).to_string();
-    if s.trim().is_empty() { None } else { Some(s) }
+    if s.trim().is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+// ── Platform clipboard write ──────────────────────────────────────────────────
+
+/// Write text to the system clipboard.
+pub fn write_clipboard(text: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Write;
+        if let Ok(mut child) = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Try wl-copy (Wayland) first, then xclip (X11).
+        let written = try_write_clipboard_cmd("wl-copy", &[], text)
+            || try_write_clipboard_cmd("xclip", &["-selection", "clipboard"], text);
+        if !written {
+            // arboard fallback.
+            if let Ok(mut cb) = arboard::Clipboard::new() {
+                let _ = cb.set_text(text);
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = text;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn try_write_clipboard_cmd(cmd: &str, args: &[&str], text: &str) -> bool {
+    use std::io::Write;
+    let child = std::process::Command::new(cmd)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .spawn();
+    if let Ok(mut child) = child {
+        if let Some(stdin) = child.stdin.as_mut() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        return child.wait().map(|s| s.success()).unwrap_or(false);
+    }
+    false
 }
 
 /// Spawn a background thread that polls the clipboard every 500 ms.

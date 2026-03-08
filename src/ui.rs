@@ -1,11 +1,14 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use eframe::egui::{
+use egui::{
     self, Color32, FontData, FontDefinitions, FontFamily, FontId, Key, Rounding, Stroke, Vec2,
 };
+
+#[cfg(target_os = "macos")]
 use objc2::rc::Retained;
+#[cfg(target_os = "macos")]
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy,
     NSRunningApplication, NSWorkspace,
@@ -19,6 +22,7 @@ use crate::pass::discover_pass_entries;
 
 // ── macOS helpers ─────────────────────────────────────────────────────────────
 
+#[cfg(target_os = "macos")]
 fn capture_previous_app() -> Option<Retained<NSRunningApplication>> {
     let workspace = NSWorkspace::sharedWorkspace();
     let apps = workspace.runningApplications();
@@ -31,32 +35,90 @@ fn capture_previous_app() -> Option<Retained<NSRunningApplication>> {
     None
 }
 
+#[cfg(target_os = "macos")]
 fn restore_app_focus(app: &NSRunningApplication) {
     app.activateWithOptions(NSApplicationActivationOptions(0));
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const MAPLE_MONO_REGULAR: &str = "/Users/jgarcia/Library/Fonts/MapleMono-NF-Regular.ttf";
-const MAPLE_MONO_MEDIUM: &str = "/Users/jgarcia/Library/Fonts/MapleMono-NF-Medium.ttf";
-const ICON_SIZE: f32 = 24.0;
-const ROW_HEIGHT: f32 = 38.0;
+const ICON_SIZE: f32 = 26.0;
+const ROW_HEIGHT: f32 = 42.0;
 const MAX_VISIBLE_ROWS: usize = 7;
+
+/// Return the paths to look for the custom fonts, in priority order.
+/// On macOS: ~/Library/Fonts  On Linux: ~/.local/share/fonts and system paths.
+fn font_search_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        #[cfg(target_os = "macos")]
+        dirs.push(home.join("Library/Fonts"));
+
+        #[cfg(target_os = "linux")]
+        {
+            dirs.push(home.join(".local/share/fonts"));
+            dirs.push(home.join(".fonts"));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        dirs.push(std::path::PathBuf::from("/usr/local/share/fonts"));
+        dirs.push(std::path::PathBuf::from("/usr/share/fonts"));
+        dirs.push(std::path::PathBuf::from("/usr/share/fonts/truetype"));
+        dirs.push(std::path::PathBuf::from("/usr/share/fonts/OTF"));
+    }
+    dirs
+}
+
+/// Try to load a font by stem name (e.g. "MapleMono-NF-Regular").
+/// First tries the exact filename (with .ttf/.otf), then scans font directories
+/// for any file whose name *contains* the stem — handles e.g. "MapleMono-NF-Regular(1).ttf".
+fn find_font(stem: &str) -> Option<Vec<u8>> {
+    // Try exact filenames first.
+    for ext in &["ttf", "otf"] {
+        let filename = format!("{}.{}", stem, ext);
+        for dir in font_search_dirs() {
+            let path = dir.join(&filename);
+            if let Ok(bytes) = std::fs::read(&path) {
+                return Some(bytes);
+            }
+        }
+    }
+    // Fallback: scan directories for any file whose name contains the stem.
+    for dir in font_search_dirs() {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.contains(stem)
+                    && (name_str.ends_with(".ttf") || name_str.ends_with(".otf"))
+                {
+                    if let Ok(bytes) = std::fs::read(entry.path()) {
+                        return Some(bytes);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
 
 // ── Kanagawa palette (kept for per-item accent colors) ────────────────────────
 mod kana {
-    use eframe::egui::Color32;
-    pub const fn hex(r: u8, g: u8, b: u8) -> Color32 { Color32::from_rgb(r, g, b) }
-    pub const CRYSTAL_BLUE:   Color32 = hex(0x7E, 0x9C, 0xD8);
-    pub const ONI_VIOLET:     Color32 = hex(0x95, 0x7F, 0xB8);
-    pub const SPRING_GREEN:   Color32 = hex(0x98, 0xBB, 0x6C);
-    pub const WAVE_AQUA2:     Color32 = hex(0x7A, 0xA8, 0x9F);
-    pub const SAKURA_PINK:    Color32 = hex(0xD2, 0x7E, 0x99);
-    pub const SURIMI_ORANGE:  Color32 = hex(0xFF, 0xA0, 0x66);
-    pub const CARP_YELLOW:    Color32 = hex(0xE6, 0xC3, 0x84);
-    pub const WAVE_RED:       Color32 = hex(0xE4, 0x68, 0x76);
-    pub const SPRING_BLUE:    Color32 = hex(0x7F, 0xB4, 0xCA);
-    pub const BOAT_YELLOW2:   Color32 = hex(0xC0, 0xA3, 0x6E);
+    use egui::Color32;
+    pub const fn hex(r: u8, g: u8, b: u8) -> Color32 {
+        Color32::from_rgb(r, g, b)
+    }
+    pub const CRYSTAL_BLUE: Color32 = hex(0x7E, 0x9C, 0xD8);
+    pub const ONI_VIOLET: Color32 = hex(0x95, 0x7F, 0xB8);
+    pub const SPRING_GREEN: Color32 = hex(0x98, 0xBB, 0x6C);
+    pub const WAVE_AQUA2: Color32 = hex(0x7A, 0xA8, 0x9F);
+    pub const SAKURA_PINK: Color32 = hex(0xD2, 0x7E, 0x99);
+    pub const SURIMI_ORANGE: Color32 = hex(0xFF, 0xA0, 0x66);
+    pub const CARP_YELLOW: Color32 = hex(0xE6, 0xC3, 0x84);
+    pub const WAVE_RED: Color32 = hex(0xE4, 0x68, 0x76);
+    pub const SPRING_BLUE: Color32 = hex(0x7F, 0xB4, 0xCA);
+    pub const BOAT_YELLOW2: Color32 = hex(0xC0, 0xA3, 0x6E);
 }
 
 // ── Nerd Font glyph lookup ────────────────────────────────────────────────────
@@ -65,7 +127,7 @@ fn glyph_for_item(item: &LaunchItem) -> &'static str {
     match item {
         LaunchItem::Clip(e) => glyph_for_clip(&e.text),
         LaunchItem::Pass(e) => glyph_for_pass(&e.name),
-        LaunchItem::App(a)  => glyph_for_app(&a.name),
+        LaunchItem::App(a) => glyph_for_app(&a.name),
     }
 }
 
@@ -77,45 +139,49 @@ fn glyph_for_clip(text: &str) -> &'static str {
         || trimmed.starts_with("https://")
         || trimmed.starts_with("ftp://")
     {
-        return "\u{F0AC}";  // nf-fa-globe
+        return "\u{F0AC}"; // nf-fa-globe
     }
     // Email address
     if !trimmed.contains('\n') && trimmed.contains('@') && trimmed.contains('.') {
-        return "\u{F0E0}";  // nf-fa-envelope
+        return "\u{F0E0}"; // nf-fa-envelope
     }
     // File path
     if trimmed.starts_with('/') || trimmed.starts_with("~/") {
-        return "\u{F15B}";  // nf-fa-file
+        return "\u{F15B}"; // nf-fa-file
     }
     // UUID  e.g. 550e8400-e29b-41d4-a716-446655440000
     let is_uuid = {
         let p: Vec<&str> = trimmed.split('-').collect();
         p.len() == 5
-            && p[0].len() == 8  && p[1].len() == 4
-            && p[2].len() == 4  && p[3].len() == 4
+            && p[0].len() == 8
+            && p[1].len() == 4
+            && p[2].len() == 4
+            && p[3].len() == 4
             && p[4].len() == 12
             && p.iter().all(|s| s.chars().all(|c| c.is_ascii_hexdigit()))
     };
     if is_uuid {
-        return "\u{F0CB2}";  // nf-md-numeric
+        return "\u{F0CB2}"; // nf-md-numeric
     }
     // Pure numeric / hex token (short, no spaces)
     if !trimmed.contains('\n')
         && trimmed.len() <= 64
-        && trimmed.chars().all(|c| c.is_ascii_hexdigit() || c == 'x' || c == 'X' || c == '-' || c == '_')
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == 'x' || c == 'X' || c == '-' || c == '_')
     {
-        return "\u{F0CB2}";  // nf-md-numeric
+        return "\u{F0CB2}"; // nf-md-numeric
     }
     // Multi-line → text-box stack
     if trimmed.contains('\n') {
-        return "\u{F0219}";  // nf-md-text_box_multiple
+        return "\u{F0219}"; // nf-md-text_box_multiple
     }
     // Short snippet → single page
     if trimmed.len() <= 60 {
-        return "\u{F0F6}";   // nf-fa-file_text_o  (small note / page)
+        return "\u{F0F6}"; // nf-fa-file_text_o  (small note / page)
     }
     // Long single-line text
-    "\u{F0219}"              // nf-md-text_box
+    "\u{F0219}" // nf-md-text_box
 }
 
 /// Pick a padlock glyph based on the pass entry path.
@@ -123,95 +189,137 @@ fn glyph_for_pass(name: &str) -> &'static str {
     let lower = name.to_lowercase();
     // Category hints from folder/entry name.
     if lower.contains("ssh") || lower.contains("gpg") || lower.contains("key") {
-        "\u{F0306}"   // nf-md-key_variant
+        "\u{F0306}" // nf-md-key_variant
     } else if lower.contains("bank") || lower.contains("finance") || lower.contains("credit") {
-        "\u{F024B}"   // nf-md-bank
+        "\u{F024B}" // nf-md-bank
     } else if lower.contains("email") || lower.contains("mail") || lower.contains("smtp") {
-        "\u{F0E0}"    // nf-fa-envelope
+        "\u{F0E0}" // nf-fa-envelope
     } else if lower.contains("wifi") || lower.contains("network") || lower.contains("vpn") {
-        "\u{F0A72}"   // nf-md-lock_check  (network cred)
+        "\u{F0A72}" // nf-md-lock_check  (network cred)
     } else if lower.contains("github") || lower.contains("gitlab") || lower.contains("git") {
-        "\u{F0A70}"   // nf-md-source_repository_multiple → use lock + git feel
+        "\u{F0A70}" // nf-md-source_repository_multiple → use lock + git feel
     } else if lower.contains("work") || lower.contains("corp") || lower.contains("office") {
-        "\u{F0A75}"   // nf-md-briefcase_lock
+        "\u{F0A75}" // nf-md-briefcase_lock
     } else if name.contains('/') {
-        "\u{F023}"    // nf-fa-lock  (nested entry — standard padlock)
+        "\u{F023}" // nf-fa-lock  (nested entry — standard padlock)
     } else {
-        "\u{F09C0}"   // nf-md-lock  (top-level entry — solid lock)
+        "\u{F09C0}" // nf-md-lock  (top-level entry — solid lock)
     }
 }
 
 /// Returns a representative Nerd Font glyph for each built-in theme name.
 fn theme_glyph_for(name: &str) -> &'static str {
     match name {
-        "kanagawa"   => "\u{E6AC}",   // nf-custom-vim  (wave/japanese feel)
-        "gruvbox"    => "\u{F0043}",  // nf-md-fire     (warm earthy tones)
-        "nord"       => "\u{F0599}",  // nf-md-snowflake
-        "tokyonight" => "\u{F0E7B}",  // nf-md-city_variant_outline
-        "dracula"    => "\u{F0B4B}",  // nf-md-bat
-        "solarized"  => "\u{F0438}",  // nf-md-weather_sunny
-        "monokai"    => "\u{F0A71}",  // nf-md-coffee
-        "catppuccin" => "\u{F028B}",  // nf-md-cat
-        "onedark"    => "\u{F04A6}",  // nf-md-moon_waning_crescent
-        "rosepine"   => "\u{F04CB}",  // nf-md-pine_tree
-        _            => "\u{F53F}",   // nf-md-palette  (fallback)
+        "kanagawa" => "\u{E6AC}",    // nf-custom-vim  (wave/japanese feel)
+        "gruvbox" => "\u{F0043}",    // nf-md-fire     (warm earthy tones)
+        "nord" => "\u{F0599}",       // nf-md-snowflake
+        "tokyonight" => "\u{F0E7B}", // nf-md-city_variant_outline
+        "dracula" => "\u{F0B4B}",    // nf-md-bat
+        "solarized" => "\u{F0438}",  // nf-md-weather_sunny
+        "monokai" => "\u{F0A71}",    // nf-md-coffee
+        "catppuccin" => "\u{F028B}", // nf-md-cat
+        "onedark" => "\u{F04A6}",    // nf-md-moon_waning_crescent
+        "rosepine" => "\u{F04CB}",   // nf-md-pine_tree
+        _ => "\u{F53F}",             // nf-md-palette  (fallback)
     }
 }
 
 fn glyph_for_app(name: &str) -> &'static str {
     let n = name.to_lowercase();
-    if n.contains("safari")                                            { "\u{E748}" }
-    else if n.contains("firefox")                                      { "\u{E745}" }
-    else if n.contains("chrome") || n.contains("chromium")             { "\u{E743}" }
-    else if n.contains("terminal") || n.contains("iterm")
-         || n.contains("alacritty") || n.contains("warp")
-         || n.contains("kitty") || n.contains("ghostty")               { "\u{EA85}" }
-    else if n.contains("code") || n.contains("vscode")
-         || n.contains("cursor")                                        { "\u{E8DA}" }
-    else if n.contains("xcode")                                        { "\u{E8E8}" }
-    else if n.contains("sublime")                                      { "\u{E7AA}" }
-    else if n.contains("finder")                                       { "\u{F0036}" }
-    else if n.contains("mail")                                         { "\u{F0E0}" }
-    else if n.contains("messages")                                     { "\u{F27A}" }
-    else if n.contains("calendar")                                     { "\u{F073}" }
-    else if n.contains("music")                                        { "\u{F001}" }
-    else if n.contains("spotify")                                      { "\u{F1BC}" }
-    else if n.contains("discord")                                      { "\u{F1FF}" }
-    else if n.contains("slack")                                        { "\u{E8A4}" }
-    else if n.contains("docker")                                       { "\u{E7B0}" }
-    else if n.contains("github desktop") || n.contains("github")      { "\u{E709}" }
-    else if n.contains("figma")                                        { "\u{E7DA}" }
-    else if n.contains("system preferences")
-         || n.contains("system settings")                              { "\u{EB52}" }
-    else if n.contains("app store")                                    { "\u{F0BD}" }
-    else if n.contains("photos")                                       { "\u{F03E}" }
-    else if n.contains("notes")                                        { "\u{F249}" }
-    else if n.contains("maps")                                         { "\u{F279}" }
-    else if n.contains("calculator")                                   { "\u{F1EC}" }
-    else if n.contains("disk utility")                                 { "\u{F02CA}" }
-    else if n.contains("activity monitor")                             { "\u{F0128}" }
-    else if n.contains("time machine")                                 { "\u{F006F}" }
-    else if n.contains("vlc")                                          { "\u{F057C}" }
-    else if n.contains("steam")                                        { "\u{F1B6}" }
-    else if n.contains("postman")                                      { "\u{E86B}" }
-    else if n.contains("1password") || n.contains("onepassword")       { "\u{F0881}" }
-    else if n.contains("dropbox")                                      { "\u{E707}" }
-    else                                                               { "\u{F2D0}" }
+    if n.contains("safari") {
+        "\u{E748}"
+    } else if n.contains("firefox") {
+        "\u{E745}"
+    } else if n.contains("chrome") || n.contains("chromium") {
+        "\u{E743}"
+    } else if n.contains("terminal")
+        || n.contains("iterm")
+        || n.contains("alacritty")
+        || n.contains("warp")
+        || n.contains("kitty")
+        || n.contains("ghostty")
+    {
+        "\u{EA85}"
+    } else if n.contains("code") || n.contains("vscode") || n.contains("cursor") {
+        "\u{E8DA}"
+    } else if n.contains("xcode") {
+        "\u{E8E8}"
+    } else if n.contains("sublime") {
+        "\u{E7AA}"
+    } else if n.contains("finder") {
+        "\u{F0036}"
+    } else if n.contains("mail") {
+        "\u{F0E0}"
+    } else if n.contains("messages") {
+        "\u{F27A}"
+    } else if n.contains("calendar") {
+        "\u{F073}"
+    } else if n.contains("music") {
+        "\u{F001}"
+    } else if n.contains("spotify") {
+        "\u{F1BC}"
+    } else if n.contains("discord") {
+        "\u{F1FF}"
+    } else if n.contains("slack") {
+        "\u{E8A4}"
+    } else if n.contains("docker") {
+        "\u{E7B0}"
+    } else if n.contains("github desktop") || n.contains("github") {
+        "\u{E709}"
+    } else if n.contains("figma") {
+        "\u{E7DA}"
+    } else if n.contains("system preferences") || n.contains("system settings") {
+        "\u{EB52}"
+    } else if n.contains("app store") {
+        "\u{F0BD}"
+    } else if n.contains("photos") {
+        "\u{F03E}"
+    } else if n.contains("notes") {
+        "\u{F249}"
+    } else if n.contains("maps") {
+        "\u{F279}"
+    } else if n.contains("calculator") {
+        "\u{F1EC}"
+    } else if n.contains("disk utility") {
+        "\u{F02CA}"
+    } else if n.contains("activity monitor") {
+        "\u{F0128}"
+    } else if n.contains("time machine") {
+        "\u{F006F}"
+    } else if n.contains("vlc") {
+        "\u{F057C}"
+    } else if n.contains("steam") {
+        "\u{F1B6}"
+    } else if n.contains("postman") {
+        "\u{E86B}"
+    } else if n.contains("1password") || n.contains("onepassword") {
+        "\u{F0881}"
+    } else if n.contains("dropbox") {
+        "\u{E707}"
+    } else {
+        "\u{F2D0}"
+    }
 }
 
 fn glyph_color_for_item(item: &LaunchItem, t: &Theme) -> Color32 {
     match item {
         LaunchItem::Clip(_) => t.accent2,
         LaunchItem::Pass(_) => t.toast,
-        LaunchItem::App(a)  => accent_for_name(&a.name),
+        LaunchItem::App(a) => accent_for_name(&a.name),
     }
 }
 
 fn accent_for_name(name: &str) -> Color32 {
     let accents = [
-        kana::CRYSTAL_BLUE, kana::ONI_VIOLET,    kana::SPRING_GREEN,
-        kana::WAVE_AQUA2,   kana::SAKURA_PINK,   kana::SURIMI_ORANGE,
-        kana::CARP_YELLOW,  kana::WAVE_RED,      kana::SPRING_BLUE,
+        kana::CRYSTAL_BLUE,
+        kana::ONI_VIOLET,
+        kana::SPRING_GREEN,
+        kana::WAVE_AQUA2,
+        kana::SAKURA_PINK,
+        kana::SURIMI_ORANGE,
+        kana::CARP_YELLOW,
+        kana::WAVE_RED,
+        kana::SPRING_BLUE,
         kana::BOAT_YELLOW2,
     ];
     let idx = name.bytes().next().unwrap_or(0) as usize % accents.len();
@@ -229,18 +337,41 @@ fn dim_color(c: Color32) -> Color32 {
 
 // ── Font loading ──────────────────────────────────────────────────────────────
 
-fn load_fonts(ctx: &egui::Context) {
+/// Load fonts and return the best available "medium weight" family.
+/// If MapleMono-NF-Medium is not installed, falls back to Monospace so
+/// we never reference an unregistered FontFamily (which panics in epaint).
+fn load_fonts(ctx: &egui::Context) -> FontFamily {
     let mut fonts = FontDefinitions::default();
-    if let Ok(bytes) = std::fs::read(MAPLE_MONO_REGULAR) {
-        fonts.font_data.insert("MapleMono".to_owned(), FontData::from_owned(bytes));
-        fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "MapleMono".to_owned());
-        fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "MapleMono".to_owned());
+    if let Some(bytes) = find_font("MapleMono-NF-Regular") {
+        fonts
+            .font_data
+            .insert("MapleMono".to_owned(), FontData::from_owned(bytes));
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, "MapleMono".to_owned());
+        fonts
+            .families
+            .entry(FontFamily::Monospace)
+            .or_default()
+            .insert(0, "MapleMono".to_owned());
     }
-    if let Ok(bytes) = std::fs::read(MAPLE_MONO_MEDIUM) {
-        fonts.font_data.insert("MapleMonoMedium".to_owned(), FontData::from_owned(bytes));
-        fonts.families.insert(FontFamily::Name("medium".into()), vec!["MapleMonoMedium".to_owned()]);
-    }
+    let medium_family = if let Some(bytes) = find_font("MapleMono-NF-Medium") {
+        fonts
+            .font_data
+            .insert("MapleMonoMedium".to_owned(), FontData::from_owned(bytes));
+        fonts.families.insert(
+            FontFamily::Name("medium".into()),
+            vec!["MapleMonoMedium".to_owned()],
+        );
+        FontFamily::Name("medium".into())
+    } else {
+        // Medium font not installed — fall back to the regular NF font or Monospace.
+        FontFamily::Monospace
+    };
     ctx.set_fonts(fonts);
+    medium_family
 }
 
 // ── Mode ──────────────────────────────────────────────────────────────────────
@@ -268,10 +399,19 @@ pub struct RofiApp {
     mode: Mode,
     should_close: bool,
     clip_history: ClipboardHistory,
+    /// In oneshot (daemonless) mode, holds the result after the window closes.
+    /// Some(Some(name)) = pass entry selected, Some(None) = cancelled/Escape, None = not done.
+    pub oneshot_result: Option<Option<String>>,
     toast: Option<(String, std::time::Instant)>,
     frame_count: u32,
-    toggle: Arc<AtomicBool>,
+    /// True once egui has reported keyboard focus at least once.
+    /// On Wayland the focus `enter` event may arrive after several frames;
+    /// we must not trigger auto-hide-on-focus-loss until focus was first seen.
+    had_keyboard_focus_ever: bool,
+    toggle: Arc<AtomicUsize>,
     visible: bool,
+    /// Previous focused app — macOS only (focus restore after hide).
+    #[cfg(target_os = "macos")]
     prev_app: Option<Retained<NSRunningApplication>>,
     pending_entry: Arc<Mutex<Option<Option<String>>>>,
     pending_input: Arc<Mutex<Option<Vec<String>>>>,
@@ -288,20 +428,93 @@ pub struct RofiApp {
     // ── Theme hot-reload ──
     theme: Theme,
     config_mtime: Option<SystemTime>,
+    /// The FontFamily to use for medium-weight text.  Normally
+    /// FontFamily::Name("medium") when MapleMono-NF-Medium.ttf is installed,
+    /// otherwise falls back to FontFamily::Monospace to prevent a panic.
+    medium_font: FontFamily,
 }
 
 impl RofiApp {
+    #[cfg(target_os = "macos")]
     pub fn new(
         cc: &eframe::CreationContext,
-        toggle: Arc<AtomicBool>,
+        toggle: Arc<AtomicUsize>,
         pending_entry: Arc<Mutex<Option<Option<String>>>>,
         pending_input: Arc<Mutex<Option<Vec<String>>>>,
         input_result: Arc<Mutex<Option<Option<String>>>>,
         pending_input_is_themes: Arc<Mutex<bool>>,
         pending_mode: Arc<Mutex<Option<String>>>,
     ) -> Self {
-        load_fonts(&cc.egui_ctx);
+        Self::new_with_ctx(
+            &cc.egui_ctx,
+            toggle,
+            pending_entry,
+            pending_input,
+            input_result,
+            pending_input_is_themes,
+            pending_mode,
+        )
+    }
 
+    #[cfg(target_os = "linux")]
+    pub fn new_linux(
+        toggle: Arc<AtomicUsize>,
+        pending_entry: Arc<Mutex<Option<Option<String>>>>,
+        pending_input: Arc<Mutex<Option<Vec<String>>>>,
+        input_result: Arc<Mutex<Option<Option<String>>>>,
+        pending_input_is_themes: Arc<Mutex<bool>>,
+        pending_mode: Arc<Mutex<Option<String>>>,
+    ) -> Self {
+        // On Linux with the layer-shell path, setup() in AppHandler will
+        // pass a real Context. We create a temporary one just to call the
+        // shared constructor; setup() will replace fonts etc. on the real ctx.
+        let tmp_ctx = egui::Context::default();
+        Self::new_with_ctx(
+            &tmp_ctx,
+            toggle,
+            pending_entry,
+            pending_input,
+            input_result,
+            pending_input_is_themes,
+            pending_mode,
+        )
+    }
+
+    /// Daemonless one-shot constructor.  No IPC Arcs needed; the window opens
+    /// immediately (visible=true) and the result is read from `oneshot_result`
+    /// after `layer_window::run_oneshot` returns.
+    #[cfg(target_os = "linux")]
+    pub fn new_oneshot_with_mode(initial_mode: Mode) -> Self {
+        let tmp_ctx = egui::Context::default();
+        let mut app = Self::new_with_ctx(
+            &tmp_ctx,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(false)),
+            Arc::new(Mutex::new(None)),
+        );
+        // Start visible — the surface is already mapped by run_oneshot().
+        app.visible = true;
+        app.mode = initial_mode;
+        // Pre-filter for the requested tab so the list is ready on first frame.
+        app.refilter(true);
+        app
+    }
+
+    fn new_with_ctx(
+        ctx: &egui::Context,
+        toggle: Arc<AtomicUsize>,
+        pending_entry: Arc<Mutex<Option<Option<String>>>>,
+        pending_input: Arc<Mutex<Option<Vec<String>>>>,
+        input_result: Arc<Mutex<Option<Option<String>>>>,
+        pending_input_is_themes: Arc<Mutex<bool>>,
+        pending_mode: Arc<Mutex<Option<String>>>,
+    ) -> Self {
+        let medium_font = load_fonts(ctx);
+
+        #[cfg(target_os = "macos")]
         unsafe {
             use objc2::MainThreadMarker;
             let mtm = MainThreadMarker::new_unchecked();
@@ -312,17 +525,24 @@ impl RofiApp {
         let history = Arc::new(Mutex::new(load_history()));
         start_poller(Arc::clone(&history));
 
-        let mut all_items: Vec<LaunchItem> = discover_apps().into_iter().map(LaunchItem::App).collect();
+        let mut all_items: Vec<LaunchItem> =
+            discover_apps().into_iter().map(LaunchItem::App).collect();
         {
             let lock = history.lock().unwrap();
-            for e in lock.iter().cloned() { all_items.push(LaunchItem::Clip(e)); }
+            for e in lock.iter().cloned() {
+                all_items.push(LaunchItem::Clip(e));
+            }
         }
-        for e in discover_pass_entries() { all_items.push(LaunchItem::Pass(e)); }
+        for e in discover_pass_entries() {
+            all_items.push(LaunchItem::Pass(e));
+        }
 
         let filtered: Vec<usize> = (0..all_items.len()).collect();
         let cfg = Config::load();
         let theme = theme_by_name(cfg.active_theme_name());
-        let config_mtime = std::fs::metadata(config_path()).ok().and_then(|m| m.modified().ok());
+        let config_mtime = std::fs::metadata(config_path())
+            .ok()
+            .and_then(|m| m.modified().ok());
 
         let mut app = Self {
             query: String::new(),
@@ -335,8 +555,11 @@ impl RofiApp {
             clip_history: history,
             toast: None,
             frame_count: 0,
+            had_keyboard_focus_ever: false,
             toggle,
             visible: false,
+            oneshot_result: None,
+            #[cfg(target_os = "macos")]
             prev_app: None,
             pending_entry,
             pending_input,
@@ -349,6 +572,7 @@ impl RofiApp {
             theme_before_preview: None,
             theme,
             config_mtime,
+            medium_font,
         };
         app.refilter(true);
         app
@@ -358,8 +582,11 @@ impl RofiApp {
 
     fn sync_clipboard(&mut self) {
         let clips: Vec<ClipboardEntry> = self.clip_history.lock().unwrap().clone();
-        self.items.retain(|i| matches!(i, LaunchItem::App(_) | LaunchItem::Pass(_)));
-        for e in clips { self.items.push(LaunchItem::Clip(e)); }
+        self.items
+            .retain(|i| matches!(i, LaunchItem::App(_) | LaunchItem::Pass(_)));
+        for e in clips {
+            self.items.push(LaunchItem::Clip(e));
+        }
     }
 
     fn sync_apps(&mut self) {
@@ -369,11 +596,14 @@ impl RofiApp {
     }
 
     fn refilter(&mut self, reset_selection: bool) {
-        let mode_items: Vec<(usize, &LaunchItem)> = self.items.iter().enumerate()
+        let mode_items: Vec<(usize, &LaunchItem)> = self
+            .items
+            .iter()
+            .enumerate()
             .filter(|(_, item)| match self.mode {
-                Mode::Apps      => matches!(item, LaunchItem::App(_)),
+                Mode::Apps => matches!(item, LaunchItem::App(_)),
                 Mode::Clipboard => matches!(item, LaunchItem::Clip(_)),
-                Mode::Pass      => matches!(item, LaunchItem::Pass(_)),
+                Mode::Pass => matches!(item, LaunchItem::Pass(_)),
                 Mode::About | Mode::Input | Mode::Themes => false,
             })
             .collect();
@@ -394,7 +624,10 @@ impl RofiApp {
             self.input_filtered = (0..self.input_items.len()).collect();
         } else {
             let q = self.query.to_lowercase();
-            self.input_filtered = self.input_items.iter().enumerate()
+            self.input_filtered = self
+                .input_items
+                .iter()
+                .enumerate()
                 .filter(|(_, s)| s.to_lowercase().contains(&q))
                 .map(|(i, _)| i)
                 .collect();
@@ -404,23 +637,50 @@ impl RofiApp {
 
     fn execute_selected(&mut self) {
         if self.mode == Mode::Input || self.mode == Mode::Themes {
-            let result = self.input_filtered.get(self.selected)
+            let result = self
+                .input_filtered
+                .get(self.selected)
                 .and_then(|&i| self.input_items.get(i))
                 .cloned();
-            // For themes mode, clear the preview backup — the chosen theme stays.
             if self.mode == Mode::Themes {
+                // Commit the previewed theme: clear backup and persist to config.
                 self.theme_before_preview = None;
+                if let Some(ref name) = result {
+                    let theme_name = name.trim_start_matches("* ").to_string();
+                    let mut cfg = crate::config::Config::load();
+                    cfg.theme = theme_name;
+                    cfg.save();
+                }
+                // Close without producing a pass/output string.
+                self.oneshot_result = Some(None);
+                self.should_close = true;
+                return;
             }
-            *self.input_result.lock().unwrap() = Some(result);
+            *self.input_result.lock().unwrap() = Some(result.clone());
+            // Oneshot: record the result (treat as cancel/no-output for input mode).
+            self.oneshot_result = Some(result);
             self.should_close = true;
             return;
         }
         if let Some(&idx) = self.filtered.get(self.selected) {
             match &self.items[idx] {
-                LaunchItem::App(app) => { launch_app(&app.path.clone()); self.should_close = true; }
-                LaunchItem::Clip(e)  => { paste_text(&e.text.clone()); self.should_close = true; }
-                LaunchItem::Pass(e)  => {
-                    *self.pending_entry.lock().unwrap() = Some(Some(e.name.clone()));
+                LaunchItem::App(app) => {
+                    launch_app(&app.path.clone());
+                    // Oneshot: no text output for app launches — treat as "done".
+                    self.oneshot_result = Some(None);
+                    self.should_close = true;
+                }
+                LaunchItem::Clip(e) => {
+                    paste_text(&e.text.clone());
+                    // Oneshot: no text output for clipboard pastes.
+                    self.oneshot_result = Some(None);
+                    self.should_close = true;
+                }
+                LaunchItem::Pass(e) => {
+                    let name = e.name.clone();
+                    *self.pending_entry.lock().unwrap() = Some(Some(name.clone()));
+                    // Oneshot: record the pass entry name so the caller can decrypt it.
+                    self.oneshot_result = Some(Some(name));
                     self.should_close = true;
                 }
             }
@@ -428,7 +688,10 @@ impl RofiApp {
     }
 
     fn restore_focus(&mut self) {
-        if let Some(app) = self.prev_app.take() { restore_app_focus(&app); }
+        #[cfg(target_os = "macos")]
+        if let Some(app) = self.prev_app.take() {
+            restore_app_focus(&app);
+        }
     }
 
     fn hide(&mut self, ctx: &egui::Context) {
@@ -436,6 +699,7 @@ impl RofiApp {
         self.should_close = false;
         self.query.clear();
         self.frame_count = 0;
+        self.had_keyboard_focus_ever = false;
         self.toast = None;
         // If we were in themes mode and the user cancelled, restore original theme.
         if let Some(original) = self.theme_before_preview.take() {
@@ -444,14 +708,32 @@ impl RofiApp {
         self.input_is_themes = false;
         self.mode = Mode::Apps;
         self.refilter(true);
-        { let mut l = self.pending_entry.lock().unwrap(); if l.is_none() { *l = Some(None); } }
+        // In oneshot mode, record the result now (None = cancelled).
+        // execute_selected() may have already set oneshot_result to Some(Some(name)).
+        // If not set yet, it means the user cancelled (Escape / focus-loss).
+        if self.oneshot_result.is_none() {
+            self.oneshot_result = Some(None);
+        }
+        {
+            let mut l = self.pending_entry.lock().unwrap();
+            if l.is_none() {
+                *l = Some(None);
+            }
+        }
         {
             let mut l = self.input_result.lock().unwrap();
-            if l.is_none() && !self.input_items.is_empty() { *l = Some(None); }
+            if l.is_none() && !self.input_items.is_empty() {
+                *l = Some(None);
+            }
         }
         self.input_items.clear();
         self.input_filtered.clear();
+        #[cfg(target_os = "macos")]
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        // On Wayland/Linux, Visible(false) and OuterPosition are no-ops in
+        // winit 0.29.  Shrink to 1×1 so the surface is effectively invisible.
+        #[cfg(not(target_os = "macos"))]
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1.0, 1.0)));
         self.restore_focus();
     }
 
@@ -459,15 +741,24 @@ impl RofiApp {
     fn enter_themes_mode(&mut self) {
         use crate::config::{Config, THEME_NAMES};
         let active = Config::load().active_theme_name().to_string();
-        self.input_items = THEME_NAMES.iter().map(|&name| {
-            if name == active { format!("* {}", name) } else { name.to_string() }
-        }).collect();
+        self.input_items = THEME_NAMES
+            .iter()
+            .map(|&name| {
+                if name == active {
+                    format!("* {}", name)
+                } else {
+                    name.to_string()
+                }
+            })
+            .collect();
         self.input_is_themes = true;
         self.theme_before_preview = Some(self.theme.clone());
         self.mode = Mode::Themes;
         self.query.clear();
         // Pre-select the active theme.
-        self.selected = self.input_items.iter()
+        self.selected = self
+            .input_items
+            .iter()
             .position(|s| s.starts_with("* "))
             .unwrap_or(0);
         self.refilter_input();
@@ -475,7 +766,9 @@ impl RofiApp {
 
     /// Poll config file mtime and reload theme if it changed.
     fn maybe_reload_theme(&mut self) {
-        let mtime = std::fs::metadata(config_path()).ok().and_then(|m| m.modified().ok());
+        let mtime = std::fs::metadata(config_path())
+            .ok()
+            .and_then(|m| m.modified().ok());
         if mtime != self.config_mtime {
             self.config_mtime = mtime;
             let cfg = Config::load();
@@ -496,23 +789,74 @@ impl RofiApp {
 
 // ── eframe::App ───────────────────────────────────────────────────────────────
 
+#[cfg(target_os = "macos")]
 impl eframe::App for RofiApp {
     fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
         egui::Rgba::TRANSPARENT.to_array()
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.do_update(ctx);
+    }
+}
+
+// ── layer_window::AppHandler (Linux) ─────────────────────────────────────────
+
+#[cfg(target_os = "linux")]
+impl crate::layer_window::AppHandler for RofiApp {
+    fn setup(&mut self, ctx: &egui::Context) {
+        // Re-run font loading on the real egui Context now that we have one.
+        self.medium_font = load_fonts(ctx);
+    }
+
+    fn update(&mut self, ctx: &egui::Context) -> bool {
+        self.do_update(ctx);
+        // In oneshot mode (visible starts true, no toggle mechanism), signal
+        // the event loop to exit once the app has hidden itself.
+        if !self.visible && self.oneshot_result.is_some() {
+            return true;
+        }
+        false
+    }
+}
+
+// ── Shared update body ────────────────────────────────────────────────────────
+
+impl RofiApp {
+    fn do_update(&mut self, ctx: &egui::Context) {
         // Hot-reload theme when config file changes (only when not in themes mode).
         if !self.input_is_themes {
             self.maybe_reload_theme();
         }
 
         // ── SIGUSR1 toggle ────────────────────────────────────────────────────
-        if self.toggle.swap(false, Ordering::Relaxed) {
+        // Process at most ONE toggle per frame.  If two signals arrive between
+        // frames (show+hide collapsed), process show now and leave the hide for
+        // the next frame.  This prevents show+hide from both running in a single
+        // egui::run() call and fighting over the last InnerSize command.
+        let pending = self
+            .toggle
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                if n > 0 {
+                    Some(n - 1)
+                } else {
+                    None
+                }
+            });
+        if pending.is_ok() {
             self.visible = !self.visible;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(self.visible));
             if self.visible {
-                self.prev_app = capture_previous_app();
+                // Restore the window to full size.
+                // On macOS we use Visible(true); on Wayland/Linux OuterPosition
+                // and Visible are no-ops — expand from 1×1 back to full size.
+                #[cfg(target_os = "macos")]
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                #[cfg(not(target_os = "macos"))]
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(640.0, 380.0)));
+                #[cfg(target_os = "macos")]
+                {
+                    self.prev_app = capture_previous_app();
+                }
                 self.query.clear();
                 self.frame_count = 0;
                 self.toast = None;
@@ -527,9 +871,11 @@ impl eframe::App for RofiApp {
                         self.mode = Mode::Themes;
                         // Pre-select the currently active theme.
                         let active = self.theme.name;
-                        if let Some(pos) = self.input_items.iter().position(|s| {
-                            s.trim_start_matches("* ") == active
-                        }) {
+                        if let Some(pos) = self
+                            .input_items
+                            .iter()
+                            .position(|s| s.trim_start_matches("* ") == active)
+                        {
                             self.selected = pos;
                         } else {
                             self.selected = 0;
@@ -562,8 +908,17 @@ impl eframe::App for RofiApp {
                 *self.pending_input_is_themes.lock().unwrap() = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             } else {
-                self.restore_focus();
+                // Toggled off via SIGUSR1 — use hide() so pending_entry and
+                // input_result are unblocked (socket handlers waiting on them
+                // would hang forever otherwise).
+                self.hide(ctx);
             }
+        }
+        // If there are still queued toggles (e.g. show was just processed but
+        // a hide is still pending), request an immediate repaint so it isn't
+        // delayed by the 50 ms poll timeout.
+        if self.toggle.load(Ordering::Relaxed) > 0 {
+            ctx.request_repaint();
         }
 
         if self.visible && self.mode != Mode::Input && self.mode != Mode::Themes {
@@ -576,9 +931,11 @@ impl eframe::App for RofiApp {
                     self.theme_before_preview = Some(self.theme.clone());
                     self.mode = Mode::Themes;
                     let active = self.theme.name;
-                    if let Some(pos) = self.input_items.iter().position(|s| {
-                        s.trim_start_matches("* ") == active
-                    }) {
+                    if let Some(pos) = self
+                        .input_items
+                        .iter()
+                        .position(|s| s.trim_start_matches("* ") == active)
+                    {
                         self.selected = pos;
                     } else {
                         self.selected = 0;
@@ -593,18 +950,65 @@ impl eframe::App for RofiApp {
             }
         }
 
-        ctx.request_repaint_after(std::time::Duration::from_millis(50));
-        if !self.visible { return; }
+        // When hidden: slow down the repaint poll, force fully transparent
+        // background so nothing is painted, and return early.
+        if !self.visible {
+            // Only repaint when we need to check for a toggle signal.
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            // Override panel_fill to transparent so egui doesn't paint its
+            // default dark-grey background over our transparent surface.
+            let mut style = (*ctx.style()).clone();
+            style.visuals.panel_fill = Color32::TRANSPARENT;
+            style.visuals.window_fill = Color32::TRANSPARENT;
+            ctx.set_style(style);
+            // An empty CentralPanel is required so egui doesn't warn about
+            // unclaimed space and doesn't fill it with the old style colour.
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none())
+                .show(ctx, |_ui| {});
+            return;
+        }
 
-        if self.should_close { self.hide(ctx); return; }
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+
+        if self.should_close {
+            self.hide(ctx);
+            return;
+        }
 
         self.frame_count = self.frame_count.saturating_add(1);
 
+        // Track whether we have ever had keyboard focus this session.
+        // On Wayland the focus enter event may arrive after several frames,
+        // so we must not auto-hide due to "no focus" before it has ever arrived.
+        if ctx.input(|i| i.focused) {
+            self.had_keyboard_focus_ever = true;
+        }
+
+        // Auto-hide on focus loss.  On Wayland the focus event arrives later
+        // than on macOS, so we allow more frames before checking.  Also, we
+        // must not check until focus has been received at least once — otherwise
+        // the window would close immediately if the compositor is slow to grant
+        // keyboard focus.
+        let focus_grace = if cfg!(target_os = "macos") { 5 } else { 100 };
+        if self.had_keyboard_focus_ever
+            && self.frame_count > focus_grace
+            && !ctx.input(|i| i.focused)
+        {
+            self.hide(ctx);
+            return;
+        }
+
         // ── Global key handling — MUST happen before any widget rendering ─────
         // Escape / Cmd+R: hide.
-        if ctx.input(|i| i.key_pressed(Key::Escape)) { self.hide(ctx); return; }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::R)) { self.hide(ctx); return; }
-        if self.frame_count > 5 && !ctx.input(|i| i.focused) { self.hide(ctx); return; }
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.hide(ctx);
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::R)) {
+            self.hide(ctx);
+            return;
+        }
 
         // Consume Ctrl+J / Ctrl+K here — before TextEdit steals them.
         let ctrl_j = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::J));
@@ -629,36 +1033,34 @@ impl eframe::App for RofiApp {
                 let panel_rect = ui.max_rect();
 
                 ui.painter().rect_filled(
-                    panel_rect, Rounding::ZERO,
+                    panel_rect,
+                    Rounding::ZERO,
                     Color32::from_rgba_unmultiplied(t.bg.r(), t.bg.g(), t.bg.b(), t.bg_alpha),
                 );
-                ui.painter().rect_stroke(
-                    panel_rect, Rounding::ZERO,
-                    Stroke::new(1.5, t.border),
-                );
+                ui.painter()
+                    .rect_stroke(panel_rect, Rounding::ZERO, Stroke::new(1.5, t.border));
 
                 let inner = panel_rect.shrink2(Vec2::new(16.0, 14.0));
                 ui.allocate_ui_at_rect(inner, |ui| {
                     ui.vertical(|ui| {
-
                         // ── Mode tabs ─────────────────────────────────────
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
 
                             let normal_tabs: &[(Mode, &str)] = &[
-                                (Mode::Apps,      "Apps"),
+                                (Mode::Apps, "Apps"),
                                 (Mode::Clipboard, "Clipboard"),
-                                (Mode::Pass,      "Pass"),
-                                (Mode::Themes,    "Themes"),
-                                (Mode::About,     "About"),
+                                (Mode::Pass, "Pass"),
+                                (Mode::Themes, "Themes"),
+                                (Mode::About, "About"),
                             ];
                             // \u{F53F} = nf-md-palette (󰔿) — theme/palette icon
-                            let input_tab:  &[(Mode, &str)] = &[(Mode::Input,  "Input")];
+                            let input_tab: &[(Mode, &str)] = &[(Mode::Input, "Input")];
                             let themes_tab: &[(Mode, &str)] = &[(Mode::Themes, "Themes")];
                             let tabs = match self.mode {
-                                Mode::Input  => input_tab,
+                                Mode::Input => input_tab,
                                 // Themes tab is now also in normal_tabs, so just fall through.
-                                _            => normal_tabs,
+                                _ => normal_tabs,
                             };
                             let _ = themes_tab; // suppress unused warning
 
@@ -666,11 +1068,19 @@ impl eframe::App for RofiApp {
                                 let selected = self.mode == mode;
                                 let btn = egui::Button::new(
                                     egui::RichText::new(label)
-                                        .font(FontId::new(10.0, FontFamily::Monospace))
+                                        .font(FontId::new(12.0, FontFamily::Monospace))
                                         .color(if selected { t.accent } else { t.fg_muted }),
                                 )
-                                .fill(if selected { t.tab_active_bg } else { Color32::TRANSPARENT })
-                                .stroke(if selected { Stroke::new(1.0, t.border) } else { Stroke::NONE })
+                                .fill(if selected {
+                                    t.tab_active_bg
+                                } else {
+                                    Color32::TRANSPARENT
+                                })
+                                .stroke(if selected {
+                                    Stroke::new(1.0, t.border)
+                                } else {
+                                    Stroke::NONE
+                                })
                                 .rounding(Rounding::ZERO);
 
                                 let resp = ui.add(btn);
@@ -680,63 +1090,70 @@ impl eframe::App for RofiApp {
                                     } else {
                                         self.mode = mode;
                                         self.query.clear();
-                                        if mode == Mode::Clipboard { self.sync_clipboard(); }
+                                        if mode == Mode::Clipboard {
+                                            self.sync_clipboard();
+                                        }
                                         self.refilter(true);
                                     }
                                 }
                             }
 
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(
-                                    egui::RichText::new("Mofi")
-                                        .font(FontId::new(11.0, FontFamily::Name("medium".into())))
-                                        .color(t.brand),
-                                );
-                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new("Mofi")
+                                            .font(FontId::new(13.0, self.medium_font.clone()))
+                                            .color(t.brand),
+                                    );
+                                },
+                            );
                         });
 
                         ui.add_space(10.0);
 
                         // ── Search bar ────────────────────────────────────
                         let hint = match self.mode {
-                            Mode::Apps      => "Search apps…",
+                            Mode::Apps => "Search apps…",
                             Mode::Clipboard => "Filter clipboard…",
-                            Mode::Pass      => "Search passwords…",
-                            Mode::Input     => "Filter…",
-                            Mode::Themes    => "Filter themes…",
-                            Mode::About     => "",
+                            Mode::Pass => "Search passwords…",
+                            Mode::Input => "Filter…",
+                            Mode::Themes => "Filter themes…",
+                            Mode::About => "",
                         };
 
                         let response = ui.add(
                             egui::TextEdit::singleline(&mut self.query)
                                 .hint_text(egui::RichText::new(hint).color(t.fg_muted))
-                                .font(FontId::new(15.0, FontFamily::Monospace))
+                                .font(FontId::new(17.0, FontFamily::Monospace))
                                 .text_color(t.fg)
                                 .frame(false)
                                 .desired_width(f32::INFINITY),
                         );
                         response.request_focus();
 
-                        let down  = ctx.input(|i| i.key_pressed(Key::ArrowDown)) || ctrl_j;
-                        let up    = ctx.input(|i| i.key_pressed(Key::ArrowUp))   || ctrl_k;
-                        let tab   = ctx.input(|i| i.key_pressed(Key::Tab));
+                        let down = ctx.input(|i| i.key_pressed(Key::ArrowDown)) || ctrl_j;
+                        let up = ctx.input(|i| i.key_pressed(Key::ArrowUp)) || ctrl_k;
+                        let tab = ctx.input(|i| i.key_pressed(Key::Tab));
                         let enter = ctx.input(|i| i.key_pressed(Key::Enter));
 
                         if tab && self.mode != Mode::Input {
                             let next = match self.mode {
-                                Mode::Apps      => Mode::Clipboard,
+                                Mode::Apps => Mode::Clipboard,
                                 Mode::Clipboard => Mode::Pass,
-                                Mode::Pass      => Mode::Themes,
-                                Mode::Themes    => Mode::About,
-                                Mode::About     => Mode::Apps,
-                                Mode::Input     => Mode::Input,
+                                Mode::Pass => Mode::Themes,
+                                Mode::Themes => Mode::About,
+                                Mode::About => Mode::Apps,
+                                Mode::Input => Mode::Input,
                             };
                             if next == Mode::Themes {
                                 self.enter_themes_mode();
                             } else {
                                 self.mode = next;
                                 self.query.clear();
-                                if self.mode == Mode::Clipboard { self.sync_clipboard(); }
+                                if self.mode == Mode::Clipboard {
+                                    self.sync_clipboard();
+                                }
                                 self.refilter(true);
                             }
                         }
@@ -744,24 +1161,41 @@ impl eframe::App for RofiApp {
                         if self.mode == Mode::Input || self.mode == Mode::Themes {
                             let len = self.input_filtered.len();
                             if down && len > 0 {
-                                self.selected = (self.selected + 1) % len;
-                                if self.mode == Mode::Themes { self.preview_theme_at_selection(); }
+                                if self.selected + 1 < len {
+                                    self.selected += 1;
+                                }
+                                if self.mode == Mode::Themes {
+                                    self.preview_theme_at_selection();
+                                }
                             }
                             if up && len > 0 {
-                                self.selected = self.selected.checked_sub(1).unwrap_or(len - 1);
-                                if self.mode == Mode::Themes { self.preview_theme_at_selection(); }
+                                self.selected = self.selected.saturating_sub(1);
+                                if self.mode == Mode::Themes {
+                                    self.preview_theme_at_selection();
+                                }
                             }
                         } else {
                             let len = self.filtered.len();
-                            if down && len > 0 { self.selected = (self.selected + 1) % len; }
-                            if up   && len > 0 { self.selected = self.selected.checked_sub(1).unwrap_or(len - 1); }
+                            if down && len > 0 {
+                                if self.selected + 1 < len {
+                                    self.selected += 1;
+                                }
+                            }
+                            if up && len > 0 {
+                                self.selected = self.selected.saturating_sub(1);
+                            }
                         }
 
-                        if enter { self.execute_selected(); return; }
+                        if enter {
+                            self.execute_selected();
+                            return;
+                        }
                         if response.changed() {
                             if self.mode == Mode::Input || self.mode == Mode::Themes {
                                 self.refilter_input();
-                                if self.mode == Mode::Themes { self.preview_theme_at_selection(); }
+                                if self.mode == Mode::Themes {
+                                    self.preview_theme_at_selection();
+                                }
                             } else {
                                 self.refilter(true);
                             }
@@ -769,7 +1203,11 @@ impl eframe::App for RofiApp {
 
                         ui.add_space(6.0);
                         let sep_y = ui.cursor().top();
-                        ui.painter().hline(ui.max_rect().x_range(), sep_y, Stroke::new(1.0, t.separator));
+                        ui.painter().hline(
+                            ui.max_rect().x_range(),
+                            sep_y,
+                            Stroke::new(1.0, t.separator),
+                        );
                         ui.add_space(6.0);
 
                         // ── Panels ────────────────────────────────────────
@@ -778,173 +1216,239 @@ impl eframe::App for RofiApp {
                         if self.mode == Mode::About {
                             ui.add_space(18.0);
                             ui.vertical_centered(|ui| {
-                                ui.label(egui::RichText::new("Mofi")
-                                    .font(FontId::new(22.0, FontFamily::Name("medium".into())))
-                                    .color(t.accent));
+                                ui.label(
+                                    egui::RichText::new("Mofi")
+                                        .font(FontId::new(24.0, self.medium_font.clone()))
+                                        .color(t.accent),
+                                );
                                 ui.add_space(4.0);
-                                ui.label(egui::RichText::new("v0.1.0")
-                                    .font(FontId::new(10.0, FontFamily::Monospace))
-                                    .color(t.fg_muted));
+                                ui.label(
+                                    egui::RichText::new("v0.1.0")
+                                        .font(FontId::new(12.0, FontFamily::Monospace))
+                                        .color(t.fg_muted),
+                                );
                                 ui.add_space(14.0);
-                                ui.label(egui::RichText::new("App launcher · Clipboard · Pass")
-                                    .font(FontId::new(11.0, FontFamily::Monospace))
-                                    .color(t.fg_dim));
+                                ui.label(
+                                    egui::RichText::new("App launcher · Clipboard · Pass")
+                                        .font(FontId::new(13.0, FontFamily::Monospace))
+                                        .color(t.fg_dim),
+                                );
                                 ui.add_space(14.0);
-                                ui.label(egui::RichText::new("\u{F09B}  github.com/bechampion/mofi")
-                                    .font(FontId::new(11.0, FontFamily::Monospace))
-                                    .color(t.accent2));
+                                ui.label(
+                                    egui::RichText::new("\u{F09B}  github.com/bechampion/mofi")
+                                        .font(FontId::new(13.0, FontFamily::Monospace))
+                                        .color(t.accent2),
+                                );
                                 ui.add_space(14.0);
-                                ui.label(egui::RichText::new(
-                                        format!("Theme: {}", t.name))
-                                    .font(FontId::new(10.0, FontFamily::Monospace))
-                                    .color(t.fg_muted));
+                                ui.label(
+                                    egui::RichText::new(format!("Theme: {}", t.name))
+                                        .font(FontId::new(12.0, FontFamily::Monospace))
+                                        .color(t.fg_muted),
+                                );
                                 ui.add_space(8.0);
-                                ui.label(egui::RichText::new(
-                                        "Cmd+Space / Cmd+R  open · Esc  close · Tab  cycle tabs")
-                                    .font(FontId::new(9.0, FontFamily::Monospace))
-                                    .color(t.fg_muted));
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Super/Mod key  open · Esc  close · Tab  cycle tabs",
+                                    )
+                                    .font(FontId::new(11.0, FontFamily::Monospace))
+                                    .color(t.fg_muted),
+                                );
                             });
                         } else if self.mode == Mode::Input || self.mode == Mode::Themes {
                             // ── Input / theme picker list ─────────────────
-                            egui::ScrollArea::vertical().max_height(max_list_height).show(ui, |ui| {
-                                ui.set_min_width(ui.available_width());
-                                if self.input_filtered.is_empty() {
-                                    ui.add_space(20.0);
-                                    ui.centered_and_justified(|ui| {
-                                        ui.label(egui::RichText::new("No results")
-                                            .font(FontId::new(11.0, FontFamily::Monospace))
-                                            .color(t.fg_muted));
-                                    });
-                                    return;
-                                }
-                                let aw = ui.available_width();
-                                // Collect a snapshot so we don't hold a borrow on self.input_filtered
-                                // while potentially mutating self inside the loop.
-                                let rows: Vec<(usize, usize)> = self.input_filtered.iter()
-                                    .copied()
-                                    .enumerate()
-                                    .collect();
-                                let is_themes = self.mode == Mode::Themes;
-                                for (row_idx, item_idx) in rows {
-                                    let sel = row_idx == self.selected;
-                                    let text = self.input_items[item_idx].clone();
-                                    // Per-row icon: theme-specific glyph in themes mode, plain list bullet otherwise.
-                                    let row_icon = if is_themes {
-                                        theme_glyph_for(text.trim_start_matches("* "))
-                                    } else {
-                                        "\u{F0CA}"  // nf-fa-list_ul
-                                    };
-                                    let (rr, _) = ui.allocate_exact_size(Vec2::new(aw, ROW_HEIGHT), egui::Sense::hover());
-                                    if sel { ui.scroll_to_rect(rr, None); }
-                                    if sel {
-                                        ui.painter().rect_filled(rr, Rounding::ZERO, t.row_sel);
-                                        ui.painter().rect_filled(
-                                            egui::Rect::from_min_size(egui::pos2(rr.left(), rr.top() + 4.0), Vec2::new(3.0, rr.height() - 8.0)),
-                                            Rounding::ZERO, t.accent,
-                                        );
-                                    } else if ui.rect_contains_pointer(rr) {
-                                        ui.painter().rect_filled(rr, Rounding::ZERO, t.row_hover);
+                            egui::ScrollArea::vertical()
+                                .max_height(max_list_height)
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    if self.input_filtered.is_empty() {
+                                        ui.add_space(20.0);
+                                        ui.centered_and_justified(|ui| {
+                                            ui.label(
+                                                egui::RichText::new("No results")
+                                                    .font(FontId::new(13.0, FontFamily::Monospace))
+                                                    .color(t.fg_muted),
+                                            );
+                                        });
+                                        return;
                                     }
-                                    let ix = rr.left() + 14.0;
-                                    ui.painter().text(
-                                        egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
-                                        egui::Align2::CENTER_CENTER,
-                                        row_icon,
-                                        FontId::new(ICON_SIZE * 0.75, FontFamily::Monospace),
-                                        if sel { t.icon_sel } else { t.icon_dim },
-                                    );
-                                    ui.painter().text(
-                                        egui::pos2(ix + ICON_SIZE + 12.0, rr.center().y),
-                                        egui::Align2::LEFT_CENTER,
-                                        &text,
-                                        FontId::new(12.0, FontFamily::Name("medium".into())),
-                                        if sel { t.fg } else { t.fg_dim },
-                                    );
-                                    let click = ui.interact(rr, egui::Id::new(("input_row", row_idx)), egui::Sense::click());
-                                    if click.hovered() {
-                                        if self.mode == Mode::Themes && self.selected != row_idx {
-                                            self.selected = row_idx;
-                                            self.preview_theme_at_selection();
+                                    let aw = ui.available_width();
+                                    // Collect a snapshot so we don't hold a borrow on self.input_filtered
+                                    // while potentially mutating self inside the loop.
+                                    let rows: Vec<(usize, usize)> =
+                                        self.input_filtered.iter().copied().enumerate().collect();
+                                    let is_themes = self.mode == Mode::Themes;
+                                    for (row_idx, item_idx) in rows {
+                                        let sel = row_idx == self.selected;
+                                        let text = self.input_items[item_idx].clone();
+                                        // Per-row icon: theme-specific glyph in themes mode, plain list bullet otherwise.
+                                        let row_icon = if is_themes {
+                                            theme_glyph_for(text.trim_start_matches("* "))
                                         } else {
+                                            "\u{F0CA}" // nf-fa-list_ul
+                                        };
+                                        let (rr, _) = ui.allocate_exact_size(
+                                            Vec2::new(aw, ROW_HEIGHT),
+                                            egui::Sense::hover(),
+                                        );
+                                        if sel {
+                                            ui.scroll_to_rect(rr, None);
+                                        }
+                                        if sel {
+                                            ui.painter().rect_filled(rr, Rounding::ZERO, t.row_sel);
+                                            ui.painter().rect_filled(
+                                                egui::Rect::from_min_size(
+                                                    egui::pos2(rr.left(), rr.top() + 4.0),
+                                                    Vec2::new(3.0, rr.height() - 8.0),
+                                                ),
+                                                Rounding::ZERO,
+                                                t.accent,
+                                            );
+                                        } else if ui.rect_contains_pointer(rr) {
+                                            ui.painter().rect_filled(
+                                                rr,
+                                                Rounding::ZERO,
+                                                t.row_hover,
+                                            );
+                                        }
+                                        let ix = rr.left() + 14.0;
+                                        ui.painter().text(
+                                            egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
+                                            egui::Align2::CENTER_CENTER,
+                                            row_icon,
+                                            FontId::new(ICON_SIZE * 0.75, FontFamily::Monospace),
+                                            if sel { t.icon_sel } else { t.icon_dim },
+                                        );
+                                        ui.painter().text(
+                                            egui::pos2(ix + ICON_SIZE + 12.0, rr.center().y),
+                                            egui::Align2::LEFT_CENTER,
+                                            &text,
+                                            FontId::new(14.0, self.medium_font.clone()),
+                                            if sel { t.fg } else { t.fg_dim },
+                                        );
+                                        let click = ui.interact(
+                                            rr,
+                                            egui::Id::new(("input_row", row_idx)),
+                                            egui::Sense::click(),
+                                        );
+                                        if click.hovered() {
+                                            if self.mode == Mode::Themes && self.selected != row_idx
+                                            {
+                                                self.selected = row_idx;
+                                                self.preview_theme_at_selection();
+                                            } else {
+                                                self.selected = row_idx;
+                                            }
+                                        }
+                                        if click.double_clicked() {
                                             self.selected = row_idx;
+                                            self.execute_selected();
+                                            return;
                                         }
                                     }
-                                    if click.double_clicked() { self.selected = row_idx; self.execute_selected(); return; }
-                                }
-                            });
+                                });
                         } else {
                             // ── Normal results list ───────────────────────
-                            egui::ScrollArea::vertical().max_height(max_list_height).show(ui, |ui| {
-                                ui.set_min_width(ui.available_width());
-                                if self.filtered.is_empty() {
-                                    ui.add_space(20.0);
-                                    ui.centered_and_justified(|ui| {
-                                        ui.label(egui::RichText::new("No results")
-                                            .font(FontId::new(11.0, FontFamily::Monospace))
-                                            .color(t.fg_muted));
-                                    });
-                                    return;
-                                }
-                                let aw = ui.available_width();
-                                for (row_idx, &item_idx) in self.filtered.iter().enumerate() {
-                                    let sel = row_idx == self.selected;
-                                    let item = &self.items[item_idx];
-                                    let glyph = glyph_for_item(item);
-                                    let gc = glyph_color_for_item(item, &t);
-                                    let gc = if sel { gc } else { dim_color(gc) };
-                                    let display  = item.display_name();
-                                    let subtitle = item.subtitle();
-
-                                    let (rr, _) = ui.allocate_exact_size(Vec2::new(aw, ROW_HEIGHT), egui::Sense::hover());
-                                    if sel { ui.scroll_to_rect(rr, None); }
-
-                                    if sel {
-                                        ui.painter().rect_filled(rr, Rounding::ZERO, t.row_sel);
-                                        ui.painter().rect_filled(
-                                            egui::Rect::from_min_size(egui::pos2(rr.left(), rr.top() + 4.0), Vec2::new(3.0, rr.height() - 8.0)),
-                                            Rounding::ZERO, t.accent,
-                                        );
-                                    } else if ui.rect_contains_pointer(rr) {
-                                        ui.painter().rect_filled(rr, Rounding::ZERO, t.row_hover);
+                            egui::ScrollArea::vertical()
+                                .max_height(max_list_height)
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    if self.filtered.is_empty() {
+                                        ui.add_space(20.0);
+                                        ui.centered_and_justified(|ui| {
+                                            ui.label(
+                                                egui::RichText::new("No results")
+                                                    .font(FontId::new(13.0, FontFamily::Monospace))
+                                                    .color(t.fg_muted),
+                                            );
+                                        });
+                                        return;
                                     }
+                                    let aw = ui.available_width();
+                                    for (row_idx, &item_idx) in self.filtered.iter().enumerate() {
+                                        let sel = row_idx == self.selected;
+                                        let item = &self.items[item_idx];
+                                        let glyph = glyph_for_item(item);
+                                        let gc = glyph_color_for_item(item, &t);
+                                        let gc = if sel { gc } else { dim_color(gc) };
+                                        let display = item.display_name();
+                                        let subtitle = item.subtitle();
 
-                                    let ix = rr.left() + 14.0;
-                                    ui.painter().text(
-                                        egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
-                                        egui::Align2::CENTER_CENTER,
-                                        glyph,
-                                        FontId::new(ICON_SIZE * 0.75, FontFamily::Monospace),
-                                        gc,
-                                    );
+                                        let (rr, _) = ui.allocate_exact_size(
+                                            Vec2::new(aw, ROW_HEIGHT),
+                                            egui::Sense::hover(),
+                                        );
+                                        if sel {
+                                            ui.scroll_to_rect(rr, None);
+                                        }
 
-                                    let tx = ix + ICON_SIZE + 12.0;
-                                    if let Some(sub) = subtitle {
+                                        if sel {
+                                            ui.painter().rect_filled(rr, Rounding::ZERO, t.row_sel);
+                                            ui.painter().rect_filled(
+                                                egui::Rect::from_min_size(
+                                                    egui::pos2(rr.left(), rr.top() + 4.0),
+                                                    Vec2::new(3.0, rr.height() - 8.0),
+                                                ),
+                                                Rounding::ZERO,
+                                                t.accent,
+                                            );
+                                        } else if ui.rect_contains_pointer(rr) {
+                                            ui.painter().rect_filled(
+                                                rr,
+                                                Rounding::ZERO,
+                                                t.row_hover,
+                                            );
+                                        }
+
+                                        let ix = rr.left() + 14.0;
                                         ui.painter().text(
-                                            egui::pos2(tx, rr.center().y - 7.0),
-                                            egui::Align2::LEFT_CENTER, &display,
-                                            FontId::new(12.0, FontFamily::Name("medium".into())),
-                                            if sel { t.fg } else { t.fg_dim },
+                                            egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
+                                            egui::Align2::CENTER_CENTER,
+                                            glyph,
+                                            FontId::new(ICON_SIZE * 0.75, FontFamily::Monospace),
+                                            gc,
                                         );
-                                        ui.painter().text(
-                                            egui::pos2(tx, rr.center().y + 7.0),
-                                            egui::Align2::LEFT_CENTER, &sub,
-                                            FontId::new(9.0, FontFamily::Monospace),
-                                            if sel { t.accent2 } else { t.fg_muted },
+
+                                        let tx = ix + ICON_SIZE + 12.0;
+                                        if let Some(sub) = subtitle {
+                                            ui.painter().text(
+                                                egui::pos2(tx, rr.center().y - 7.0),
+                                                egui::Align2::LEFT_CENTER,
+                                                &display,
+                                                FontId::new(14.0, self.medium_font.clone()),
+                                                if sel { t.fg } else { t.fg_dim },
+                                            );
+                                            ui.painter().text(
+                                                egui::pos2(tx, rr.center().y + 7.0),
+                                                egui::Align2::LEFT_CENTER,
+                                                &sub,
+                                                FontId::new(11.0, FontFamily::Monospace),
+                                                if sel { t.accent2 } else { t.fg_muted },
+                                            );
+                                        } else {
+                                            ui.painter().text(
+                                                egui::pos2(tx, rr.center().y),
+                                                egui::Align2::LEFT_CENTER,
+                                                &display,
+                                                FontId::new(14.0, self.medium_font.clone()),
+                                                if sel { t.fg } else { t.fg_dim },
+                                            );
+                                        }
+
+                                        let click = ui.interact(
+                                            rr,
+                                            egui::Id::new(("row", row_idx)),
+                                            egui::Sense::click(),
                                         );
-                                    } else {
-                                        ui.painter().text(
-                                            egui::pos2(tx, rr.center().y),
-                                            egui::Align2::LEFT_CENTER, &display,
-                                            FontId::new(12.0, FontFamily::Name("medium".into())),
-                                            if sel { t.fg } else { t.fg_dim },
-                                        );
+                                        if click.hovered() {
+                                            self.selected = row_idx;
+                                        }
+                                        if click.double_clicked() {
+                                            self.selected = row_idx;
+                                            self.execute_selected();
+                                            return;
+                                        }
                                     }
-
-                                    let click = ui.interact(rr, egui::Id::new(("row", row_idx)), egui::Sense::click());
-                                    if click.hovered() { self.selected = row_idx; }
-                                    if click.double_clicked() { self.selected = row_idx; self.execute_selected(); return; }
-                                }
-                            });
+                                });
                         }
 
                         // ── Toast ─────────────────────────────────────────
@@ -952,9 +1456,11 @@ impl eframe::App for RofiApp {
                             if since.elapsed().as_secs_f32() < 1.5 {
                                 ui.add_space(8.0);
                                 ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new(msg.as_str())
-                                        .font(FontId::new(11.0, FontFamily::Monospace))
-                                        .color(t.toast));
+                                    ui.label(
+                                        egui::RichText::new(msg.as_str())
+                                            .font(FontId::new(13.0, FontFamily::Monospace))
+                                            .color(t.toast),
+                                    );
                                 });
                                 ctx.request_repaint_after(std::time::Duration::from_millis(50));
                             } else {

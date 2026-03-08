@@ -63,7 +63,7 @@ fn relative_name(root: &Path, file: &Path) -> Option<String> {
 
 /// Copy the first line (the password) of a pass entry to the clipboard.
 /// This version is for the CLIENT — uses `pass show -c` which handles
-/// pinentry-mac GUI prompting and clipboard copy natively.
+/// pinentry GUI prompting and clipboard copy natively.
 /// Returns true on success.
 pub fn copy_password_client(name: &str) -> bool {
     let home = match dirs::home_dir() {
@@ -71,34 +71,56 @@ pub fn copy_password_client(name: &str) -> bool {
         None => return false,
     };
 
-    // Build a sane PATH that includes Homebrew so `gpg`, `pass`, `pinentry-mac`
-    // are all resolvable even when launched from a sparse launchd/skhd env.
+    let gnupghome = std::env::var("GNUPGHOME")
+        .unwrap_or_else(|_| home.join(".gnupg").to_string_lossy().into_owned());
+
+    #[cfg(target_os = "macos")]
     let path_env = format!(
         "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:{}/.local/bin",
         home.display()
     );
 
-    let gnupghome = std::env::var("GNUPGHOME")
-        .unwrap_or_else(|_| home.join(".gnupg").to_string_lossy().into_owned());
+    #[cfg(target_os = "linux")]
+    let path_env = format!(
+        "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:{}/.local/bin:{}/.local/share/mise/shims",
+        home.display(),
+        home.display(),
+    );
 
-    // `pass show -c <name>` decrypts, copies the first line to clipboard via
-    // pbcopy, and triggers pinentry-mac for the GPG passphrase if needed.
-    // stderr is inherited so pinentry-mac can connect to the window server.
-    let status = std::process::Command::new("pass")
-        .args(["show", "-c", name])
-        .env("HOME",      home.to_str().unwrap_or("/"))
-        .env("PATH",      &path_env)
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let path_env = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
+
+    let mut cmd = std::process::Command::new("pass");
+    cmd.args(["show", "-c", name])
+        .env("HOME", home.to_str().unwrap_or("/"))
+        .env("PATH", &path_env)
         .env("GNUPGHOME", &gnupghome)
-        // Tell pinentry to use the GUI (not curses/loopback) even without a TTY.
-        .env("PINENTRY_USER_DATA", "USE_CURSES:0")
-        // Unset GPG_TTY so gpg-agent doesn't try a curses/tty pinentry.
-        .env_remove("GPG_TTY")
         .stdin(std::process::Stdio::null())
-        // Do NOT suppress stderr — pinentry-mac needs it to reach the display.
+        // Do NOT suppress stderr — pinentry needs it to reach the display.
         .stderr(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::null())
-        .status();
+        .stdout(std::process::Stdio::null());
 
-    matches!(status, Ok(s) if s.success())
+    #[cfg(target_os = "macos")]
+    {
+        // Tell pinentry to use the GUI (not curses/loopback) even without a TTY.
+        cmd.env("PINENTRY_USER_DATA", "USE_CURSES:0");
+        // Unset GPG_TTY so gpg-agent doesn't try a curses/tty pinentry.
+        cmd.env_remove("GPG_TTY");
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // On Linux the display variable is needed for GUI pinentry.
+        // Inherit DISPLAY and WAYLAND_DISPLAY from the caller if set.
+        if let Ok(display) = std::env::var("DISPLAY") {
+            cmd.env("DISPLAY", display);
+        }
+        if let Ok(wd) = std::env::var("WAYLAND_DISPLAY") {
+            cmd.env("WAYLAND_DISPLAY", wd);
+        }
+        // For headless / tty sessions, allow loopback pinentry.
+        cmd.env("GPG_TTY", std::env::var("GPG_TTY").unwrap_or_default());
+    }
+
+    matches!(cmd.status(), Ok(s) if s.success())
 }
-
