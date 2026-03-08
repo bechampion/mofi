@@ -272,6 +272,69 @@ The default `kanagawa` theme uses strictly named palette tokens from [Kanagawa](
 
 ---
 
+## Window switcher (`mofisw`)
+
+`mofisw` is a separate binary in the same project — an Option+Tab window switcher that replaces the default macOS switcher with a keyboard-driven overlay showing all open windows across every app.
+
+### Usage
+
+```
+Hold ⌥ (Option) + press Tab   → show switcher / advance to next window
+Keep pressing Tab while ⌥ held → cycle through all open windows
+Release ⌥                      → activate selected window and dismiss
+```
+
+### Setup
+
+```bash
+cargo build --release
+# Launch as a login item, or load via launchd:
+cp target/release/mofisw /usr/local/bin/mofisw
+```
+
+Example launchd plist (`~/Library/LaunchAgents/com.user.mofisw.plist`):
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.mofisw</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/path/to/mofisw</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>
+```
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.user.mofisw.plist
+```
+
+> **Accessibility permission required** — macOS will prompt on first launch. Grant access in System Settings → Privacy & Security → Accessibility.
+
+### How it works
+
+- Uses `CGWindowListCopyWindowInfo` to enumerate all on-screen windows (layer 0 only — no menu bar, Dock, or desktop elements)
+- Each window is shown as a card: large Nerd Font glyph + app name + window title (dimmed)
+- The window resizes dynamically to fit however many windows are open (max 1200 px wide)
+- Built with `rdev` for global key listening, `eframe`/`egui` for rendering
+- Runs as `NSApplicationActivationPolicyAccessory` — no Dock icon, no Cmd-Tab entry
+
+### Source
+
+```
+src/switcher/main.rs   ← entire mofisw binary (~500 lines)
+```
+
+---
+
 ## License
 
 MIT
