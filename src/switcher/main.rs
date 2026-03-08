@@ -105,6 +105,21 @@ mod ffi {
         pub fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> Boolean;
     }
 
+    // ── Accessibility (AX) API ────────────────────────────────────────────────
+    pub type AXUIElementRef = *mut c_void;
+    pub type AXError        = i32;
+    pub const kAXErrorSuccess: AXError = 0;
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        pub fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
+        pub fn AXUIElementCopyAttributeValue(
+            element: AXUIElementRef,
+            attribute: CFStringRef,
+            value: *mut CFTypeRef,
+        ) -> AXError;
+    }
+
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
         pub fn CFArrayGetCount(theArray: CFArrayRef) -> CFIndex;
@@ -307,6 +322,75 @@ unsafe fn dict_i32(dict: ffi::CFDictionaryRef, key: &str) -> Option<i32> {
     if ok != 0 { Some(out) } else { None }
 }
 
+/// Fetch window titles for a given PID via the Accessibility API.
+/// Returns titles in front-to-back order (matching CGWindowList Z-order).
+/// Returns an empty vec if AX is unavailable or the app has no windows.
+fn ax_window_titles(pid: i32) -> Vec<String> {
+    unsafe {
+        let app_elem = ffi::AXUIElementCreateApplication(pid);
+        if app_elem.is_null() { return vec![]; }
+
+        // kAXWindowsAttribute
+        let attr_name = std::ffi::CString::new("AXWindows").unwrap();
+        let cf_attr = ffi::CFStringCreateWithCString(
+            std::ptr::null(),
+            attr_name.as_ptr() as *const _,
+            ffi::kCFStringEncodingUTF8,
+        );
+        if cf_attr.is_null() {
+            ffi::CFRelease(app_elem as ffi::CFTypeRef);
+            return vec![];
+        }
+
+        let mut windows_val: ffi::CFTypeRef = std::ptr::null();
+        let err = ffi::AXUIElementCopyAttributeValue(app_elem, cf_attr, &mut windows_val);
+        ffi::CFRelease(cf_attr);
+        ffi::CFRelease(app_elem as ffi::CFTypeRef);
+
+        if err != ffi::kAXErrorSuccess || windows_val.is_null() { return vec![]; }
+
+        let count = ffi::CFArrayGetCount(windows_val as ffi::CFArrayRef);
+        let mut titles = Vec::new();
+
+        let title_attr_name = std::ffi::CString::new("AXTitle").unwrap();
+        let cf_title_attr = ffi::CFStringCreateWithCString(
+            std::ptr::null(),
+            title_attr_name.as_ptr() as *const _,
+            ffi::kCFStringEncodingUTF8,
+        );
+
+        for i in 0..count {
+            let win = ffi::CFArrayGetValueAtIndex(windows_val as ffi::CFArrayRef, i);
+            if win.is_null() { titles.push(String::new()); continue; }
+
+            let mut title_val: ffi::CFTypeRef = std::ptr::null();
+            let err2 = ffi::AXUIElementCopyAttributeValue(
+                win as ffi::AXUIElementRef,
+                cf_title_attr,
+                &mut title_val,
+            );
+            if err2 == ffi::kAXErrorSuccess && !title_val.is_null() {
+                if ffi::CFGetTypeID(title_val) == ffi::CFStringGetTypeID() {
+                    let s = cf_string_to_rust(title_val as ffi::CFStringRef)
+                        .unwrap_or_default();
+                    ffi::CFRelease(title_val);
+                    titles.push(s);
+                } else {
+                    ffi::CFRelease(title_val);
+                    titles.push(String::new());
+                }
+            } else {
+                titles.push(String::new());
+            }
+        }
+
+        if !cf_title_attr.is_null() { ffi::CFRelease(cf_title_attr); }
+        ffi::CFRelease(windows_val);
+
+        titles
+    }
+}
+
 /// Returns the raw on-screen window list **without** rotation.
 /// Index 0 = currently focused window (CGWindowList Z-order).
 fn list_windows_raw() -> Vec<WinEntry> {
@@ -339,14 +423,35 @@ fn list_windows_raw() -> Vec<WinEntry> {
     }
     unsafe { ffi::CFRelease(array) };
 
-    // Clean up redundant titles (single-window app where title == app name).
+    // kCGWindowName is often empty on macOS 13+ without Screen Recording
+    // permission.  Fill in missing titles via the Accessibility API instead,
+    // which only needs the Accessibility permission we already require.
+    // AX window order matches CGWindowList front-to-back order for the same PID.
+    let mut ax_cache: HashMap<i32, Vec<String>> = HashMap::new();
+    // per-pid window index counter so we map AX titles positionally
+    let mut pid_idx: HashMap<i32, usize> = HashMap::new();
+    for e in out.iter_mut() {
+        if e.win_title.is_empty() {
+            let titles = ax_cache.entry(e.pid).or_insert_with(|| ax_window_titles(e.pid));
+            let idx = pid_idx.entry(e.pid).or_insert(0);
+            if let Some(t) = titles.get(*idx) {
+                if !t.is_empty() { e.win_title = t.clone(); }
+            }
+            *idx += 1;
+        }
+    }
+
+    // Remove titles that are identical to the app name and the app has only
+    // one window (no disambiguation value).
     let count_per_pid: HashMap<i32, usize> = {
         let mut m: HashMap<i32, usize> = HashMap::new();
         for e in &out { *m.entry(e.pid).or_insert(0) += 1; }
         m
     };
     for e in out.iter_mut() {
-        if count_per_pid.get(&e.pid).copied().unwrap_or(0) == 1 && e.win_title == e.app_name {
+        if count_per_pid.get(&e.pid).copied().unwrap_or(0) == 1
+            && e.win_title == e.app_name
+        {
             e.win_title.clear();
         }
     }
@@ -356,36 +461,32 @@ fn list_windows_raw() -> Vec<WinEntry> {
 
 /// Build the display list for the switcher overlay.
 ///
-/// Strategy:
-///  - `prev_pid` is the PID the user was on **before** the currently focused
-///    window (i.e., the one they'd most likely want to jump back to).
-///  - We rotate so `prev_pid`'s window is at index 0 (pre-selected).
-///  - If `prev_pid` is unknown or not in the list, fall back to rotate_left(1)
-///    so the second-most-recent window is still first.
-fn build_window_list(prev_pid: i32) -> (Vec<WinEntry>, usize) {
-    let raw = list_windows_raw();
+/// `raw` is the unmodified CGWindowList (index 0 = current foreground window).
+/// The current foreground PID is stripped entirely — you can never switch to
+/// the window you're already on.  The previously focused window (prev_pid)
+/// is rotated to index 0 so it is pre-selected.
+fn build_window_list(raw: Vec<WinEntry>, prev_pid: i32) -> (Vec<WinEntry>, usize) {
     if raw.is_empty() { return (raw, 0); }
 
-    let mut out = raw;
+    // The window at index 0 is the current foreground window.
+    let current_pid = raw[0].pid;
 
-    // Find where prev_pid sits in the raw list.
-    let target_idx = if prev_pid > 0 {
-        out.iter().position(|e| e.pid == prev_pid)
-    } else {
-        None
-    };
+    // Remove all windows belonging to the current foreground app.
+    let mut out: Vec<WinEntry> = raw.into_iter().filter(|e| e.pid != current_pid).collect();
 
-    let rotate_by = match target_idx {
-        Some(idx) => idx,       // rotate that entry to the front
-        None      => 1,         // fallback: second window (skipping current)
-    };
+    if out.is_empty() { return (out, 0); }
 
-    if out.len() > 1 && rotate_by > 0 {
-        let len = out.len();
-        out.rotate_left(rotate_by.min(len - 1));
+    // Rotate so prev_pid is at index 0, falling back to index 0 as-is
+    // (which is already the most-recently-used non-current window).
+    if prev_pid > 0 && prev_pid != current_pid {
+        if let Some(idx) = out.iter().position(|e| e.pid == prev_pid) {
+            if idx > 0 {
+                let len = out.len();
+                out.rotate_left(idx.min(len - 1));
+            }
+        }
     }
 
-    // Pre-select index 0 (the prev_pid window or best guess).
     (out, 0)
 }
 
@@ -499,10 +600,10 @@ impl Colors {
 
 // ── Layout ────────────────────────────────────────────────────────────────────
 
-const CARD_W:   f32 = 130.0;
-const CARD_H:   f32 = 120.0;
-const CARD_PAD: f32 = 12.0;
-const WIN_PAD:  f32 = 20.0;
+const CARD_W:   f32 = 100.0;
+const CARD_H:   f32 = 110.0;
+const CARD_PAD: f32 = 14.0;
+const WIN_PAD:  f32 = 28.0;
 const HINT_H:   f32 = 0.0;  // legend removed
 
 // ── Switcher app ──────────────────────────────────────────────────────────────
@@ -549,14 +650,16 @@ impl eframe::App for SwitcherApp {
                     self.selected.store((cur + 1) % len, Ordering::Relaxed);
                 }
             } else {
-                // Capture window list and prev_pid regardless — needed for
-                // both the overlay path and the silent-swap path.
+                // Capture window list once — raw[0] is current foreground window,
+                // raw[1] is previously focused (our silent-swap target).
                 let raw  = list_windows_raw();
                 let prev = raw.get(1).map(|e| e.pid).unwrap_or(0);
                 self.pending_prev_pid = prev;
                 self.prev_pid.store(prev, Ordering::Relaxed);
 
-                let (wins, sel) = build_window_list(prev);
+                // Pass raw into build_window_list so it strips the current app
+                // and uses the same snapshot (no second CGWindowList call).
+                let (wins, sel) = build_window_list(raw, prev);
                 let colors = build_window_colors(&wins);
                 *self.windows.lock().unwrap()    = wins;
                 *self.win_colors.lock().unwrap() = colors;
@@ -658,19 +761,19 @@ impl eframe::App for SwitcherApp {
 
                         // Glyph (app icon)
                         ui.painter().text(
-                            egui::pos2(r.center().x, r.top() + 40.0),
+                            egui::pos2(r.center().x, r.top() + 36.0),
                             egui::Align2::CENTER_CENTER,
                             glyph_for(&entry.app_name),
-                            egui::FontId::proportional(30.0),
+                            egui::FontId::proportional(24.0),
                             if is_sel { win_color } else { c.fg },
                         );
 
                         // App name
                         ui.painter().text(
-                            egui::pos2(r.center().x, r.top() + 72.0),
+                            egui::pos2(r.center().x, r.top() + 63.0),
                             egui::Align2::CENTER_CENTER,
-                            truncate(&entry.app_name, 15),
-                            egui::FontId::proportional(11.0),
+                            truncate(&entry.app_name, 13),
+                            egui::FontId::proportional(10.0),
                             c.fg,
                         );
 
@@ -678,13 +781,13 @@ impl eframe::App for SwitcherApp {
                         let title_text = if entry.win_title.is_empty() {
                             "—".to_string()
                         } else {
-                            truncate(&entry.win_title, 16)
+                            truncate(&entry.win_title, 14)
                         };
                         ui.painter().text(
-                            egui::pos2(r.center().x, r.top() + 89.0),
+                            egui::pos2(r.center().x, r.top() + 80.0),
                             egui::Align2::CENTER_CENTER,
                             title_text,
-                            egui::FontId::proportional(10.0),
+                            egui::FontId::proportional(9.0),
                             if is_sel { win_color } else { c.fg_dim },
                         );
                     }
