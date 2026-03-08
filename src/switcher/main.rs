@@ -192,6 +192,9 @@ unsafe extern "C" fn event_tap_callback(
             // 48 = kVK_Tab
             if keycode == 48 && ctx.option_down {
                 let _ = ctx.tx.send(KeyMsg::TabPressed);
+                // Swallow the event — return null so it never reaches the
+                // focused application.
+                return std::ptr::null_mut();
             }
         }
         _ => {}
@@ -224,7 +227,7 @@ fn start_key_listener(tx: std::sync::mpsc::Sender<KeyMsg>) {
             ffi::CGEventTapCreate(
                 ffi::kCGHIDEventTap,
                 ffi::kCGHeadInsertEventTap,
-                ffi::kCGEventTapOptionListenOnly,
+                ffi::kCGEventTapOptionDefault,  // intercepting, not listen-only
                 mask,
                 event_tap_callback,
                 ctx_raw,
