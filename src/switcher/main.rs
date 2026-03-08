@@ -59,6 +59,7 @@ mod ffi {
     pub const kCGEventFlagMaskAlternate:   CGEventFlags = 0x00080000;
 
     pub const kCFNumberSInt32Type: CFNumberType = 3;
+    pub const kCFNumberSInt64Type: CFNumberType = 4;
 
     // kCFStringEncodingUTF8
     pub const kCFStringEncodingUTF8: u32 = 0x08000100;
@@ -400,22 +401,25 @@ fn ax_window_titles(pid: i32) -> Vec<String> {
 }
 
 /// Raise and focus a specific window identified by its CGWindowID.
-/// Iterates the AX window list for `pid`, matches on kAXWindowIdentifier,
-/// calls AXRaise, then activates the app.
-fn raise_window(pid: i32, wid: u32) {
+///
+/// Strategy (in order):
+///   1. Match AX window by AXWindowIdentifier (CGWindowID, read as i64).
+///   2. Fall back to matching by AXTitle == win_title.
+///   3. Fall back to activate_pid only (brings app to front, macOS picks window).
+///
+/// AXRaise is called on the matched element, then activate_pid brings the app
+/// to front.  The ordering matters: raise first, then activate, so the raised
+/// window ends up as the frontmost one.
+fn raise_window(pid: i32, wid: u32, win_title: &str) {
     unsafe {
         let app_elem = ffi::AXUIElementCreateApplication(pid);
         if app_elem.is_null() { activate_pid(pid); return; }
 
-        let ax_windows_name = std::ffi::CString::new("AXWindows").unwrap();
-        let cf_windows_attr = ffi::CFStringCreateWithCString(
-            std::ptr::null(),
-            ax_windows_name.as_ptr() as *const _,
-            ffi::kCFStringEncodingUTF8,
-        );
+        // --- fetch AXWindows list ------------------------------------------
+        let cf_ax_windows = cf_str("AXWindows");
         let mut windows_val: ffi::CFTypeRef = std::ptr::null();
-        let err = ffi::AXUIElementCopyAttributeValue(app_elem, cf_windows_attr, &mut windows_val);
-        ffi::CFRelease(cf_windows_attr);
+        let err = ffi::AXUIElementCopyAttributeValue(app_elem, cf_ax_windows, &mut windows_val);
+        ffi::CFRelease(cf_ax_windows);
 
         if err != ffi::kAXErrorSuccess || windows_val.is_null() {
             ffi::CFRelease(app_elem as ffi::CFTypeRef);
@@ -423,38 +427,32 @@ fn raise_window(pid: i32, wid: u32) {
             return;
         }
 
-        let cf_wid_attr = {
-            let s = std::ffi::CString::new("AXWindowIdentifier").unwrap();
-            ffi::CFStringCreateWithCString(std::ptr::null(), s.as_ptr() as *const _, ffi::kCFStringEncodingUTF8)
-        };
-        let cf_raise_action = {
-            let s = std::ffi::CString::new("AXRaise").unwrap();
-            ffi::CFStringCreateWithCString(std::ptr::null(), s.as_ptr() as *const _, ffi::kCFStringEncodingUTF8)
-        };
+        let cf_wid_attr    = cf_str("AXWindowIdentifier");
+        let cf_title_attr  = cf_str("AXTitle");
+        let cf_raise_action = cf_str("AXRaise");
 
         let count = ffi::CFArrayGetCount(windows_val as ffi::CFArrayRef);
-        let mut raised = false;
+        let mut target: ffi::AXUIElementRef = std::ptr::null_mut();
+
+        // Pass 1 — match by CGWindowID (AXWindowIdentifier, 64-bit).
         for i in 0..count {
             let win = ffi::CFArrayGetValueAtIndex(windows_val as ffi::CFArrayRef, i);
             if win.is_null() { continue; }
-
-            // Read AXWindowIdentifier (a CFNumber == CGWindowID)
             let mut id_val: ffi::CFTypeRef = std::ptr::null();
-            let e2 = ffi::AXUIElementCopyAttributeValue(
+            let e = ffi::AXUIElementCopyAttributeValue(
                 win as ffi::AXUIElementRef, cf_wid_attr, &mut id_val,
             );
-            if e2 == ffi::kAXErrorSuccess && !id_val.is_null() {
+            if e == ffi::kAXErrorSuccess && !id_val.is_null() {
                 if ffi::CFGetTypeID(id_val) == ffi::CFNumberGetTypeID() {
-                    let mut win_id: i32 = 0;
+                    let mut win_id: i64 = 0;
                     ffi::CFNumberGetValue(
                         id_val as ffi::CFNumberRef,
-                        ffi::kCFNumberSInt32Type,
+                        ffi::kCFNumberSInt64Type,
                         &mut win_id as *mut _ as *mut _,
                     );
                     ffi::CFRelease(id_val);
                     if win_id as u32 == wid {
-                        ffi::AXUIElementPerformAction(win as ffi::AXUIElementRef, cf_raise_action);
-                        raised = true;
+                        target = win as ffi::AXUIElementRef;
                         break;
                     }
                 } else {
@@ -463,15 +461,55 @@ fn raise_window(pid: i32, wid: u32) {
             }
         }
 
+        // Pass 2 — match by AXTitle if wid match failed and we have a title.
+        if target.is_null() && !win_title.is_empty() {
+            for i in 0..count {
+                let win = ffi::CFArrayGetValueAtIndex(windows_val as ffi::CFArrayRef, i);
+                if win.is_null() { continue; }
+                let title = ax_element_title(win as ffi::AXUIElementRef, cf_title_attr);
+                if title.as_deref() == Some(win_title) {
+                    target = win as ffi::AXUIElementRef;
+                    break;
+                }
+            }
+        }
+
+        if !target.is_null() {
+            ffi::AXUIElementPerformAction(target, cf_raise_action);
+        }
+
         ffi::CFRelease(cf_wid_attr);
+        ffi::CFRelease(cf_title_attr);
         ffi::CFRelease(cf_raise_action);
         ffi::CFRelease(windows_val);
         ffi::CFRelease(app_elem as ffi::CFTypeRef);
 
-        // Always activate the app regardless (brings it to front).
-        let _ = raised;
+        // Activate the app — must come AFTER AXRaise so the raised window wins.
         activate_pid(pid);
     }
+}
+
+/// Create a CFStringRef from a &str (UTF-8).  Caller must CFRelease.
+unsafe fn cf_str(s: &str) -> ffi::CFStringRef {
+    let c = std::ffi::CString::new(s).unwrap();
+    ffi::CFStringCreateWithCString(std::ptr::null(), c.as_ptr() as *const _, ffi::kCFStringEncodingUTF8)
+}
+
+/// Read AXTitle from an AX element.
+unsafe fn ax_element_title(
+    elem: ffi::AXUIElementRef,
+    cf_title_attr: ffi::CFStringRef,
+) -> Option<String> {
+    let mut val: ffi::CFTypeRef = std::ptr::null();
+    let e = ffi::AXUIElementCopyAttributeValue(elem, cf_title_attr, &mut val);
+    if e != ffi::kAXErrorSuccess || val.is_null() { return None; }
+    if ffi::CFGetTypeID(val) != ffi::CFStringGetTypeID() {
+        ffi::CFRelease(val);
+        return None;
+    }
+    let s = cf_string_to_rust(val as ffi::CFStringRef);
+    ffi::CFRelease(val);
+    s
 }
 
 /// Returns the raw on-screen window list **without** rotation.
@@ -705,6 +743,8 @@ struct SwitcherApp {
     pending_prev_pid: i32,
     /// wid (CGWindowID) counterpart to pending_prev_pid.
     pending_prev_wid: u32,
+    /// win_title counterpart to pending_prev_pid (for title-based fallback).
+    pending_prev_title: String,
 }
 
 impl eframe::App for SwitcherApp {
@@ -736,10 +776,12 @@ impl eframe::App for SwitcherApp {
                 // Capture window list once — raw[0] is current foreground window,
                 // raw[1] is previously focused (our silent-swap target).
                 let raw  = list_windows_raw();
-                let prev     = raw.get(1).map(|e| e.pid).unwrap_or(0);
-                let prev_wid = raw.get(1).map(|e| e.wid).unwrap_or(0);
-                self.pending_prev_pid = prev;
-                self.pending_prev_wid = prev_wid;
+                let prev        = raw.get(1).map(|e| e.pid).unwrap_or(0);
+                let prev_wid    = raw.get(1).map(|e| e.wid).unwrap_or(0);
+                let prev_title  = raw.get(1).map(|e| e.win_title.clone()).unwrap_or_default();
+                self.pending_prev_pid   = prev;
+                self.pending_prev_wid   = prev_wid;
+                self.pending_prev_title = prev_title;
                 self.prev_pid.store(prev, Ordering::Relaxed);
 
                 // Pass raw into build_window_list so it strips the current app
@@ -758,10 +800,11 @@ impl eframe::App for SwitcherApp {
                 } else {
                     // Option already released before update() ran — silent swap.
                     if self.pending_prev_pid > 0 {
-                        raise_window(self.pending_prev_pid, self.pending_prev_wid);
+                        raise_window(self.pending_prev_pid, self.pending_prev_wid, &self.pending_prev_title.clone());
                     }
-                    self.pending_prev_pid = 0;
-                    self.pending_prev_wid = 0;
+                    self.pending_prev_pid   = 0;
+                    self.pending_prev_wid   = 0;
+                    self.pending_prev_title = String::new();
                 }
             }
         }
@@ -775,11 +818,12 @@ impl eframe::App for SwitcherApp {
                 let wins = self.windows.lock().unwrap().clone();
                 let sel  = self.selected.load(Ordering::Relaxed);
                 if let Some(e) = wins.get(sel) {
-                    raise_window(e.pid, e.wid);
+                    raise_window(e.pid, e.wid, &e.win_title);
                 }
             }
-            self.pending_prev_pid = 0;
-            self.pending_prev_wid = 0;
+            self.pending_prev_pid   = 0;
+            self.pending_prev_wid   = 0;
+            self.pending_prev_title = String::new();
         }
 
         ctx.request_repaint_after(if self.visible.load(Ordering::Relaxed) {
@@ -958,8 +1002,9 @@ fn main() -> eframe::Result<()> {
                     colors: Colors::kanagawa(),
                     prev_pid,
                     option_down,
-                    pending_prev_pid: 0,
-                    pending_prev_wid: 0,
+                    pending_prev_pid:   0,
+                    pending_prev_wid:   0,
+                    pending_prev_title: String::new(),
                 })
         }),
     )
