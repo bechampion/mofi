@@ -470,17 +470,19 @@ fn render_icon_colors(bg: [u8; 4], fg: [u8; 4], glyph: char, font_path_override:
         px.copy_from_slice(&bg);
     }
 
-    // 1-px border — same color as bg (subtle inset shape, no color contrast)
-    let border: [u8; 4] = bg;
-    for i in 0..SIZE {
-        let set = |buf: &mut Vec<u8>, x: usize, y: usize| {
-            let off = (y * SIZE + x) * 4;
-            buf[off..off + 4].copy_from_slice(&border);
-        };
-        set(&mut buf, i, 0);
-        set(&mut buf, i, SIZE - 1);
-        set(&mut buf, 0, i);
-        set(&mut buf, SIZE - 1, i);
+    // 2-px border — lighter than the dark bg so it's visible as a frame
+    let border: [u8; 4] = [120, 80, 180, 255];
+    for t in 0..2usize {
+        for i in 0..SIZE {
+            let set = |buf: &mut Vec<u8>, x: usize, y: usize| {
+                let off = (y * SIZE + x) * 4;
+                buf[off..off + 4].copy_from_slice(&border);
+            };
+            set(&mut buf, i, t);
+            set(&mut buf, i, SIZE - 1 - t);
+            set(&mut buf, t, i);
+            set(&mut buf, SIZE - 1 - t, i);
+        }
     }
 
     // ── Load font ─────────────────────────────────────────────────────────────
