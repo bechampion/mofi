@@ -17,6 +17,13 @@ use std::sync::{Arc, Mutex};
 const PID_FILE: &str = "/tmp/mofi.pid";
 const SOCK_FILE: &str = "/tmp/mofi.sock";
 
+/// Send SIGUSR1 to our own process (called from handle_client threads so that
+/// shared state is fully written *before* the UI thread wakes on the signal).
+fn send_sigusr1_to_self() {
+    let pid = std::process::id() as i32;
+    unsafe { libc::kill(pid, libc::SIGUSR1) };
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(|s| s.as_str()).unwrap_or("--daemon");
@@ -89,19 +96,9 @@ fn show_tab_main(tab: &str) {
 
     // Send "tab:<name>" — daemon opens on that tab and waits for a selection,
     // then writes the selected entry name back over the socket.
+    // The daemon's handle_client sends SIGUSR1 to itself after setting pending_mode.
     let msg = format!("tab:{}\n", tab);
     stream.write_all(msg.as_bytes()).ok();
-
-    match fs::read_to_string(PID_FILE) {
-        Ok(contents) => {
-            let pid: i32 = contents.trim().parse().expect("Invalid PID");
-            unsafe { libc::kill(pid, libc::SIGUSR1) };
-        }
-        Err(_) => {
-            eprintln!("mofi: no PID file at {}", PID_FILE);
-            std::process::exit(1);
-        }
-    }
 
     // Wait for the daemon to send back the selected entry name (or empty = cancel).
     let mut response = String::new();
@@ -204,24 +201,15 @@ fn connect_or_start_daemon() -> Option<UnixStream> {
     None
 }
 
-/// Send `tab:<tab>\n`, wake the daemon with SIGUSR1, wait for a result line,
-/// then decrypt if a pass entry was returned.
+/// Send `tab:<tab>\n`, wait for a result line (the daemon sends SIGUSR1 to
+/// itself after receiving the message), then decrypt if a pass entry was returned.
 #[cfg(target_os = "linux")]
 fn run_tab_client(mut stream: UnixStream, tab: &str) {
     let msg = format!("tab:{}\n", tab);
     stream.write_all(msg.as_bytes()).ok();
 
-    // Signal the daemon to show the window on the requested tab.
-    match fs::read_to_string(PID_FILE) {
-        Ok(contents) => {
-            let pid: i32 = contents.trim().parse().expect("Invalid PID");
-            unsafe { libc::kill(pid, libc::SIGUSR1) };
-        }
-        Err(_) => {
-            eprintln!("mofi: no PID file at {}", PID_FILE);
-            std::process::exit(1);
-        }
-    }
+    // The daemon's handle_client thread now sends SIGUSR1 after setting
+    // pending_mode, so we do NOT need to kill() here — just wait for the result.
 
     // Wait for the daemon to send back the selected entry name (or empty = cancel).
     let mut response = String::new();
@@ -263,16 +251,7 @@ fn client_main() {
 
     stream.write_all(b"ready\n").ok();
 
-    match fs::read_to_string(PID_FILE) {
-        Ok(contents) => {
-            let pid: i32 = contents.trim().parse().expect("Invalid PID");
-            unsafe { libc::kill(pid, libc::SIGUSR1) };
-        }
-        Err(_) => {
-            eprintln!("mofi: no PID file at {}", PID_FILE);
-            std::process::exit(1);
-        }
-    }
+    // The daemon's handle_client thread sends SIGUSR1 to itself after receiving "ready".
 
     let mut response = String::new();
     BufReader::new(&stream).read_line(&mut response).ok();
@@ -323,17 +302,7 @@ fn input_client_main() {
     let message = format!("input\t{}\n", encoded.join("\t"));
     stream.write_all(message.as_bytes()).ok();
 
-    // Signal the daemon to show the window.
-    match fs::read_to_string(PID_FILE) {
-        Ok(contents) => {
-            let pid: i32 = contents.trim().parse().expect("Invalid PID");
-            unsafe { libc::kill(pid, libc::SIGUSR1) };
-        }
-        Err(_) => {
-            eprintln!("mofi: no PID file at {}", PID_FILE);
-            std::process::exit(1);
-        }
-    }
+    // The daemon's handle_client thread sends SIGUSR1 to itself after posting items.
 
     // Wait for the daemon's response.
     let mut response = String::new();
@@ -384,17 +353,7 @@ fn themes_client_main() {
     let message = format!("themes\t{}\n", encoded.join("\t"));
     stream.write_all(message.as_bytes()).ok();
 
-    // Signal the daemon to show the window.
-    match fs::read_to_string(PID_FILE) {
-        Ok(contents) => {
-            let pid: i32 = contents.trim().parse().expect("Invalid PID");
-            unsafe { libc::kill(pid, libc::SIGUSR1) };
-        }
-        Err(_) => {
-            eprintln!("mofi: no PID file at {}", PID_FILE);
-            std::process::exit(1);
-        }
-    }
+    // The daemon's handle_client thread sends SIGUSR1 to itself after posting items.
 
     // Wait for selection.
     let mut response = String::new();
@@ -910,6 +869,7 @@ fn handle_client(
     // show:<tab> — legacy fire-and-forget protocol, kept for compatibility.
     if let Some(tab) = line.strip_prefix("show:") {
         *pending_mode.lock().unwrap() = Some(tab.to_string());
+        send_sigusr1_to_self();
         return;
     }
 
@@ -917,6 +877,9 @@ fn handle_client(
     // Used by --pass and --clip so the client can act on the result.
     if let Some(tab) = line.strip_prefix("tab:") {
         *pending_mode.lock().unwrap() = Some(tab.to_string());
+        // Send SIGUSR1 NOW, after pending_mode is set — this eliminates the
+        // race where the UI wakes on SIGUSR1 before pending_mode is written.
+        send_sigusr1_to_self();
         // Fall through to the pending_entry wait loop below.
     } else if line.starts_with("input\t") || line.starts_with("themes\t") {
         let is_themes = line.starts_with("themes\t");
@@ -937,6 +900,8 @@ fn handle_client(
         {
             *pending_input.lock().unwrap() = Some(items);
         }
+        // Send SIGUSR1 after all shared state is written.
+        send_sigusr1_to_self();
 
         // Wait for the UI to post a result (selected string or None for cancel).
         let result = loop {
@@ -959,6 +924,11 @@ fn handle_client(
 
     // "ready" (--client) or "tab:<x>" (--pass / --clip) — wait for selection.
     {
+        // For "ready" (plain --client / macOS): send SIGUSR1 now that state is set.
+        // For "tab:<x>" the signal was already sent above.
+        if line == "ready" {
+            send_sigusr1_to_self();
+        }
         // Clear any stale value left from a previous session.
         // Some(None) means hide() fired — could be from this session's hide-before-wait
         // race, OR stale from a previous session.  Either way we clear it: if it was
