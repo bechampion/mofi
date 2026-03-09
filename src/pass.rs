@@ -119,7 +119,18 @@ pub fn copy_password_client(name: &str) -> bool {
 
     let output = match cmd.output() {
         Ok(o) if o.status.success() => o,
-        _ => return false,
+        Ok(o) => {
+            eprintln!(
+                "mofi: pass show failed (exit {:?}): {}",
+                o.status.code(),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            return false;
+        }
+        Err(e) => {
+            eprintln!("mofi: failed to spawn pass: {}", e);
+            return false;
+        }
     };
 
     // Take only the first line (the password itself).
@@ -152,19 +163,26 @@ pub fn copy_password_client(name: &str) -> bool {
     {
         use std::io::Write;
         // Try wl-copy (Wayland) first, then xclip (X11).
+        // Explicitly pass Wayland session vars — the client process may have
+        // a stripped environment when launched via a compositor keybind.
         for (prog, args) in &[
             ("wl-copy", vec![] as Vec<&str>),
             ("xclip", vec!["-selection", "clipboard"]),
         ] {
-            if let Ok(mut child) = std::process::Command::new(prog)
-                .args(args)
-                .stdin(std::process::Stdio::piped())
-                .spawn()
-            {
+            let mut child_cmd = std::process::Command::new(prog);
+            child_cmd.args(args).stdin(std::process::Stdio::piped());
+            // Ensure Wayland/X11 session vars are present.
+            for var in &["WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DISPLAY"] {
+                if let Ok(val) = std::env::var(var) {
+                    child_cmd.env(var, val);
+                }
+            }
+            if let Ok(mut child) = child_cmd.spawn() {
                 if let Some(stdin) = child.stdin.as_mut() {
                     let _ = stdin.write_all(plaintext.as_bytes());
                 }
-                if child.wait().map(|s| s.success()).unwrap_or(false) {
+                let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+                if ok {
                     return true;
                 }
             }

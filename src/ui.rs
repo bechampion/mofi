@@ -42,8 +42,8 @@ fn restore_app_focus(app: &NSRunningApplication) {
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const ICON_SIZE: f32 = 26.0;
-const ROW_HEIGHT: f32 = 42.0;
+const ICON_SIZE: f32 = 30.0;
+const ROW_HEIGHT: f32 = 48.0;
 const MAX_VISIBLE_ROWS: usize = 7;
 
 /// Return the paths to look for the custom fonts, in priority order.
@@ -850,15 +850,19 @@ impl RofiApp {
                 }
             });
         if pending.is_ok() {
-            self.visible = !self.visible;
-            if self.visible {
-                // Restore the window to full size.
-                // On macOS we use Visible(true); on Wayland/Linux OuterPosition
-                // and Visible are no-ops — expand from 1×1 back to full size.
+            // If pending_mode is set this is an explicit show-on-tab request
+            // (--password / --clipboard / --client).  Always show — never
+            // toggle to hide — so a second hotkey press while already visible
+            // doesn't accidentally hide and leave the socket client hanging.
+            let has_pending_mode = self.pending_mode.lock().unwrap().is_some();
+            let want_show = has_pending_mode || !self.visible;
+            if want_show && !self.visible {
+                // Show the window.
+                self.visible = true;
                 #[cfg(target_os = "macos")]
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 #[cfg(not(target_os = "macos"))]
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(640.0, 380.0)));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(720.0, 440.0)));
                 #[cfg(target_os = "macos")]
                 {
                     self.prev_app = capture_previous_app();
@@ -875,7 +879,6 @@ impl RofiApp {
                     if is_themes {
                         self.theme_before_preview = Some(self.theme.clone());
                         self.mode = Mode::Themes;
-                        // Pre-select the currently active theme.
                         let active = self.theme.name;
                         if let Some(pos) = self
                             .input_items
@@ -893,7 +896,6 @@ impl RofiApp {
                     self.refilter_input();
                 } else {
                     self.input_is_themes = false;
-                    // Check if --pass or --clip requested a specific tab.
                     let requested = self.pending_mode.lock().unwrap().take();
                     match requested.as_deref() {
                         Some("pass") => {
@@ -910,13 +912,33 @@ impl RofiApp {
                     self.sync_apps();
                     self.refilter(true);
                 }
-                // Reset themes flag for next invocation.
                 *self.pending_input_is_themes.lock().unwrap() = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            } else if want_show && self.visible {
+                // Already visible but a new tab was requested — switch tab and
+                // reset state without hiding/showing the surface.
+                self.query.clear();
+                self.frame_count = 0;
+                self.toast = None;
+                self.input_is_themes = false;
+                let requested = self.pending_mode.lock().unwrap().take();
+                match requested.as_deref() {
+                    Some("pass") => {
+                        self.mode = Mode::Pass;
+                    }
+                    Some("clip") => {
+                        self.mode = Mode::Clipboard;
+                        self.sync_clipboard();
+                    }
+                    _ => {
+                        self.mode = Mode::Apps;
+                    }
+                }
+                self.sync_apps();
+                self.refilter(true);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             } else {
-                // Toggled off via SIGUSR1 — use hide() so pending_entry and
-                // input_result are unblocked (socket handlers waiting on them
-                // would hang forever otherwise).
+                // Plain toggle-off (no pending tab, window was visible).
                 self.hide(ctx);
             }
         }
@@ -1074,7 +1096,7 @@ impl RofiApp {
                                 let selected = self.mode == mode;
                                 let btn = egui::Button::new(
                                     egui::RichText::new(label)
-                                        .font(FontId::new(12.0, FontFamily::Monospace))
+                                        .font(FontId::new(14.0, FontFamily::Monospace))
                                         .color(if selected { t.accent } else { t.fg_muted }),
                                 )
                                 .fill(if selected {
@@ -1109,7 +1131,7 @@ impl RofiApp {
                                 |ui| {
                                     ui.label(
                                         egui::RichText::new("Mofi")
-                                            .font(FontId::new(13.0, self.medium_font.clone()))
+                                            .font(FontId::new(15.0, self.medium_font.clone()))
                                             .color(t.brand),
                                     );
                                 },
@@ -1131,7 +1153,7 @@ impl RofiApp {
                         let response = ui.add(
                             egui::TextEdit::singleline(&mut self.query)
                                 .hint_text(egui::RichText::new(hint).color(t.fg_muted))
-                                .font(FontId::new(17.0, FontFamily::Monospace))
+                                .font(FontId::new(20.0, FontFamily::Monospace))
                                 .text_color(t.fg)
                                 .frame(false)
                                 .desired_width(f32::INFINITY),
@@ -1224,31 +1246,31 @@ impl RofiApp {
                             ui.vertical_centered(|ui| {
                                 ui.label(
                                     egui::RichText::new("Mofi")
-                                        .font(FontId::new(24.0, self.medium_font.clone()))
+                                        .font(FontId::new(27.0, self.medium_font.clone()))
                                         .color(t.accent),
                                 );
                                 ui.add_space(4.0);
                                 ui.label(
                                     egui::RichText::new("v0.1.0")
-                                        .font(FontId::new(12.0, FontFamily::Monospace))
+                                        .font(FontId::new(14.0, FontFamily::Monospace))
                                         .color(t.fg_muted),
                                 );
                                 ui.add_space(14.0);
                                 ui.label(
                                     egui::RichText::new("App launcher · Clipboard · Pass")
-                                        .font(FontId::new(13.0, FontFamily::Monospace))
+                                        .font(FontId::new(15.0, FontFamily::Monospace))
                                         .color(t.fg_dim),
                                 );
                                 ui.add_space(14.0);
                                 ui.label(
                                     egui::RichText::new("\u{F09B}  github.com/bechampion/mofi")
-                                        .font(FontId::new(13.0, FontFamily::Monospace))
+                                        .font(FontId::new(15.0, FontFamily::Monospace))
                                         .color(t.accent2),
                                 );
                                 ui.add_space(14.0);
                                 ui.label(
                                     egui::RichText::new(format!("Theme: {}", t.name))
-                                        .font(FontId::new(12.0, FontFamily::Monospace))
+                                        .font(FontId::new(14.0, FontFamily::Monospace))
                                         .color(t.fg_muted),
                                 );
                                 ui.add_space(8.0);
@@ -1256,7 +1278,7 @@ impl RofiApp {
                                     egui::RichText::new(
                                         "Super/Mod key  open · Esc  close · Tab  cycle tabs",
                                     )
-                                    .font(FontId::new(11.0, FontFamily::Monospace))
+                                    .font(FontId::new(13.0, FontFamily::Monospace))
                                     .color(t.fg_muted),
                                 );
                             });
@@ -1271,7 +1293,7 @@ impl RofiApp {
                                         ui.centered_and_justified(|ui| {
                                             ui.label(
                                                 egui::RichText::new("No results")
-                                                    .font(FontId::new(13.0, FontFamily::Monospace))
+                                                    .font(FontId::new(15.0, FontFamily::Monospace))
                                                     .color(t.fg_muted),
                                             );
                                         });
@@ -1328,7 +1350,7 @@ impl RofiApp {
                                             egui::pos2(ix + ICON_SIZE + 12.0, rr.center().y),
                                             egui::Align2::LEFT_CENTER,
                                             &text,
-                                            FontId::new(14.0, self.medium_font.clone()),
+                                            FontId::new(16.0, self.medium_font.clone()),
                                             if sel { t.fg } else { t.fg_dim },
                                         );
                                         let click = ui.interact(
@@ -1363,7 +1385,7 @@ impl RofiApp {
                                         ui.centered_and_justified(|ui| {
                                             ui.label(
                                                 egui::RichText::new("No results")
-                                                    .font(FontId::new(13.0, FontFamily::Monospace))
+                                                    .font(FontId::new(15.0, FontFamily::Monospace))
                                                     .color(t.fg_muted),
                                             );
                                         });
@@ -1427,7 +1449,7 @@ impl RofiApp {
                                                 egui::pos2(tx, rr.center().y + 7.0),
                                                 egui::Align2::LEFT_CENTER,
                                                 &sub,
-                                                FontId::new(11.0, FontFamily::Monospace),
+                                                FontId::new(13.0, FontFamily::Monospace),
                                                 if sel { t.accent2 } else { t.fg_muted },
                                             );
                                         } else {
@@ -1464,7 +1486,7 @@ impl RofiApp {
                                 ui.horizontal(|ui| {
                                     ui.label(
                                         egui::RichText::new(msg.as_str())
-                                            .font(FontId::new(13.0, FontFamily::Monospace))
+                                            .font(FontId::new(15.0, FontFamily::Monospace))
                                             .color(t.toast),
                                     );
                                 });

@@ -58,8 +58,8 @@ use smithay_client_toolkit::{
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 
 // Window dimensions when visible.
-const WIN_W: u32 = 640;
-const WIN_H: u32 = 380;
+const WIN_W: u32 = 720;
+const WIN_H: u32 = 440;
 
 // ── Public entry points ───────────────────────────────────────────────────────
 
