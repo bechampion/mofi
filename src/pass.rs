@@ -65,6 +65,11 @@ fn relative_name(root: &Path, file: &Path) -> Option<String> {
 /// This version is for the CLIENT — uses `pass show` to decrypt, then
 /// copies the first line to the clipboard via wl-copy (Wayland) or
 /// xclip (X11) on Linux, or pbcopy on macOS.
+///
+/// On Linux the clipboard is automatically cleared after `CLIP_TIMEOUT`
+/// seconds — but only if it still contains the password we set (so we
+/// don't nuke something the user copied in the meantime).
+///
 /// Returns true on success.
 pub fn copy_password_client(name: &str) -> bool {
     let home = match dirs::home_dir() {
@@ -183,6 +188,8 @@ pub fn copy_password_client(name: &str) -> bool {
                 }
                 let ok = child.wait().map(|s| s.success()).unwrap_or(false);
                 if ok {
+                    // Schedule clipboard clear after timeout.
+                    schedule_clipboard_clear(plaintext);
                     return true;
                 }
             }
@@ -192,4 +199,72 @@ pub fn copy_password_client(name: &str) -> bool {
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     false
+}
+
+// ── Clipboard auto-clear for passwords ────────────────────────────────────────
+
+/// How many seconds to keep a password in the clipboard before clearing it.
+/// Matches the default `pass -c` behaviour (45 s).
+const CLIP_TIMEOUT_SECS: u64 = 45;
+
+/// Spawn a detached thread that sleeps for `CLIP_TIMEOUT_SECS`, then clears
+/// the clipboard — but only if it still contains the password we set.
+#[cfg(target_os = "linux")]
+fn schedule_clipboard_clear(password: String) {
+    // Snapshot the session vars now — the thread may outlive the caller.
+    let wayland = std::env::var("WAYLAND_DISPLAY").ok();
+    let xdg_rt = std::env::var("XDG_RUNTIME_DIR").ok();
+    let display = std::env::var("DISPLAY").ok();
+
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(CLIP_TIMEOUT_SECS));
+
+        // Read the current clipboard content.
+        let current = {
+            let mut cmd = std::process::Command::new("wl-paste");
+            cmd.arg("--no-newline")
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped());
+            if let Some(ref v) = wayland {
+                cmd.env("WAYLAND_DISPLAY", v);
+            }
+            if let Some(ref v) = xdg_rt {
+                cmd.env("XDG_RUNTIME_DIR", v);
+            }
+            if let Some(ref v) = display {
+                cmd.env("DISPLAY", v);
+            }
+            cmd.output()
+                .ok()
+                .and_then(|o| {
+                    if o.status.success() {
+                        Some(o.stdout)
+                    } else {
+                        None
+                    }
+                })
+                .and_then(|b| String::from_utf8(b).ok())
+        };
+
+        // Only clear if the clipboard still holds the password we set.
+        if current.as_deref() == Some(password.as_str()) {
+            let mut cmd = std::process::Command::new("wl-copy");
+            cmd.arg("--clear")
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null());
+            if let Some(ref v) = wayland {
+                cmd.env("WAYLAND_DISPLAY", v);
+            }
+            if let Some(ref v) = xdg_rt {
+                cmd.env("XDG_RUNTIME_DIR", v);
+            }
+            let _ = cmd.status();
+            eprintln!(
+                "[mofi] clipboard cleared after {}s (password auto-expire)",
+                CLIP_TIMEOUT_SECS
+            );
+        }
+    });
 }
