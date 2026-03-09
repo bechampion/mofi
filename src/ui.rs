@@ -442,6 +442,8 @@ pub struct RofiApp {
     /// Used to avoid re-issuing the scroll every frame (which causes the
     /// center-align to drift the view on the first frame when selected=0).
     last_scroll_to: usize,
+    /// When true, the next frame's scroll area should reset offset to 0.
+    scroll_reset_pending: bool,
     /// System-tray handle (Linux only) — used to update the tray icon colour
     /// when the mode or visibility changes.
     #[cfg(target_os = "linux")]
@@ -595,6 +597,7 @@ impl RofiApp {
             medium_font,
             frecency: FrecencyStore::load(),
             last_scroll_to: usize::MAX,
+            scroll_reset_pending: false,
             #[cfg(target_os = "linux")]
             tray_handle: None,
         };
@@ -724,6 +727,14 @@ impl RofiApp {
         }
     }
 
+    /// Reset a scroll area's offset to zero by clearing its persisted state.
+    /// The `id_salt` is hashed with the parent UI id by ScrollArea, so we
+    /// clear all persisted scroll_area::State entries matching any parent.
+    /// Instead we set a flag; the scroll areas check it on the next frame.
+    fn request_scroll_reset(&mut self) {
+        self.scroll_reset_pending = true;
+    }
+
     fn hide(&mut self, ctx: &egui::Context) {
         self.visible = false;
         self.should_close = false;
@@ -732,6 +743,8 @@ impl RofiApp {
         self.had_keyboard_focus_ever = false;
         self.toast = None;
         self.last_scroll_to = usize::MAX;
+        // Request scroll reset so the next open starts at the top.
+        self.request_scroll_reset();
         // If we were in themes mode and the user cancelled, restore original theme.
         if let Some(original) = self.theme_before_preview.take() {
             self.theme = original;
@@ -979,6 +992,7 @@ impl RofiApp {
                 self.frame_count = 0;
                 self.toast = None;
                 self.last_scroll_to = usize::MAX;
+                self.scroll_reset_pending = true;
 
                 let new_items = self.pending_input.lock().unwrap().take();
                 let is_themes = *self.pending_input_is_themes.lock().unwrap();
@@ -1031,6 +1045,7 @@ impl RofiApp {
                 self.frame_count = 0;
                 self.toast = None;
                 self.last_scroll_to = usize::MAX;
+                self.scroll_reset_pending = true;
                 self.input_is_themes = false;
                 let requested = self.pending_mode.lock().unwrap().take();
                 match requested.as_deref() {
@@ -1404,6 +1419,7 @@ impl RofiApp {
                         } else if self.mode == Mode::Input || self.mode == Mode::Themes {
                             // ── Input / theme picker list ─────────────────
                             egui::ScrollArea::vertical()
+                                .id_source("mofi_input")
                                 .max_height(max_list_height)
                                 .show(ui, |ui| {
                                     ui.set_min_width(ui.available_width());
@@ -1439,7 +1455,13 @@ impl RofiApp {
                                         );
                                         if sel && self.selected != self.last_scroll_to {
                                             self.last_scroll_to = self.selected;
-                                            ui.scroll_to_rect(rr, None);
+                                            let align = if self.scroll_reset_pending {
+                                                self.scroll_reset_pending = false;
+                                                Some(egui::Align::TOP)
+                                            } else {
+                                                None
+                                            };
+                                            ui.scroll_to_rect(rr, align);
                                         }
                                         if sel {
                                             ui.painter().rect_filled(rr, Rounding::ZERO, t.row_sel);
@@ -1497,6 +1519,7 @@ impl RofiApp {
                         } else {
                             // ── Normal results list ───────────────────────
                             egui::ScrollArea::vertical()
+                                .id_source("mofi_results")
                                 .max_height(max_list_height)
                                 .show(ui, |ui| {
                                     ui.set_min_width(ui.available_width());
@@ -1527,7 +1550,13 @@ impl RofiApp {
                                         );
                                         if sel && self.selected != self.last_scroll_to {
                                             self.last_scroll_to = self.selected;
-                                            ui.scroll_to_rect(rr, None);
+                                            let align = if self.scroll_reset_pending {
+                                                self.scroll_reset_pending = false;
+                                                Some(egui::Align::TOP)
+                                            } else {
+                                                None
+                                            };
+                                            ui.scroll_to_rect(rr, align);
                                         }
 
                                         if sel {
