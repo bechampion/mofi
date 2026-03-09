@@ -17,6 +17,7 @@ use objc2_app_kit::{
 use crate::apps::discover_apps;
 use crate::clipboard::{load_history, start_poller, ClipboardEntry, ClipboardHistory};
 use crate::config::{config_path, theme_by_name, Config, Theme};
+use crate::frecency::FrecencyStore;
 use crate::launcher::{launch_app, paste_text, LaunchItem, Launcher};
 use crate::pass::discover_pass_entries;
 
@@ -435,6 +436,8 @@ pub struct RofiApp {
     /// FontFamily::Name("medium") when MapleMono-NF-Medium.ttf is installed,
     /// otherwise falls back to FontFamily::Monospace to prevent a panic.
     medium_font: FontFamily,
+    /// Frecency store — tracks launch frequency/recency for Apps and Pass items.
+    frecency: FrecencyStore,
 }
 
 impl RofiApp {
@@ -579,6 +582,7 @@ impl RofiApp {
             theme,
             config_mtime,
             medium_font,
+            frecency: FrecencyStore::load(),
         };
         app.refilter(true);
         app
@@ -615,7 +619,9 @@ impl RofiApp {
             .collect();
 
         let search_items: Vec<LaunchItem> = mode_items.iter().map(|(_, i)| (*i).clone()).collect();
-        let matched: Vec<usize> = self.launcher.search(&self.query, &search_items);
+        let matched: Vec<usize> = self
+            .launcher
+            .search(&self.query, &search_items, &self.frecency);
         self.filtered = matched.into_iter().map(|li| mode_items[li].0).collect();
 
         if reset_selection {
@@ -671,7 +677,10 @@ impl RofiApp {
         if let Some(&idx) = self.filtered.get(self.selected) {
             match &self.items[idx] {
                 LaunchItem::App(app) => {
-                    launch_app(&app.path.clone());
+                    let path = app.path.clone();
+                    let name = app.name.clone();
+                    launch_app(&path);
+                    self.frecency.record(&name);
                     // Oneshot: no text output for app launches — treat as "done".
                     self.oneshot_result = Some(None);
                     self.should_close = true;
@@ -684,6 +693,7 @@ impl RofiApp {
                 }
                 LaunchItem::Pass(e) => {
                     let name = e.name.clone();
+                    self.frecency.record(&name);
                     *self.pending_entry.lock().unwrap() = Some(Some(name.clone()));
                     // Oneshot: record the pass entry name so the caller can decrypt it.
                     self.oneshot_result = Some(Some(name));

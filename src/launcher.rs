@@ -1,5 +1,6 @@
 use crate::apps::AppEntry;
 use crate::clipboard::ClipboardEntry;
+use crate::frecency::FrecencyStore;
 use crate::pass::PassEntry;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
@@ -43,11 +44,52 @@ impl Launcher {
         }
     }
 
-    /// Filter and rank items by query. Returns indices into `items` in score order.
-    pub fn search(&self, query: &str, items: &[LaunchItem]) -> Vec<usize> {
+    /// Filter and rank items by query, boosted by frecency.
+    /// Returns indices into `items` in ranked order.
+    ///
+    /// - Empty query: sort purely by frecency score (most-used first).
+    /// - Non-empty query: fuzzy-match as before, but add a frecency bonus so
+    ///   frequently-used items rise within ties (bonus is capped so a poor
+    ///   fuzzy match never beats a good one).
+    pub fn search(
+        &self,
+        query: &str,
+        items: &[LaunchItem],
+        frecency: &FrecencyStore,
+    ) -> Vec<usize> {
+        let keys: Vec<&str> = items
+            .iter()
+            .map(|i| {
+                match i {
+                    LaunchItem::App(a) => a.name.as_str(),
+                    LaunchItem::Pass(p) => p.name.as_str(),
+                    // Clipboard items are never frecency-tracked; key doesn't matter.
+                    LaunchItem::Clip(_) => "",
+                }
+            })
+            .collect();
+
+        let frec_scores = frecency.scores(&keys);
+
         if query.is_empty() {
-            return (0..items.len()).collect();
+            // Sort by frecency descending; stable so equal scores keep
+            // their original (alphabetical) order.
+            let mut indices: Vec<usize> = (0..items.len()).collect();
+            indices.sort_by(|&a, &b| {
+                frec_scores[b]
+                    .partial_cmp(&frec_scores[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            return indices;
         }
+
+        // Fuzzy match + frecency bonus.
+        // Bonus = frecency_score * FRECENCY_WEIGHT, added to the fuzzy score.
+        // We scale frecency into fuzzy-score units: SkimMatcher scores are
+        // roughly in the range 0–500 for typical strings, so a bonus of up to
+        // ~50 (≈10% of max) lets frequent items beat weak matches without
+        // displacing strong fuzzy hits.
+        const FRECENCY_WEIGHT: f64 = 20.0;
 
         let mut scored: Vec<(i64, usize)> = items
             .iter()
@@ -55,7 +97,10 @@ impl Launcher {
             .filter_map(|(i, item)| {
                 self.matcher
                     .fuzzy_match(&item.display_name(), query)
-                    .map(|score| (score, i))
+                    .map(|score| {
+                        let bonus = (frec_scores[i] * FRECENCY_WEIGHT) as i64;
+                        (score + bonus, i)
+                    })
             })
             .collect();
 
