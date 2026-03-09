@@ -402,6 +402,9 @@ pub struct RofiApp {
     /// In oneshot (daemonless) mode, holds the result after the window closes.
     /// Some(Some(name)) = pass entry selected, Some(None) = cancelled/Escape, None = not done.
     pub oneshot_result: Option<Option<String>>,
+    /// True when running in daemonless oneshot mode; false in persistent daemon mode.
+    /// Controls whether update() signals the event loop to exit after hide().
+    oneshot_mode: bool,
     toast: Option<(String, std::time::Instant)>,
     frame_count: u32,
     /// True once egui has reported keyboard focus at least once.
@@ -484,6 +487,7 @@ impl RofiApp {
     /// immediately (visible=true) and the result is read from `oneshot_result`
     /// after `layer_window::run_oneshot` returns.
     #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
     pub fn new_oneshot_with_mode(initial_mode: Mode) -> Self {
         let tmp_ctx = egui::Context::default();
         let mut app = Self::new_with_ctx(
@@ -497,6 +501,7 @@ impl RofiApp {
         );
         // Start visible — the surface is already mapped by run_oneshot().
         app.visible = true;
+        app.oneshot_mode = true;
         app.mode = initial_mode;
         // Pre-filter for the requested tab so the list is ready on first frame.
         app.refilter(true);
@@ -559,6 +564,7 @@ impl RofiApp {
             toggle,
             visible: false,
             oneshot_result: None,
+            oneshot_mode: false,
             #[cfg(target_os = "macos")]
             prev_app: None,
             pending_entry,
@@ -813,7 +819,7 @@ impl crate::layer_window::AppHandler for RofiApp {
         self.do_update(ctx);
         // In oneshot mode (visible starts true, no toggle mechanism), signal
         // the event loop to exit once the app has hidden itself.
-        if !self.visible && self.oneshot_result.is_some() {
+        if self.oneshot_mode && !self.visible && self.oneshot_result.is_some() {
             return true;
         }
         false

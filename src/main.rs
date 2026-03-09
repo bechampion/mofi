@@ -24,19 +24,19 @@ fn main() {
     match mode {
         "--client" => {
             #[cfg(target_os = "linux")]
-            client_oneshot(ui::Mode::Apps);
+            linux_client_main("apps");
             #[cfg(not(target_os = "linux"))]
             client_main();
         }
         "--password" => {
             #[cfg(target_os = "linux")]
-            client_oneshot(ui::Mode::Pass);
+            linux_client_main("pass");
             #[cfg(not(target_os = "linux"))]
             show_tab_main("pass");
         }
         "--clipboard" => {
             #[cfg(target_os = "linux")]
-            client_oneshot(ui::Mode::Clipboard);
+            linux_client_main("clip");
             #[cfg(not(target_os = "linux"))]
             show_tab_main("clip");
         }
@@ -123,9 +123,10 @@ fn show_tab_main(tab: &str) {
     }
 }
 
-// ── --client daemonless (Linux one-shot) ─────────────────────────────────────
+// ── --client daemonless (Linux one-shot, fallback only) ──────────────────────
 
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 fn client_oneshot(initial_mode: ui::Mode) {
     let app = ui::RofiApp::new_oneshot_with_mode(initial_mode);
     let app = layer_window::run_oneshot(app);
@@ -151,6 +152,98 @@ fn client_oneshot(initial_mode: ui::Mode) {
             std::process::exit(1);
         }
     }
+}
+
+// ── --client / --password / --clipboard via daemon (Linux) ───────────────────
+//
+// Connects to the running daemon over the Unix socket, asking it to show on a
+// specific tab.  If the daemon is not running, spawns it in the background and
+// retries.  On success, decrypts and copies the password if a pass entry was
+// selected.
+
+#[cfg(target_os = "linux")]
+fn linux_client_main(tab: &str) {
+    let stream = match connect_or_start_daemon() {
+        Some(s) => s,
+        None => {
+            eprintln!("mofi: could not connect to daemon after auto-start");
+            std::process::exit(1);
+        }
+    };
+    // Delegate to the shared show_tab_main logic.
+    run_tab_client(stream, tab);
+}
+
+/// Try to connect to the daemon socket.  If not running, spawn `mofi --daemon`
+/// detached and retry with a longer timeout (~5 s).
+#[cfg(target_os = "linux")]
+fn connect_or_start_daemon() -> Option<UnixStream> {
+    // Fast path: daemon already running.
+    if let Ok(s) = UnixStream::connect(SOCK_FILE) {
+        return Some(s);
+    }
+
+    // Spawn the daemon detached (double-fork via nohup equivalent).
+    let bin = std::env::current_exe().expect("cannot resolve binary path");
+    std::process::Command::new(&bin)
+        .arg("--daemon")
+        // Detach from our session so it survives after we exit.
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+
+    // Retry for up to 5 seconds.
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Ok(s) = UnixStream::connect(SOCK_FILE) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// Send `tab:<tab>\n`, wake the daemon with SIGUSR1, wait for a result line,
+/// then decrypt if a pass entry was returned.
+#[cfg(target_os = "linux")]
+fn run_tab_client(mut stream: UnixStream, tab: &str) {
+    let msg = format!("tab:{}\n", tab);
+    stream.write_all(msg.as_bytes()).ok();
+
+    // Signal the daemon to show the window on the requested tab.
+    match fs::read_to_string(PID_FILE) {
+        Ok(contents) => {
+            let pid: i32 = contents.trim().parse().expect("Invalid PID");
+            unsafe { libc::kill(pid, libc::SIGUSR1) };
+        }
+        Err(_) => {
+            eprintln!("mofi: no PID file at {}", PID_FILE);
+            std::process::exit(1);
+        }
+    }
+
+    // Wait for the daemon to send back the selected entry name (or empty = cancel).
+    let mut response = String::new();
+    BufReader::new(&stream).read_line(&mut response).ok();
+    let entry = response.trim().to_string();
+
+    if entry.is_empty() {
+        std::process::exit(0);
+    }
+
+    // Only pass entries need decryption.
+    if tab == "pass" {
+        if pass::copy_password_client(&entry) {
+            println!("Copied {}", entry);
+            std::process::exit(0);
+        } else {
+            eprintln!("mofi: failed to decrypt {}", entry);
+            std::process::exit(1);
+        }
+    }
+    // Apps / clipboard are handled inline by the daemon — nothing more to do.
+    std::process::exit(0);
 }
 
 // ── --client (existing daemon toggle / pass flow — macOS / fallback) ─────────
@@ -527,8 +620,16 @@ WantedBy=graphical-session.target
 
     // ── 2. hotkey hint ────────────────────────────────────────────────────────
     println!();
+    println!("  The daemon starts automatically on first use (--client auto-starts it).");
+    println!(
+        "  To pre-start it (faster first launch): {} --daemon &",
+        bin_str
+    );
+    println!();
     println!("  Hotkey: bind a key in your compositor/WM to run:");
-    println!("    {} --client", bin_str);
+    println!("    {} --client     (launcher)", bin_str);
+    println!("    {} --password   (jump to Pass tab)", bin_str);
+    println!("    {} --clipboard  (jump to Clipboard tab)", bin_str);
     println!("  Examples:");
     println!(
         "    Hyprland  → bind = SUPER, Space, exec, {} --client",
@@ -858,17 +959,17 @@ fn handle_client(
 
     // "ready" (--client) or "tab:<x>" (--pass / --clip) — wait for selection.
     {
-        // Clear any stale *pass-entry name* left from a previous session.
-        // IMPORTANT: do NOT clear Some(None) — that means hide() already fired
-        // while we were waiting to be scheduled; in that case exit immediately.
+        // Clear any stale value left from a previous session.
+        // Some(None) means hide() fired — could be from this session's hide-before-wait
+        // race, OR stale from a previous session.  Either way we clear it: if it was
+        // a true race the SIGUSR1 already sent the window visible so we still need to
+        // wait for the new selection; if it was stale we obviously must clear it.
         {
             let mut l = pending_entry.lock().unwrap();
             match *l {
                 Some(None) => {
-                    // hide() already fired before we even started waiting — return now.
-                    drop(l);
-                    stream.write_all(b"\n").ok();
-                    return;
+                    // Consume the stale cancel signal and continue waiting for this session.
+                    *l = None;
                 }
                 Some(Some(_)) => {
                     // Stale entry name from a prior session — discard it.

@@ -66,6 +66,7 @@ const WIN_H: u32 = 380;
 /// One-shot mode: create the window already mapped (visible), run until the app
 /// signals close (update returns true), then return the app so the caller can
 /// read the result.  Used by `--client` on Linux when running without a daemon.
+#[allow(dead_code)]
 pub fn run_oneshot<A: AppHandler>(app: A) -> A {
     let dummy_sigterm = Arc::new(AtomicBool::new(false));
     run_inner(app, dummy_sigterm, true)
@@ -175,6 +176,14 @@ fn run_inner<A: AppHandler>(mut app: A, sigterm: Arc<AtomicBool>, start_mapped: 
     let gl_ctx: PossiblyCurrentContext = gl_ctx_nc
         .make_current(&gl_surface)
         .expect("failed to make EGL context current");
+
+    // Disable vsync (swap interval 0) so swap_buffers returns immediately.
+    // We drive the frame rate ourselves via the 16ms poll loop.  With interval=1
+    // EGL blocks on an internal wl_surface.frame callback which can stall
+    // permanently after an unmap/remap cycle if the compositor stops sending them.
+    gl_surface
+        .set_swap_interval(&gl_ctx, glutin::surface::SwapInterval::DontWait)
+        .ok();
 
     // ── glow + egui_glow Painter ──────────────────────────────────────────────
     let gl = unsafe {
