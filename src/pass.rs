@@ -62,8 +62,9 @@ fn relative_name(root: &Path, file: &Path) -> Option<String> {
 }
 
 /// Copy the first line (the password) of a pass entry to the clipboard.
-/// This version is for the CLIENT — uses `pass show -c` which handles
-/// pinentry GUI prompting and clipboard copy natively.
+/// This version is for the CLIENT — uses `pass show` to decrypt, then
+/// copies the first line to the clipboard via wl-copy (Wayland) or
+/// xclip (X11) on Linux, or pbcopy on macOS.
 /// Returns true on success.
 pub fn copy_password_client(name: &str) -> bool {
     let home = match dirs::home_dir() {
@@ -91,36 +92,86 @@ pub fn copy_password_client(name: &str) -> bool {
     let path_env = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
 
     let mut cmd = std::process::Command::new("pass");
-    cmd.args(["show", "-c", name])
+    cmd.args(["show", name])
         .env("HOME", home.to_str().unwrap_or("/"))
         .env("PATH", &path_env)
         .env("GNUPGHOME", &gnupghome)
         .stdin(std::process::Stdio::null())
-        // Do NOT suppress stderr — pinentry needs it to reach the display.
         .stderr(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::null());
+        .stdout(std::process::Stdio::piped());
 
     #[cfg(target_os = "macos")]
     {
-        // Tell pinentry to use the GUI (not curses/loopback) even without a TTY.
         cmd.env("PINENTRY_USER_DATA", "USE_CURSES:0");
-        // Unset GPG_TTY so gpg-agent doesn't try a curses/tty pinentry.
         cmd.env_remove("GPG_TTY");
     }
 
     #[cfg(target_os = "linux")]
     {
-        // On Linux the display variable is needed for GUI pinentry.
-        // Inherit DISPLAY and WAYLAND_DISPLAY from the caller if set.
         if let Ok(display) = std::env::var("DISPLAY") {
             cmd.env("DISPLAY", display);
         }
         if let Ok(wd) = std::env::var("WAYLAND_DISPLAY") {
             cmd.env("WAYLAND_DISPLAY", wd);
         }
-        // For headless / tty sessions, allow loopback pinentry.
         cmd.env("GPG_TTY", std::env::var("GPG_TTY").unwrap_or_default());
     }
 
-    matches!(cmd.status(), Ok(s) if s.success())
+    let output = match cmd.output() {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+
+    // Take only the first line (the password itself).
+    let plaintext = match std::str::from_utf8(&output.stdout) {
+        Ok(s) => s.lines().next().unwrap_or("").to_string(),
+        Err(_) => return false,
+    };
+
+    if plaintext.is_empty() {
+        return false;
+    }
+
+    // Copy to clipboard using the appropriate tool for the platform.
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Write;
+        if let Ok(mut child) = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(plaintext.as_bytes());
+            }
+            return child.wait().map(|s| s.success()).unwrap_or(false);
+        }
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Write;
+        // Try wl-copy (Wayland) first, then xclip (X11).
+        for (prog, args) in &[
+            ("wl-copy", vec![] as Vec<&str>),
+            ("xclip", vec!["-selection", "clipboard"]),
+        ] {
+            if let Ok(mut child) = std::process::Command::new(prog)
+                .args(args)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+            {
+                if let Some(stdin) = child.stdin.as_mut() {
+                    let _ = stdin.write_all(plaintext.as_bytes());
+                }
+                if child.wait().map(|s| s.success()).unwrap_or(false) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    false
 }
