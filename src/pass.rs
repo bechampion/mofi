@@ -207,64 +207,43 @@ pub fn copy_password_client(name: &str) -> bool {
 /// Matches the default `pass -c` behaviour (45 s).
 const CLIP_TIMEOUT_SECS: u64 = 45;
 
-/// Spawn a detached thread that sleeps for `CLIP_TIMEOUT_SECS`, then clears
-/// the clipboard — but only if it still contains the password we set.
+/// Spawn a **detached child process** that sleeps for `CLIP_TIMEOUT_SECS`,
+/// then clears the clipboard — but only if it still contains the password
+/// we set.  A child process is used instead of a thread because the client
+/// binary may exit (process::exit) before a thread would complete.
 #[cfg(target_os = "linux")]
 fn schedule_clipboard_clear(password: String) {
-    // Snapshot the session vars now — the thread may outlive the caller.
-    let wayland = std::env::var("WAYLAND_DISPLAY").ok();
-    let xdg_rt = std::env::var("XDG_RUNTIME_DIR").ok();
-    let display = std::env::var("DISPLAY").ok();
+    // Build a shell script that:
+    //   1. sleeps N seconds
+    //   2. reads clipboard via wl-paste
+    //   3. compares to expected value
+    //   4. clears only if it matches
+    //
+    // We pass the expected password via an environment variable so it
+    // doesn't appear in the process argv (visible in `ps`).
+    let script = format!(
+        r#"sleep {secs}
+current="$(wl-paste --no-newline 2>/dev/null)"
+if [ "$current" = "$MOFI_CLIP_EXPECT" ]; then
+  wl-copy --clear 2>/dev/null
+fi"#,
+        secs = CLIP_TIMEOUT_SECS
+    );
 
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(CLIP_TIMEOUT_SECS));
+    let mut cmd = std::process::Command::new("sh");
+    cmd.args(["-c", &script])
+        .env("MOFI_CLIP_EXPECT", &password)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
 
-        // Read the current clipboard content.
-        let current = {
-            let mut cmd = std::process::Command::new("wl-paste");
-            cmd.arg("--no-newline")
-                .stdin(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped());
-            if let Some(ref v) = wayland {
-                cmd.env("WAYLAND_DISPLAY", v);
-            }
-            if let Some(ref v) = xdg_rt {
-                cmd.env("XDG_RUNTIME_DIR", v);
-            }
-            if let Some(ref v) = display {
-                cmd.env("DISPLAY", v);
-            }
-            cmd.output()
-                .ok()
-                .and_then(|o| {
-                    if o.status.success() {
-                        Some(o.stdout)
-                    } else {
-                        None
-                    }
-                })
-                .and_then(|b| String::from_utf8(b).ok())
-        };
-
-        // Only clear if the clipboard still holds the password we set.
-        if current.as_deref() == Some(password.as_str()) {
-            let mut cmd = std::process::Command::new("wl-copy");
-            cmd.arg("--clear")
-                .stdin(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null());
-            if let Some(ref v) = wayland {
-                cmd.env("WAYLAND_DISPLAY", v);
-            }
-            if let Some(ref v) = xdg_rt {
-                cmd.env("XDG_RUNTIME_DIR", v);
-            }
-            let _ = cmd.status();
-            eprintln!(
-                "[mofi] clipboard cleared after {}s (password auto-expire)",
-                CLIP_TIMEOUT_SECS
-            );
+    // Pass through session vars.
+    for var in &["WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DISPLAY"] {
+        if let Ok(val) = std::env::var(var) {
+            cmd.env(var, val);
         }
-    });
+    }
+
+    // Fire and forget — the child is detached and survives our exit.
+    let _ = cmd.spawn();
 }
