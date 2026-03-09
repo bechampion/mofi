@@ -442,6 +442,10 @@ pub struct RofiApp {
     /// Used to avoid re-issuing the scroll every frame (which causes the
     /// center-align to drift the view on the first frame when selected=0).
     last_scroll_to: usize,
+    /// System-tray handle (Linux only) — used to update the tray icon colour
+    /// when the mode or visibility changes.
+    #[cfg(target_os = "linux")]
+    tray_handle: Option<crate::tray::TrayHandle>,
 }
 
 impl RofiApp {
@@ -474,12 +478,13 @@ impl RofiApp {
         input_result: Arc<Mutex<Option<Option<String>>>>,
         pending_input_is_themes: Arc<Mutex<bool>>,
         pending_mode: Arc<Mutex<Option<String>>>,
+        tray_handle: crate::tray::TrayHandle,
     ) -> Self {
         // On Linux with the layer-shell path, setup() in AppHandler will
         // pass a real Context. We create a temporary one just to call the
         // shared constructor; setup() will replace fonts etc. on the real ctx.
         let tmp_ctx = egui::Context::default();
-        Self::new_with_ctx(
+        let mut app = Self::new_with_ctx(
             &tmp_ctx,
             toggle,
             pending_entry,
@@ -487,7 +492,9 @@ impl RofiApp {
             input_result,
             pending_input_is_themes,
             pending_mode,
-        )
+        );
+        app.tray_handle = Some(tray_handle);
+        app
     }
 
     /// Daemonless one-shot constructor.  No IPC Arcs needed; the window opens
@@ -588,6 +595,8 @@ impl RofiApp {
             medium_font,
             frecency: FrecencyStore::load(),
             last_scroll_to: usize::MAX,
+            #[cfg(target_os = "linux")]
+            tray_handle: None,
         };
         app.refilter(true);
         app
@@ -757,7 +766,90 @@ impl RofiApp {
         #[cfg(not(target_os = "macos"))]
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1.0, 1.0)));
         self.restore_focus();
+        self.update_tray();
     }
+
+    /// Notify the system-tray icon of the current selected item's glyph and colour.
+    #[cfg(target_os = "linux")]
+    fn update_tray(&self) {
+        if let Some(handle) = &self.tray_handle {
+            let visible = self.visible;
+
+            // Determine the glyph and colour for the current selection.
+            let (glyph, fg, label) = if !visible {
+                // Idle — will be handled by set_icon(visible=false).
+                (String::new(), [0u8; 3], String::new())
+            } else if self.mode == Mode::Input || self.mode == Mode::Themes {
+                // Input / Themes list.
+                let text = self
+                    .input_filtered
+                    .get(self.selected)
+                    .and_then(|&i| self.input_items.get(i))
+                    .cloned()
+                    .unwrap_or_default();
+                if self.mode == Mode::Themes {
+                    let g = theme_glyph_for(text.trim_start_matches("* "));
+                    (
+                        g.to_string(),
+                        [
+                            self.theme.icon_sel.r(),
+                            self.theme.icon_sel.g(),
+                            self.theme.icon_sel.b(),
+                        ],
+                        format!("mofi — {}", text.trim_start_matches("* ")),
+                    )
+                } else {
+                    (
+                        "\u{F0CA}".to_string(), // nf-fa-list_ul
+                        [
+                            self.theme.icon_sel.r(),
+                            self.theme.icon_sel.g(),
+                            self.theme.icon_sel.b(),
+                        ],
+                        "mofi — Input".into(),
+                    )
+                }
+            } else {
+                // Normal results list (Apps / Clipboard / Pass).
+                // Use a mode-level glyph for the tray (not the per-item glyph).
+                let mode_glyph: Option<&str> = match self.mode {
+                    Mode::Apps => Some("\u{F0E7}"),      // nf-fa-bolt
+                    Mode::Clipboard => Some("\u{F0C6}"), // nf-fa-paperclip
+                    _ => None,                           // Pass: use per-item glyph
+                };
+                if let Some(&item_idx) = self.filtered.get(self.selected) {
+                    let item = &self.items[item_idx];
+                    let g = mode_glyph.unwrap_or_else(|| glyph_for_item(item));
+                    let c = glyph_color_for_item(item, &self.theme);
+                    let lbl = match item {
+                        LaunchItem::App(a) => format!("mofi — {}", a.name),
+                        LaunchItem::Clip(_) => "mofi — Clipboard".into(),
+                        LaunchItem::Pass(e) => format!("mofi — {}", e.name),
+                    };
+                    (g.to_string(), [c.r(), c.g(), c.b()], lbl)
+                } else {
+                    let mode_name = match self.mode {
+                        Mode::Apps => "Apps",
+                        Mode::Clipboard => "Clipboard",
+                        Mode::Pass => "Pass",
+                        _ => "mofi",
+                    };
+                    (
+                        "\u{F2D0}".to_string(), // generic app glyph
+                        [0x7E, 0x9C, 0xD8],     // crystal blue
+                        format!("mofi — {}", mode_name),
+                    )
+                }
+            };
+
+            handle.update(move |tray| {
+                tray.set_icon(&glyph, fg, &label, visible);
+            });
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn update_tray(&self) {}
 
     /// Switch into themes mode inline (no IPC — used when clicking the Themes tab directly).
     fn enter_themes_mode(&mut self) {
@@ -931,6 +1023,7 @@ impl RofiApp {
                 }
                 *self.pending_input_is_themes.lock().unwrap() = false;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                self.update_tray();
             } else if want_show && self.visible {
                 // Already visible but a new tab was requested — switch tab and
                 // reset state without hiding/showing the surface.
@@ -955,6 +1048,7 @@ impl RofiApp {
                 self.sync_apps();
                 self.refilter(true);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                self.update_tray();
             } else {
                 // Plain toggle-off (no pending tab, window was visible).
                 self.hide(ctx);
@@ -993,6 +1087,7 @@ impl RofiApp {
                 self.query.clear();
                 self.refilter_input();
                 *self.pending_input_is_themes.lock().unwrap() = false;
+                self.update_tray();
             }
         }
 
@@ -1141,6 +1236,7 @@ impl RofiApp {
                                         }
                                         self.refilter(true);
                                     }
+                                    self.update_tray();
                                 }
                             }
 
@@ -1202,6 +1298,7 @@ impl RofiApp {
                                 }
                                 self.refilter(true);
                             }
+                            self.update_tray();
                         }
 
                         if self.mode == Mode::Input || self.mode == Mode::Themes {
@@ -1245,6 +1342,10 @@ impl RofiApp {
                             } else {
                                 self.refilter(true);
                             }
+                        }
+
+                        if down || up || response.changed() {
+                            self.update_tray();
                         }
 
                         ui.add_space(6.0);

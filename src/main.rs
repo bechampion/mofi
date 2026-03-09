@@ -9,6 +9,9 @@ mod ui;
 #[cfg(target_os = "linux")]
 mod layer_window;
 
+#[cfg(target_os = "linux")]
+mod tray;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -802,6 +805,9 @@ fn run_daemon() {
 
     #[cfg(target_os = "linux")]
     {
+        // Spawn the system-tray icon (StatusNotifierItem via D-Bus).
+        let tray_handle = tray::spawn_tray();
+
         let app = ui::RofiApp::new_linux(
             toggle,
             pending_entry,
@@ -809,6 +815,7 @@ fn run_daemon() {
             input_result,
             pending_input_is_themes,
             pending_mode,
+            tray_handle,
         );
         layer_window::run(app, sigterm_fired);
         // Clean up runtime files when the event loop exits (SIGTERM or normal close).

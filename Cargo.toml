@@ -31,6 +31,8 @@ core-foundation = "0.10"
 core-graphics = { version = "0.25", features = ["highsierra"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+ksni = "0.2"
+fontdue = "0.9"
 arboard = "3"
 smithay-client-toolkit = { version = "0.18", features = ["calloop"] }
 wayland-backend = { version = "0.3", features = ["client_system", "raw-window-handle"] }
