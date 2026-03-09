@@ -438,6 +438,10 @@ pub struct RofiApp {
     medium_font: FontFamily,
     /// Frecency store — tracks launch frequency/recency for Apps and Pass items.
     frecency: FrecencyStore,
+    /// The last selected index we issued a scroll_to_rect for.
+    /// Used to avoid re-issuing the scroll every frame (which causes the
+    /// center-align to drift the view on the first frame when selected=0).
+    last_scroll_to: usize,
 }
 
 impl RofiApp {
@@ -583,6 +587,7 @@ impl RofiApp {
             config_mtime,
             medium_font,
             frecency: FrecencyStore::load(),
+            last_scroll_to: usize::MAX,
         };
         app.refilter(true);
         app
@@ -717,6 +722,7 @@ impl RofiApp {
         self.frame_count = 0;
         self.had_keyboard_focus_ever = false;
         self.toast = None;
+        self.last_scroll_to = usize::MAX;
         // If we were in themes mode and the user cancelled, restore original theme.
         if let Some(original) = self.theme_before_preview.take() {
             self.theme = original;
@@ -880,6 +886,7 @@ impl RofiApp {
                 self.query.clear();
                 self.frame_count = 0;
                 self.toast = None;
+                self.last_scroll_to = usize::MAX;
 
                 let new_items = self.pending_input.lock().unwrap().take();
                 let is_themes = *self.pending_input_is_themes.lock().unwrap();
@@ -930,6 +937,7 @@ impl RofiApp {
                 self.query.clear();
                 self.frame_count = 0;
                 self.toast = None;
+                self.last_scroll_to = usize::MAX;
                 self.input_is_themes = false;
                 let requested = self.pending_mode.lock().unwrap().take();
                 match requested.as_deref() {
@@ -1328,7 +1336,8 @@ impl RofiApp {
                                             Vec2::new(aw, ROW_HEIGHT),
                                             egui::Sense::hover(),
                                         );
-                                        if sel {
+                                        if sel && self.selected != self.last_scroll_to {
+                                            self.last_scroll_to = self.selected;
                                             ui.scroll_to_rect(rr, None);
                                         }
                                         if sel {
@@ -1415,7 +1424,8 @@ impl RofiApp {
                                             Vec2::new(aw, ROW_HEIGHT),
                                             egui::Sense::hover(),
                                         );
-                                        if sel {
+                                        if sel && self.selected != self.last_scroll_to {
+                                            self.last_scroll_to = self.selected;
                                             ui.scroll_to_rect(rr, None);
                                         }
 
