@@ -34,6 +34,7 @@ core-graphics = { version = "0.25", features = ["highsierra"] }
 ksni = "0.2"
 fontdue = "0.9"
 arboard = "3"
+image = { version = "0.25", default-features = false, features = ["png"] }
 smithay-client-toolkit = { version = "0.18", features = ["calloop"] }
 wayland-backend = { version = "0.3", features = ["client_system", "raw-window-handle"] }
 wayland-protocols = { version = "0.31", features = ["client"] }

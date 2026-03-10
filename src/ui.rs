@@ -45,7 +45,6 @@ fn restore_app_focus(app: &NSRunningApplication) {
 
 const ICON_SIZE: f32 = 30.0;
 const ROW_HEIGHT: f32 = 48.0;
-const MAX_VISIBLE_ROWS: usize = 7;
 
 /// Return the paths to look for the custom fonts, in priority order.
 /// On macOS: ~/Library/Fonts  On Linux: ~/.local/share/fonts and system paths.
@@ -126,6 +125,7 @@ mod kana {
 
 fn glyph_for_item(item: &LaunchItem) -> &'static str {
     match item {
+        LaunchItem::Clip(e) if e.is_image() => "\u{F03E}", // nf-fa-image
         LaunchItem::Clip(e) => glyph_for_clip(&e.text),
         LaunchItem::Pass(e) => glyph_for_pass(&e.name),
         LaunchItem::App(a) => glyph_for_app(&a.name),
@@ -442,12 +442,16 @@ pub struct RofiApp {
     /// Used to avoid re-issuing the scroll every frame (which causes the
     /// center-align to drift the view on the first frame when selected=0).
     last_scroll_to: usize,
-    /// When true, the next frame's scroll area should reset offset to 0.
-    scroll_reset_pending: bool,
+    /// Incremented on every show/tab-switch.  Used as part of the ScrollArea
+    /// id_source so each show gets a fresh egui ID with no stale scroll state.
+    scroll_generation: u64,
     /// System-tray handle (Linux only) — used to update the tray icon colour
     /// when the mode or visibility changes.
     #[cfg(target_os = "linux")]
     tray_handle: Option<crate::tray::TrayHandle>,
+    /// Cached textures for clipboard image thumbnails (keyed by file path).
+    #[cfg(target_os = "linux")]
+    image_textures: std::collections::HashMap<String, egui::TextureHandle>,
 }
 
 impl RofiApp {
@@ -597,9 +601,11 @@ impl RofiApp {
             medium_font,
             frecency: FrecencyStore::load(),
             last_scroll_to: usize::MAX,
-            scroll_reset_pending: false,
+            scroll_generation: 0,
             #[cfg(target_os = "linux")]
             tray_handle: None,
+            #[cfg(target_os = "linux")]
+            image_textures: std::collections::HashMap::new(),
         };
         app.refilter(true);
         app
@@ -620,6 +626,28 @@ impl RofiApp {
         let new_apps: Vec<LaunchItem> = discover_apps().into_iter().map(LaunchItem::App).collect();
         self.items.retain(|i| !matches!(i, LaunchItem::App(_)));
         self.items.extend(new_apps);
+    }
+
+    /// Load a PNG from disk as an egui texture, caching it by path.
+    #[cfg(target_os = "linux")]
+    fn load_image_texture(
+        &mut self,
+        ctx: &egui::Context,
+        path: &str,
+    ) -> Option<(egui::TextureHandle, (u32, u32))> {
+        if let Some(tex) = self.image_textures.get(path) {
+            let [w, h] = tex.size();
+            return Some((tex.clone(), (w as u32, h as u32)));
+        }
+        let data = std::fs::read(path).ok()?;
+        let img = image::load_from_memory_with_format(&data, image::ImageFormat::Png).ok()?;
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        let color_image =
+            egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+        let tex = ctx.load_texture(path, color_image, egui::TextureOptions::LINEAR);
+        self.image_textures.insert(path.to_string(), tex.clone());
+        Some((tex, (w, h)))
     }
 
     fn refilter(&mut self, reset_selection: bool) {
@@ -703,7 +731,11 @@ impl RofiApp {
                     self.should_close = true;
                 }
                 LaunchItem::Clip(e) => {
-                    paste_text(&e.text.clone());
+                    if let Some(ref img_path) = e.image_path {
+                        crate::clipboard::write_clipboard_image(img_path);
+                    } else {
+                        paste_text(&e.text.clone());
+                    }
                     // Oneshot: no text output for clipboard pastes.
                     self.oneshot_result = Some(None);
                     self.should_close = true;
@@ -732,13 +764,15 @@ impl RofiApp {
     /// clear all persisted scroll_area::State entries matching any parent.
     /// Instead we set a flag; the scroll areas check it on the next frame.
     fn request_scroll_reset(&mut self) {
-        self.scroll_reset_pending = true;
+        self.scroll_generation = self.scroll_generation.wrapping_add(1);
+        self.last_scroll_to = usize::MAX;
     }
 
     fn hide(&mut self, ctx: &egui::Context) {
         self.visible = false;
         self.should_close = false;
         self.query.clear();
+        self.selected = 0;
         self.frame_count = 0;
         self.had_keyboard_focus_ever = false;
         self.toast = None;
@@ -983,7 +1017,7 @@ impl RofiApp {
                 #[cfg(target_os = "macos")]
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 #[cfg(not(target_os = "macos"))]
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(720.0, 440.0)));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(810.0, 550.0)));
                 #[cfg(target_os = "macos")]
                 {
                     self.prev_app = capture_previous_app();
@@ -991,8 +1025,8 @@ impl RofiApp {
                 self.query.clear();
                 self.frame_count = 0;
                 self.toast = None;
-                self.last_scroll_to = usize::MAX;
-                self.scroll_reset_pending = true;
+                self.selected = 0;
+                self.request_scroll_reset();
 
                 let new_items = self.pending_input.lock().unwrap().take();
                 let is_themes = *self.pending_input_is_themes.lock().unwrap();
@@ -1044,8 +1078,8 @@ impl RofiApp {
                 self.query.clear();
                 self.frame_count = 0;
                 self.toast = None;
-                self.last_scroll_to = usize::MAX;
-                self.scroll_reset_pending = true;
+                self.selected = 0;
+                self.request_scroll_reset();
                 self.input_is_themes = false;
                 let requested = self.pending_mode.lock().unwrap().take();
                 match requested.as_deref() {
@@ -1373,7 +1407,7 @@ impl RofiApp {
                         ui.add_space(6.0);
 
                         // ── Panels ────────────────────────────────────────
-                        let max_list_height = ROW_HEIGHT * MAX_VISIBLE_ROWS as f32;
+                        let max_list_height = ui.available_height();
 
                         if self.mode == Mode::About {
                             ui.add_space(18.0);
@@ -1418,14 +1452,9 @@ impl RofiApp {
                             });
                         } else if self.mode == Mode::Input || self.mode == Mode::Themes {
                             // ── Input / theme picker list ─────────────────
-                            let mut scroll = egui::ScrollArea::vertical()
-                                .id_source("mofi_input")
+                            let scroll = egui::ScrollArea::vertical()
+                                .id_source(("mofi_input", self.scroll_generation))
                                 .max_height(max_list_height);
-                            if self.scroll_reset_pending {
-                                scroll = scroll.vertical_scroll_offset(0.0);
-                                self.scroll_reset_pending = false;
-                                self.last_scroll_to = usize::MAX;
-                            }
                             scroll.show(ui, |ui| {
                                 ui.set_min_width(ui.available_width());
                                 if self.input_filtered.is_empty() {
@@ -1472,9 +1501,10 @@ impl RofiApp {
                                             Rounding::ZERO,
                                             t.accent,
                                         );
-                                    } else if ui.rect_contains_pointer(rr) {
+                                    } else if false && ui.rect_contains_pointer(rr) {
                                         ui.painter().rect_filled(rr, Rounding::ZERO, t.row_hover);
                                     }
+
                                     let ix = rr.left() + 14.0;
                                     ui.painter().text(
                                         egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
@@ -1495,7 +1525,7 @@ impl RofiApp {
                                         egui::Id::new(("input_row", row_idx)),
                                         egui::Sense::click(),
                                     );
-                                    if click.hovered() {
+                                    if click.hovered() && false {
                                         if self.mode == Mode::Themes && self.selected != row_idx {
                                             self.selected = row_idx;
                                             self.preview_theme_at_selection();
@@ -1503,7 +1533,7 @@ impl RofiApp {
                                             self.selected = row_idx;
                                         }
                                     }
-                                    if click.double_clicked() {
+                                    if click.double_clicked() && false {
                                         self.selected = row_idx;
                                         self.execute_selected();
                                         return;
@@ -1512,14 +1542,9 @@ impl RofiApp {
                             });
                         } else {
                             // ── Normal results list ───────────────────────
-                            let mut scroll = egui::ScrollArea::vertical()
-                                .id_source("mofi_results")
+                            let scroll = egui::ScrollArea::vertical()
+                                .id_source(("mofi_results", self.scroll_generation))
                                 .max_height(max_list_height);
-                            if self.scroll_reset_pending {
-                                scroll = scroll.vertical_scroll_offset(0.0);
-                                self.scroll_reset_pending = false;
-                                self.last_scroll_to = usize::MAX;
-                            }
                             scroll.show(ui, |ui| {
                                 ui.set_min_width(ui.available_width());
                                 if self.filtered.is_empty() {
@@ -1534,7 +1559,9 @@ impl RofiApp {
                                     return;
                                 }
                                 let aw = ui.available_width();
-                                for (row_idx, &item_idx) in self.filtered.iter().enumerate() {
+                                let filtered_snapshot: Vec<(usize, usize)> =
+                                    self.filtered.iter().copied().enumerate().collect();
+                                for (row_idx, item_idx) in filtered_snapshot {
                                     let sel = row_idx == self.selected;
                                     let item = &self.items[item_idx];
                                     let glyph = glyph_for_item(item);
@@ -1542,6 +1569,14 @@ impl RofiApp {
                                     let gc = if sel { gc } else { dim_color(gc) };
                                     let display = item.display_name();
                                     let subtitle = item.subtitle();
+                                    let img_path = if let LaunchItem::Clip(ce) = item {
+                                        ce.thumbnail_path
+                                            .as_ref()
+                                            .or(ce.image_path.as_ref())
+                                            .cloned()
+                                    } else {
+                                        None
+                                    };
 
                                     let (rr, _) = ui.allocate_exact_size(
                                         Vec2::new(aw, ROW_HEIGHT),
@@ -1562,43 +1597,91 @@ impl RofiApp {
                                             Rounding::ZERO,
                                             t.accent,
                                         );
-                                    } else if ui.rect_contains_pointer(rr) {
+                                    } else if false && ui.rect_contains_pointer(rr) {
                                         ui.painter().rect_filled(rr, Rounding::ZERO, t.row_hover);
                                     }
 
                                     let ix = rr.left() + 14.0;
-                                    ui.painter().text(
-                                        egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
-                                        egui::Align2::CENTER_CENTER,
-                                        glyph,
-                                        FontId::new(ICON_SIZE * 0.75, FontFamily::Monospace),
-                                        gc,
-                                    );
 
-                                    let tx = ix + ICON_SIZE + 12.0;
-                                    if let Some(sub) = subtitle {
+                                    // Check if this is an image clipboard entry — show thumbnail.
+                                    let mut drew_thumbnail = false;
+                                    #[cfg(target_os = "linux")]
+                                    if let Some(ref img_path) = img_path {
+                                        if let Some((tex, _dims)) =
+                                            self.load_image_texture(ctx, img_path)
+                                        {
+                                            let thumb_h = ROW_HEIGHT - 8.0;
+                                            let [tw, th] = tex.size();
+                                            let aspect = tw as f32 / th.max(1) as f32;
+                                            let thumb_w = (thumb_h * aspect).min(thumb_h * 2.0);
+                                            let thumb_rect = egui::Rect::from_min_size(
+                                                egui::pos2(ix, rr.center().y - thumb_h / 2.0),
+                                                Vec2::new(thumb_w, thumb_h),
+                                            );
+                                            ui.painter().image(
+                                                tex.id(),
+                                                thumb_rect,
+                                                egui::Rect::from_min_max(
+                                                    egui::pos2(0.0, 0.0),
+                                                    egui::pos2(1.0, 1.0),
+                                                ),
+                                                Color32::WHITE,
+                                            );
+                                            let lx = ix + thumb_w + 10.0;
+                                            ui.painter().text(
+                                                egui::pos2(lx, rr.center().y - 7.0),
+                                                egui::Align2::LEFT_CENTER,
+                                                &display,
+                                                FontId::new(14.0, self.medium_font.clone()),
+                                                if sel { t.fg } else { t.fg_dim },
+                                            );
+                                            if let Some(ref sub) = subtitle {
+                                                ui.painter().text(
+                                                    egui::pos2(lx, rr.center().y + 7.0),
+                                                    egui::Align2::LEFT_CENTER,
+                                                    sub,
+                                                    FontId::new(13.0, FontFamily::Monospace),
+                                                    if sel { t.accent2 } else { t.fg_muted },
+                                                );
+                                            }
+                                            drew_thumbnail = true;
+                                        }
+                                    }
+
+                                    if !drew_thumbnail {
                                         ui.painter().text(
-                                            egui::pos2(tx, rr.center().y - 7.0),
-                                            egui::Align2::LEFT_CENTER,
-                                            &display,
-                                            FontId::new(14.0, self.medium_font.clone()),
-                                            if sel { t.fg } else { t.fg_dim },
+                                            egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
+                                            egui::Align2::CENTER_CENTER,
+                                            glyph,
+                                            FontId::new(ICON_SIZE * 0.75, FontFamily::Monospace),
+                                            gc,
                                         );
-                                        ui.painter().text(
-                                            egui::pos2(tx, rr.center().y + 7.0),
-                                            egui::Align2::LEFT_CENTER,
-                                            &sub,
-                                            FontId::new(13.0, FontFamily::Monospace),
-                                            if sel { t.accent2 } else { t.fg_muted },
-                                        );
-                                    } else {
-                                        ui.painter().text(
-                                            egui::pos2(tx, rr.center().y),
-                                            egui::Align2::LEFT_CENTER,
-                                            &display,
-                                            FontId::new(14.0, self.medium_font.clone()),
-                                            if sel { t.fg } else { t.fg_dim },
-                                        );
+
+                                        let tx = ix + ICON_SIZE + 12.0;
+                                        if let Some(sub) = subtitle {
+                                            ui.painter().text(
+                                                egui::pos2(tx, rr.center().y - 7.0),
+                                                egui::Align2::LEFT_CENTER,
+                                                &display,
+                                                FontId::new(14.0, self.medium_font.clone()),
+                                                if sel { t.fg } else { t.fg_dim },
+                                            );
+                                            ui.painter().text(
+                                                egui::pos2(tx, rr.center().y + 7.0),
+                                                egui::Align2::LEFT_CENTER,
+                                                &sub,
+                                                FontId::new(13.0, FontFamily::Monospace),
+                                                if sel { t.accent2 } else { t.fg_muted },
+                                            );
+                                        } else {
+                                            ui.painter().text(
+                                                egui::pos2(tx, rr.center().y),
+                                                egui::Align2::LEFT_CENTER,
+                                                &display,
+                                                FontId::new(14.0, self.medium_font.clone()),
+                                                if sel { t.fg } else { t.fg_dim },
+                                            );
+                                        }
                                     }
 
                                     let click = ui.interact(
@@ -1606,10 +1689,10 @@ impl RofiApp {
                                         egui::Id::new(("row", row_idx)),
                                         egui::Sense::click(),
                                     );
-                                    if click.hovered() {
+                                    if click.hovered() && false {
                                         self.selected = row_idx;
                                     }
-                                    if click.double_clicked() {
+                                    if click.double_clicked() && false {
                                         self.selected = row_idx;
                                         self.execute_selected();
                                         return;

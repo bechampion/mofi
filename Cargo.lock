@@ -2234,6 +2234,7 @@ dependencies = [
  "fuzzy-matcher",
  "glow",
  "glutin",
+ "image 0.25.9",
  "ksni",
  "libc",
  "log",
