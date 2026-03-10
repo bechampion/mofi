@@ -9,21 +9,32 @@
  ╚═╝     ╚═╝ ╚═════╝ ╚═╝     ╚═╝
 ```
 
-> A fast, keyboard-driven launcher for macOS — built with Rust + egui.  
-> App launcher · Clipboard history · Password Store integration · Theme picker · Pipe-select mode.
+> A fast, keyboard-driven launcher built with Rust + egui.
+> App launcher · Clipboard history · Password Store integration · Shell commands · Theme picker · Pipe-select mode.
+>
+> Runs on **macOS** (eframe) and **Linux/Wayland** (zwlr-layer-shell).
 
 ---
 
 ## Features
 
-- **App launcher** — fuzzy-search all installed `.app` bundles across `/Applications`, `/System/Applications`, and `~/Applications`
+- **App launcher** — fuzzy-search installed applications with frecency-based sorting
+  - macOS: scans `.app` bundles across `/Applications`, `/System/Applications`, and `~/Applications`
+  - Linux: scans `.desktop` files from XDG data dirs, launched via `gtk-launch`
+- **Shell command execution** — prefix any query with `!` in the Apps tab to run it as a shell command (e.g. `!killall waybar`, `!htop`). The command runs detached via `sh -c` with `setsid`
 - **Clipboard history** — persistent, searchable history of everything you've copied (up to 100 entries)
-- **Pass integration** — browse and copy passwords from your `~/.password-store` via [`pass`](https://www.passwordstore.org/) and `pinentry-mac`
+  - macOS: polls the system pasteboard
+  - Linux: polls `wl-paste`, pastes back via `wl-copy`. Supports **image clipboard** with thumbnail previews (80px-tall thumbnails generated at capture time)
+  - Image entries are deduplicated by comparing actual PNG bytes
+- **Pass integration** — browse and copy passwords from your `~/.password-store` via [`pass`](https://www.passwordstore.org/). Copied passwords are **auto-cleared from the clipboard after 45 seconds**
 - **Theme picker** — 10 built-in themes with live preview; switch instantly from the Themes tab or `mofi --themes`
 - **Pipe-select mode** — `mofi --input` reads lines from stdin, presents them as a fuzzy-searchable list, and prints the selected line to stdout (exit 0) or exits 1 on cancel
-- **Maple Mono NF** — Nerd Font glyphs for every icon, no PNG loading
-- **Daemon architecture** — persistent background process toggled via `skhd`; no Dock icon, no Cmd-Tab entry (`NSApplicationActivationPolicyAccessory`). Hotkeys open directly on Apps (`Cmd+Space`), Pass (`Cmd+Shift+P`), or Clipboard (`Cmd+Shift+Y`)
-- **Focus restore** — returns focus to the previously active app on dismiss
+- **Maple Mono NF** — Nerd Font glyphs for every icon, no image loading
+- **Frecency sorting** — frequently and recently used items rise to the top (stored in `~/.local/share/mofi/frecency.json`)
+- **Daemon architecture** — persistent background process for instant window open times
+  - macOS: managed via `launchd`, toggled via `skhd`; no Dock icon (`NSApplicationActivationPolicyAccessory`)
+  - Linux: managed via systemd user service, renders via `zwlr_layer_shell_v1` (Wayland layer shell). Single-instance guard via `flock`. System tray icon via `ksni` (StatusNotifierItem) with Nerd Font glyphs
+- **Focus restore** (macOS) — returns focus to the previously active app on dismiss
 
 ---
 
@@ -38,6 +49,8 @@
 
 ## Requirements
 
+### macOS
+
 | Tool | Purpose |
 |------|---------|
 | [Rust](https://rustup.rs) | Build toolchain |
@@ -50,6 +63,27 @@
 brew install skhd pass pinentry-mac
 ```
 
+### Linux (Wayland)
+
+| Tool | Purpose |
+|------|---------|
+| [Rust](https://rustup.rs) | Build toolchain |
+| A Wayland compositor with `zwlr_layer_shell_v1` support | e.g. Hyprland, Sway |
+| `wl-clipboard` (`wl-copy`, `wl-paste`) | Clipboard read/write |
+| `gtk-launch` | Launching `.desktop` applications |
+| [pass](https://www.passwordstore.org/) | Password store (optional) |
+| Maple Mono NF | Font — install system-wide or in `~/.local/share/fonts/` |
+
+```bash
+# Arch
+pacman -S wl-clipboard pass
+
+# Debian/Ubuntu
+apt install wl-clipboard pass
+```
+
+**Environment variable:** set `MOFI_SCALE` to match your display scale factor (e.g. `MOFI_SCALE=1.5` for 150% HiDPI).
+
 ---
 
 ## Build
@@ -61,15 +95,15 @@ cargo build --release
 # binary at: target/release/mofi
 ```
 
-Pre-built binaries for macOS (Apple Silicon and Intel) are available on the [Releases](https://github.com/bechampion/mofi/releases) page.
+The same codebase compiles on both macOS and Linux — platform-specific code is gated with `#[cfg(target_os = "...")]`.
 
 ---
 
 ## Setup
 
-### Quick install
+### macOS
 
-After building, run:
+#### Quick install
 
 ```bash
 cargo build --release
@@ -78,23 +112,19 @@ cargo build --release
 
 `--install` does everything automatically:
 
-1. Writes `~/Library/LaunchAgents/com.user.mofi.plist` pointing at the current binary and loads it via `launchctl` — the daemon starts immediately and survives reboots.
-2. Appends three hotkeys to `~/.skhdrc` (only if a `# mofi` block isn't already present) and reloads `skhd`:
-   - `Cmd+Space` → `--client` (Apps tab)
-   - `Cmd+Shift+P` → `--pass` (Pass tab)
-   - `Cmd+Shift+Y` → `--clip` (Clipboard tab)
-3. Creates `~/.config/mofi/config.toml` with `theme = "kanagawa"` if it doesn't exist yet.
-
-Re-running `--install` after rebuilding the binary is safe — it unloads the old agent before overwriting the plist.
-
-### Manual setup
+1. Writes `~/Library/LaunchAgents/com.user.mofi.plist` and loads it via `launchctl`
+2. Appends hotkeys to `~/.skhdrc` and reloads `skhd`:
+   - `Cmd+Space` — Apps tab
+   - `Cmd+Shift+P` — Pass tab
+   - `Cmd+Shift+Y` — Clipboard tab
+3. Creates `~/.config/mofi/config.toml` with `theme = "kanagawa"` if it doesn't exist
 
 <details>
-<summary>Expand for manual instructions</summary>
+<summary>Manual macOS setup</summary>
 
 #### launchd plist
 
-Save the following to `~/Library/LaunchAgents/com.user.mofi.plist` (replace the path):
+Save to `~/Library/LaunchAgents/com.user.mofi.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -124,7 +154,7 @@ Save the following to `~/Library/LaunchAgents/com.user.mofi.plist` (replace the 
 launchctl load ~/Library/LaunchAgents/com.user.mofi.plist
 ```
 
-#### skhd hotkey
+#### skhd hotkeys
 
 Add to `~/.skhdrc`:
 
@@ -139,23 +169,47 @@ cmd + shift - y   : /path/to/mofi/target/release/mofi --clip
 skhd --reload
 ```
 
-#### pass + pinentry-mac (optional)
-
-```bash
-brew install pass pinentry-mac
-```
-
-Add to `~/.gnupg/gpg-agent.conf`:
-
-```
-pinentry-program /opt/homebrew/bin/pinentry-mac
-```
-
-```bash
-gpgconf --kill gpg-agent
-```
-
 </details>
+
+### Linux (Wayland)
+
+#### systemd user service
+
+Create `~/.config/systemd/user/mofi.service`:
+
+```ini
+[Unit]
+Description=mofi launcher daemon
+After=graphical-session.target
+
+[Service]
+ExecStart=/path/to/mofi/target/release/mofi --daemon
+Environment=MOFI_SCALE=1.5
+Restart=on-failure
+KillMode=process
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now mofi.service
+```
+
+`KillMode=process` ensures launched applications survive when the daemon restarts.
+
+#### Hyprland keybindings
+
+Add to `~/.config/hypr/hyprland.conf`:
+
+```
+bind = SUPER, SPACE, exec, /path/to/mofi --client
+bind = SUPER_SHIFT, P, exec, /path/to/mofi --pass
+bind = SUPER_SHIFT, Y, exec, /path/to/mofi --clip
+```
+
+For Sway, add equivalent `bindsym` entries to `~/.config/sway/config`.
 
 ---
 
@@ -163,14 +217,21 @@ gpgconf --kill gpg-agent
 
 | Key | Action |
 |-----|--------|
-| `Cmd+Space` | Open mofi on Apps tab (via skhd) |
-| `Cmd+Shift+P` | Open mofi on Pass tab (via skhd) |
-| `Cmd+Shift+Y` | Open mofi on Clipboard tab (via skhd) |
+| `Cmd+Space` / `Super+Space` | Open mofi on Apps tab |
+| `Cmd+Shift+P` / `Super+Shift+P` | Open mofi on Pass tab |
+| `Cmd+Shift+Y` / `Super+Shift+Y` | Open mofi on Clipboard tab |
 | `Escape` | Close / dismiss |
 | `Tab` | Cycle tabs: Apps → Clipboard → Pass → Themes → About |
 | `↓` / `Ctrl+J` | Move selection down |
 | `↑` / `Ctrl+K` | Move selection up |
-| `Enter` / double-click | Launch / copy / confirm selected item |
+| `Enter` | Launch / copy / confirm selected item |
+
+### Apps tab special syntax
+
+| Prefix | Behaviour |
+|--------|-----------|
+| *(none)* | Fuzzy-search installed applications |
+| `!` | Shell command — e.g. `!killall waybar` shows a "Run: killall waybar" row; Enter executes it |
 
 ---
 
@@ -178,7 +239,7 @@ gpgconf --kill gpg-agent
 
 10 built-in themes: `kanagawa` (default), `gruvbox`, `nord`, `tokyonight`, `dracula`, `solarized`, `monokai`, `catppuccin`, `onedark`, `rosepine`.
 
-**From the UI** — click the `󰔿  Themes` tab or Tab-cycle to it. Navigate with `↑`/`↓` or `Ctrl+K`/`Ctrl+J` for a live preview. Press `Enter` to confirm, `Escape` to cancel and restore the previous theme.
+**From the UI** — navigate to the Themes tab. Use `↑`/`↓` or `Ctrl+K`/`Ctrl+J` for a live preview. Press `Enter` to confirm, `Escape` to cancel and restore the previous theme.
 
 **From the command line:**
 
@@ -186,14 +247,11 @@ gpgconf --kill gpg-agent
 mofi --themes
 ```
 
-The active theme name is saved to `~/.config/mofi/config.toml`:
+The active theme is saved to `~/.config/mofi/config.toml`:
 
 ```toml
 theme = "kanagawa"
 ```
-
-![Themes picker](assets/themes-1.png)
-![Themes live preview](assets/themes-2.png)
 
 ---
 
@@ -216,51 +274,33 @@ Exit codes: `0` = item selected (selected text on stdout), `1` = cancelled.
 ## Architecture
 
 ```
-mofi --daemon     persistent egui window (hidden by default), started via launchd
-mofi --client     toggle show/hide on Apps tab — sends socket message then SIGUSR1
-mofi --pass       show mofi landing on the Pass tab (Cmd+Shift+P)
-mofi --clip       show mofi landing on the Clipboard tab (Cmd+Shift+Y)
-mofi --input      pipe-select: reads stdin, sends items to daemon, prints selection to stdout
-mofi --themes     theme picker: presents built-in themes with live preview, writes chosen theme to config
-mofi --install    install plist, load launchd agent, append skhd hotkeys, create config
-mofi --restart    unload and reload the launchd agent, then print the new daemon PID
+mofi --daemon     persistent egui window (hidden by default)
+                    macOS: started via launchd
+                    Linux: started via systemd, renders with zwlr_layer_shell_v1
+
+mofi --client     toggle show/hide on Apps tab
+mofi --pass       show mofi on the Pass tab
+mofi --clip       show mofi on the Clipboard tab
+mofi --input      pipe-select: reads stdin, sends items to daemon, prints selection
+mofi --themes     theme picker with live preview
+mofi --install    (macOS only) install plist, skhd hotkeys, create config
+mofi --restart    (macOS only) reload the launchd agent
 ```
 
-### `--restart`
+Communication uses a Unix socket at `/tmp/mofi.sock`. The daemon PID is written to `/tmp/mofi.pid`. A lock file at `/tmp/mofi.lock` (flock-based) ensures only one daemon instance runs.
 
-Restarts the running daemon without touching the launchd plist or any config files.
-Use it whenever you rebuild the binary and want the new version to take effect immediately:
-
-```sh
-cargo build --release
-~/rofi-mac/target/release/mofi --restart
-# → [restart] unloading... ok
-# → [restart] loading...   ok
-# → [restart] daemon running (PID 12345)
-```
-
-Internally it runs:
-
-```sh
-launchctl unload ~/Library/LaunchAgents/com.user.mofi.plist
-launchctl load  ~/Library/LaunchAgents/com.user.mofi.plist
-```
-
-and then reads `/tmp/mofi.pid` to confirm the new PID.
-
-Communication uses a Unix socket at `/tmp/mofi.sock`. The daemon PID is written to `/tmp/mofi.pid`.
-
-When a Pass entry is selected, the daemon sends the entry name back to the `--client` process, which runs `pass show <name>` (so `pinentry-mac` can prompt for the GPG passphrase with a proper GUI dialog) and pipes the first line to `pbcopy`.
+On Linux, the daemon also exposes a system tray icon via StatusNotifierItem (ksni) with Nerd Font glyphs for quick tab access.
 
 ### IPC protocol
 
 | Message | Direction | Description |
 |---------|-----------|-------------|
-| `ready\n` | client → daemon | Toggle show/hide on Apps tab; wait for a pass-entry name in response |
-| `show:pass\n` | client → daemon | Show window and switch to Pass tab (`--pass`) |
-| `show:clip\n` | client → daemon | Show window and switch to Clipboard tab (`--clip`) |
+| `ready\n` | client → daemon | Toggle show/hide on Apps tab |
+| `show:pass\n` | client → daemon | Show window on Pass tab |
+| `show:clip\n` | client → daemon | Show window on Clipboard tab |
+| `tab:<name>\n` | client → daemon | Switch to a specific tab (Linux) |
 | `input\t<l1>\t<l2>\t...\n` | client → daemon | Pipe-select mode |
-| `themes\t<l1>\t<l2>\t...\n` | client → daemon | Theme-picker mode (live preview enabled) |
+| `themes\t<l1>\t<l2>\t...\n` | client → daemon | Theme-picker mode |
 | `ok:<selected>\n` | daemon → client | Item was selected |
 | `cancel\n` | daemon → client | User dismissed without selecting |
 
@@ -268,27 +308,26 @@ When a Pass entry is selected, the daemon sends the entry name back to the `--cl
 
 ## Colour palette
 
-The default `kanagawa` theme uses strictly named palette tokens from [Kanagawa](https://github.com/rebelot/kanagawa.nvim). All other themes use the same `Theme` struct — background, foreground, accent, border, separator, and row-highlight colours are all configurable per theme in `src/config.rs`.
+The default `kanagawa` theme uses named palette tokens from [Kanagawa](https://github.com/rebelot/kanagawa.nvim). All themes use the same `Theme` struct — background, foreground, accent, border, separator, and row-highlight colours are all configurable per theme in `src/config.rs`.
 
 ---
 
-## Window switcher (`mofisw`)
+## Window switcher (`mofisw`) — macOS only
 
-`mofisw` is a separate binary in the same project — an Option+Tab window switcher that replaces the default macOS switcher with a keyboard-driven overlay showing all open windows across every app.
+`mofisw` is a separate binary — an Option+Tab window switcher that replaces the default macOS switcher with a keyboard-driven overlay showing all open windows across every app.
 
 ### Usage
 
 ```
-Hold ⌥ (Option) + press Tab   → show switcher / advance to next window
-Keep pressing Tab while ⌥ held → cycle through all open windows
-Release ⌥                      → activate selected window and dismiss
+Hold Option + press Tab   → show switcher / advance to next window
+Keep pressing Tab          → cycle through all open windows
+Release Option             → activate selected window and dismiss
 ```
 
 ### Setup
 
 ```bash
 cargo build --release
-# Launch as a login item, or load via launchd:
 cp target/release/mofisw /usr/local/bin/mofisw
 ```
 
@@ -313,25 +352,7 @@ Example launchd plist (`~/Library/LaunchAgents/com.user.mofisw.plist`):
 </plist>
 ```
 
-```bash
-launchctl load ~/Library/LaunchAgents/com.user.mofisw.plist
-```
-
-> **Accessibility permission required** — macOS will prompt on first launch. Grant access in System Settings → Privacy & Security → Accessibility.
-
-### How it works
-
-- Uses `CGWindowListCopyWindowInfo` to enumerate all on-screen windows (layer 0 only — no menu bar, Dock, or desktop elements)
-- Each window is shown as a card: large Nerd Font glyph + app name + window title (dimmed)
-- The window resizes dynamically to fit however many windows are open (max 1200 px wide)
-- Built with `rdev` for global key listening, `eframe`/`egui` for rendering
-- Runs as `NSApplicationActivationPolicyAccessory` — no Dock icon, no Cmd-Tab entry
-
-### Source
-
-```
-src/switcher/main.rs   ← entire mofisw binary (~500 lines)
-```
+> **Accessibility permission required** — macOS will prompt on first launch.
 
 ---
 
