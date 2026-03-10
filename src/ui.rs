@@ -650,6 +650,29 @@ impl RofiApp {
         Some((tex, (w, h)))
     }
 
+    /// Pre-load all clipboard thumbnail textures so switching to the Clipboard
+    /// tab doesn't stutter on the first frame.
+    #[cfg(target_os = "linux")]
+    fn preload_clipboard_textures(&mut self, ctx: &egui::Context) {
+        let paths: Vec<String> = self
+            .items
+            .iter()
+            .filter_map(|item| {
+                if let LaunchItem::Clip(ce) = item {
+                    ce.thumbnail_path
+                        .as_ref()
+                        .or(ce.image_path.as_ref())
+                        .cloned()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for path in paths {
+            let _ = self.load_image_texture(ctx, &path);
+        }
+    }
+
     fn refilter(&mut self, reset_selection: bool) {
         let mode_items: Vec<(usize, &LaunchItem)> = self
             .items
@@ -1061,6 +1084,8 @@ impl RofiApp {
                         Some("clip") => {
                             self.mode = Mode::Clipboard;
                             self.sync_clipboard();
+                            #[cfg(target_os = "linux")]
+                            self.preload_clipboard_textures(ctx);
                         }
                         _ => {
                             self.mode = Mode::Apps;
@@ -1089,6 +1114,8 @@ impl RofiApp {
                     Some("clip") => {
                         self.mode = Mode::Clipboard;
                         self.sync_clipboard();
+                        #[cfg(target_os = "linux")]
+                        self.preload_clipboard_textures(ctx);
                     }
                     _ => {
                         self.mode = Mode::Apps;
@@ -1200,9 +1227,33 @@ impl RofiApp {
             return;
         }
 
-        // Consume Ctrl+J / Ctrl+K here — before TextEdit steals them.
-        let ctrl_j = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::J));
-        let ctrl_k = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::K));
+        // Consume ALL Ctrl+J / Ctrl+K events here — before TextEdit steals
+        // them.  We count repeats so holding the key moves multiple rows.
+        let mut ctrl_j_count: usize = 0;
+        let mut ctrl_k_count: usize = 0;
+        ctx.input_mut(|i| {
+            i.events.retain(|ev| {
+                if let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = ev
+                {
+                    if modifiers.ctrl {
+                        if *key == Key::J {
+                            ctrl_j_count += 1;
+                            return false; // consume
+                        }
+                        if *key == Key::K {
+                            ctrl_k_count += 1;
+                            return false; // consume
+                        }
+                    }
+                }
+                true // keep
+            });
+        });
 
         if self.mode == Mode::Clipboard {
             self.sync_clipboard();
@@ -1282,6 +1333,8 @@ impl RofiApp {
                                         self.query.clear();
                                         if mode == Mode::Clipboard {
                                             self.sync_clipboard();
+                                            #[cfg(target_os = "linux")]
+                                            self.preload_clipboard_textures(ctx);
                                         }
                                         self.refilter(true);
                                     }
@@ -1323,8 +1376,12 @@ impl RofiApp {
                         );
                         response.request_focus();
 
-                        let down = ctx.input(|i| i.key_pressed(Key::ArrowDown)) || ctrl_j;
-                        let up = ctx.input(|i| i.key_pressed(Key::ArrowUp)) || ctrl_k;
+                        let arrow_down = ctx.input(|i| i.key_pressed(Key::ArrowDown));
+                        let arrow_up = ctx.input(|i| i.key_pressed(Key::ArrowUp));
+                        let down_count = ctrl_j_count.max(if arrow_down { 1 } else { 0 });
+                        let up_count = ctrl_k_count.max(if arrow_up { 1 } else { 0 });
+                        let down = down_count > 0;
+                        let up = up_count > 0;
                         let tab = ctx.input(|i| i.key_pressed(Key::Tab));
                         let enter = ctx.input(|i| i.key_pressed(Key::Enter));
 
@@ -1344,6 +1401,8 @@ impl RofiApp {
                                 self.query.clear();
                                 if self.mode == Mode::Clipboard {
                                     self.sync_clipboard();
+                                    #[cfg(target_os = "linux")]
+                                    self.preload_clipboard_textures(ctx);
                                 }
                                 self.refilter(true);
                             }
@@ -1353,15 +1412,14 @@ impl RofiApp {
                         if self.mode == Mode::Input || self.mode == Mode::Themes {
                             let len = self.input_filtered.len();
                             if down && len > 0 {
-                                if self.selected + 1 < len {
-                                    self.selected += 1;
-                                }
+                                let new_sel = (self.selected + down_count).min(len - 1);
+                                self.selected = new_sel;
                                 if self.mode == Mode::Themes {
                                     self.preview_theme_at_selection();
                                 }
                             }
                             if up && len > 0 {
-                                self.selected = self.selected.saturating_sub(1);
+                                self.selected = self.selected.saturating_sub(up_count);
                                 if self.mode == Mode::Themes {
                                     self.preview_theme_at_selection();
                                 }
@@ -1369,12 +1427,11 @@ impl RofiApp {
                         } else {
                             let len = self.filtered.len();
                             if down && len > 0 {
-                                if self.selected + 1 < len {
-                                    self.selected += 1;
-                                }
+                                let new_sel = (self.selected + down_count).min(len - 1);
+                                self.selected = new_sel;
                             }
                             if up && len > 0 {
-                                self.selected = self.selected.saturating_sub(1);
+                                self.selected = self.selected.saturating_sub(up_count);
                             }
                         }
 

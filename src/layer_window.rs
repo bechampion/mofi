@@ -236,6 +236,7 @@ fn run_inner<A: AppHandler>(mut app: A, sigterm: Arc<AtomicBool>, start_mapped: 
         egui_input: egui::RawInput::default(),
         pointer_pos: None,
         modifiers: egui::Modifiers::default(),
+        repeat_key: None,
     };
 
     // Do a blocking roundtrip so that outputs are enumerated before we read
@@ -341,6 +342,9 @@ fn run_inner<A: AppHandler>(mut app: A, sigterm: Arc<AtomicBool>, start_mapped: 
             }
         }
 
+        // Generate synthetic key-repeat events for held keys.
+        state.pump_key_repeat();
+
         // Always run app logic (processes toggle / viewport commands) so the
         // surface can be mapped even when currently unmapped.  Rendering is
         // skipped inside paint_frame when !mapped.
@@ -405,7 +409,27 @@ struct LayerState {
     egui_input: egui::RawInput,
     pointer_pos: Option<egui::Pos2>,
     modifiers: egui::Modifiers,
+
+    /// Key-repeat state.  We implement repeat ourselves because SCTK's
+    /// calloop-based repeat isn't used (we drive our own poll loop).
+    repeat_key: Option<RepeatState>,
 }
+
+/// Tracks a held key for software key-repeat.
+struct RepeatState {
+    keysym: Keysym,
+    /// When the key was first pressed.
+    pressed_at: std::time::Instant,
+    /// When we last emitted a repeat event.
+    last_repeat: std::time::Instant,
+    /// UTF-8 text associated with the key (for Text events).
+    utf8: Option<String>,
+}
+
+/// Delay before first repeat fires (ms).
+const REPEAT_DELAY_MS: u64 = 300;
+/// Interval between subsequent repeats (ms).
+const REPEAT_INTERVAL_MS: u64 = 30;
 
 impl LayerState {
     /// Physical pixel dimensions of the window (logical * scale).
@@ -414,6 +438,31 @@ impl LayerState {
     }
     fn phys_h(&self) -> u32 {
         (self.height as f32 * self.scale).round() as u32
+    }
+
+    /// Generate synthetic key-repeat events for a held key.
+    fn pump_key_repeat(&mut self) {
+        let repeat = match self.repeat_key.as_mut() {
+            Some(r) => r,
+            None => return,
+        };
+        let now = std::time::Instant::now();
+        let held = now.duration_since(repeat.pressed_at);
+        if held.as_millis() < REPEAT_DELAY_MS as u128 {
+            return;
+        }
+        let since_last = now.duration_since(repeat.last_repeat);
+        if since_last.as_millis() < REPEAT_INTERVAL_MS as u128 {
+            return;
+        }
+        // Emit a synthetic press event.
+        if let Some(ev) = keysym_to_egui(repeat.keysym, true, self.modifiers) {
+            self.egui_input.events.push(ev);
+        }
+        if let Some(ref utf8) = repeat.utf8 {
+            self.egui_input.events.push(egui::Event::Text(utf8.clone()));
+        }
+        repeat.last_repeat = now;
     }
 
     fn paint_frame<A: AppHandler>(&mut self, app: &mut A) {
@@ -578,7 +627,8 @@ impl LayerState {
         eprintln!("[mofi] unmap_surface");
         self.mapped = false;
         self.mapping_pending = false;
-        // Disable the viewport so the compositor doesn't try to scale a null buffer.
+        self.repeat_key = None; // Stop any in-progress key repeat.
+                                // Disable the viewport so the compositor doesn't try to scale a null buffer.
         self.viewport.set_destination(-1, -1);
         // Attach null buffer + commit → compositor unmaps the surface.
         self.wl_surface.attach(None, 0, 0);
@@ -749,6 +799,7 @@ impl KeyboardHandler for LayerState {
     ) {
         if self.layer.wl_surface() == surface {
             self.keyboard_focus = false;
+            self.repeat_key = None;
             self.egui_input
                 .events
                 .push(egui::Event::WindowFocused(false));
@@ -767,11 +818,20 @@ impl KeyboardHandler for LayerState {
             self.egui_input.events.push(ev);
         }
         // Text input — skip control characters (e.g. \x0b from Ctrl+K)
-        if let Some(utf8) = event.utf8 {
-            if !utf8.is_empty() && utf8.chars().all(|c| c >= ' ' || c == '\t') {
-                self.egui_input.events.push(egui::Event::Text(utf8));
-            }
+        let utf8 = event
+            .utf8
+            .filter(|s| !s.is_empty() && s.chars().all(|c| c >= ' ' || c == '\t'));
+        if let Some(ref utf8) = utf8 {
+            self.egui_input.events.push(egui::Event::Text(utf8.clone()));
         }
+        // Start key repeat tracking.
+        let now = std::time::Instant::now();
+        self.repeat_key = Some(RepeatState {
+            keysym: event.keysym,
+            pressed_at: now,
+            last_repeat: now,
+            utf8,
+        });
     }
 
     fn release_key(
@@ -784,6 +844,12 @@ impl KeyboardHandler for LayerState {
     ) {
         if let Some(ev) = keysym_to_egui(event.keysym, false, self.modifiers) {
             self.egui_input.events.push(ev);
+        }
+        // Stop repeat if this key was being repeated.
+        if let Some(ref rk) = self.repeat_key {
+            if rk.keysym == event.keysym {
+                self.repeat_key = None;
+            }
         }
     }
 
