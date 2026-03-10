@@ -1,6 +1,7 @@
 mod apps;
 mod clipboard;
 mod config;
+mod frecency;
 mod launcher;
 mod pass;
 mod ui;

@@ -14,6 +14,7 @@ use objc2_app_kit::{
 use crate::apps::discover_apps;
 use crate::clipboard::{load_history, start_poller, ClipboardEntry, ClipboardHistory};
 use crate::config::{config_path, theme_by_name, Config, Theme};
+use crate::frecency::FrecencyStore;
 use crate::launcher::{launch_app, paste_text, LaunchItem, Launcher};
 use crate::pass::discover_pass_entries;
 
@@ -265,6 +266,7 @@ pub struct RofiApp {
     filtered: Vec<usize>,
     selected: usize,
     launcher: Launcher,
+    frecency: FrecencyStore,
     mode: Mode,
     should_close: bool,
     clip_history: ClipboardHistory,
@@ -330,6 +332,7 @@ impl RofiApp {
             filtered,
             selected: 0,
             launcher: Launcher::new(),
+            frecency: FrecencyStore::load(),
             mode: Mode::Apps,
             should_close: false,
             clip_history: history,
@@ -379,7 +382,7 @@ impl RofiApp {
             .collect();
 
         let search_items: Vec<LaunchItem> = mode_items.iter().map(|(_, i)| (*i).clone()).collect();
-        let matched: Vec<usize> = self.launcher.search(&self.query, &search_items);
+        let matched: Vec<usize> = self.launcher.search(&self.query, &search_items, &self.frecency);
         self.filtered = matched.into_iter().map(|li| mode_items[li].0).collect();
 
         if reset_selection {
@@ -418,7 +421,9 @@ impl RofiApp {
         if let Some(&idx) = self.filtered.get(self.selected) {
             match &self.items[idx] {
                 LaunchItem::App(app) => {
+                    let name = app.name.clone();
                     launch_app(&app.path.clone());
+                    self.frecency.record(&name);
                     crate::flash_icon('\u{f0e7}'); // fa-bolt
                     self.should_close = true;
                 }
@@ -428,7 +433,9 @@ impl RofiApp {
                     self.should_close = true;
                 }
                 LaunchItem::Pass(e)  => {
-                    *self.pending_entry.lock().unwrap() = Some(Some(e.name.clone()));
+                    let name = e.name.clone();
+                    self.frecency.record(&name);
+                    *self.pending_entry.lock().unwrap() = Some(Some(name));
                     crate::flash_icon('\u{f023}'); // fa-lock
                     self.should_close = true;
                 }
