@@ -219,3 +219,22 @@ fn launch_app_linux(desktop_path: &str) {
 pub fn paste_text(text: &str) {
     crate::clipboard::write_clipboard(text);
 }
+
+/// Run an arbitrary shell command detached from the mofi process.
+#[cfg(target_os = "linux")]
+pub fn launch_shell_command(cmd: &str) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            })
+            .spawn();
+    }
+}

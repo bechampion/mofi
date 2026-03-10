@@ -18,6 +18,8 @@ use crate::apps::discover_apps;
 use crate::clipboard::{load_history, start_poller, ClipboardEntry, ClipboardHistory};
 use crate::config::{config_path, theme_by_name, Config, Theme};
 use crate::frecency::FrecencyStore;
+#[cfg(target_os = "linux")]
+use crate::launcher::launch_shell_command;
 use crate::launcher::{launch_app, paste_text, LaunchItem, Launcher};
 use crate::pass::discover_pass_entries;
 
@@ -772,6 +774,14 @@ impl RofiApp {
                     self.should_close = true;
                 }
             }
+        } else if self.mode == Mode::Apps && self.query.trim().starts_with('!') {
+            // Selected the synthetic "Run in shell" row — execute query as
+            // a shell command (strip the leading '!').
+            let cmd = self.query.trim().trim_start_matches('!').trim();
+            #[cfg(target_os = "linux")]
+            launch_shell_command(cmd);
+            self.oneshot_result = Some(None);
+            self.should_close = true;
         }
     }
 
@@ -1425,7 +1435,9 @@ impl RofiApp {
                                 }
                             }
                         } else {
-                            let len = self.filtered.len();
+                            let show_shell_row =
+                                self.mode == Mode::Apps && self.query.trim().starts_with('!');
+                            let len = self.filtered.len() + if show_shell_row { 1 } else { 0 };
                             if down && len > 0 {
                                 let new_sel = (self.selected + down_count).min(len - 1);
                                 self.selected = new_sel;
@@ -1604,7 +1616,14 @@ impl RofiApp {
                                 .max_height(max_list_height);
                             scroll.show(ui, |ui| {
                                 ui.set_min_width(ui.available_width());
-                                if self.filtered.is_empty() {
+                                // In Apps mode with a non-empty query, we show
+                                // an extra "Run: <query>" row at the end so the
+                                // user can execute arbitrary shell commands.
+                                let show_shell_row =
+                                    self.mode == Mode::Apps && self.query.trim().starts_with('!');
+                                let total_rows =
+                                    self.filtered.len() + if show_shell_row { 1 } else { 0 };
+                                if total_rows == 0 {
                                     ui.add_space(20.0);
                                     ui.centered_and_justified(|ui| {
                                         ui.label(
@@ -1754,6 +1773,52 @@ impl RofiApp {
                                         self.execute_selected();
                                         return;
                                     }
+                                }
+
+                                // ── Synthetic "Run in shell" row ──────────
+                                if show_shell_row {
+                                    let shell_row_idx = self.filtered.len();
+                                    let sel = self.selected == shell_row_idx;
+                                    let shell_cmd =
+                                        self.query.trim().trim_start_matches('!').trim();
+                                    let shell_label = format!("Run: {}", shell_cmd);
+                                    let shell_glyph = "\u{F489}"; // nf-md-console_line
+
+                                    let (rr, _) = ui.allocate_exact_size(
+                                        Vec2::new(aw, ROW_HEIGHT),
+                                        egui::Sense::hover(),
+                                    );
+                                    if sel && self.selected != self.last_scroll_to {
+                                        self.last_scroll_to = self.selected;
+                                        ui.scroll_to_rect(rr, None);
+                                    }
+                                    if sel {
+                                        ui.painter().rect_filled(rr, Rounding::ZERO, t.row_sel);
+                                        ui.painter().rect_filled(
+                                            egui::Rect::from_min_size(
+                                                egui::pos2(rr.left(), rr.top() + 4.0),
+                                                Vec2::new(3.0, rr.height() - 8.0),
+                                            ),
+                                            Rounding::ZERO,
+                                            t.accent,
+                                        );
+                                    }
+                                    let ix = rr.left() + 14.0;
+                                    ui.painter().text(
+                                        egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
+                                        egui::Align2::CENTER_CENTER,
+                                        shell_glyph,
+                                        FontId::new(ICON_SIZE * 0.75, FontFamily::Monospace),
+                                        if sel { t.accent } else { dim_color(t.accent) },
+                                    );
+                                    let tx = ix + ICON_SIZE + 12.0;
+                                    ui.painter().text(
+                                        egui::pos2(tx, rr.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        &shell_label,
+                                        FontId::new(14.0, self.medium_font.clone()),
+                                        if sel { t.fg } else { t.fg_dim },
+                                    );
                                 }
                             });
                         }
