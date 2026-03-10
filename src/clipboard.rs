@@ -68,6 +68,12 @@ fn save_history(history: &[ClipboardEntry]) {
 
 /// Push a new entry into history (deduplicates, trims to MAX_HISTORY, saves).
 fn push_entry(history: &mut Vec<ClipboardEntry>, text: String) {
+    // Strip leading/trailing blank lines and whitespace.
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return;
+    }
+
     // Remove any existing duplicate
     history.retain(|e| e.text != text);
 

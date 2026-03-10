@@ -133,6 +133,7 @@ pub fn launch_app(path: &str) {
 
 #[cfg(target_os = "linux")]
 fn launch_app_linux(desktop_path: &str) {
+    use std::os::unix::process::CommandExt;
     use std::path::Path;
 
     // gtk-launch accepts either the basename of the .desktop file (without
@@ -142,9 +143,18 @@ fn launch_app_linux(desktop_path: &str) {
     let basename = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
     if !basename.is_empty() {
-        let status = std::process::Command::new("gtk-launch")
-            .arg(basename)
-            .spawn();
+        let status = unsafe {
+            std::process::Command::new("gtk-launch")
+                .arg(basename)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                })
+                .spawn()
+        };
         if status.is_ok() {
             return;
         }
@@ -187,7 +197,18 @@ fn launch_app_linux(desktop_path: &str) {
                 let mut parts = cleaned.split_whitespace();
                 if let Some(bin) = parts.next() {
                     let args: Vec<&str> = parts.collect();
-                    let _ = std::process::Command::new(bin).args(args).spawn();
+                    unsafe {
+                        let _ = std::process::Command::new(bin)
+                            .args(args)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .pre_exec(|| {
+                                libc::setsid();
+                                Ok(())
+                            })
+                            .spawn();
+                    }
                 }
             }
         }

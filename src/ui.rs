@@ -1418,215 +1418,204 @@ impl RofiApp {
                             });
                         } else if self.mode == Mode::Input || self.mode == Mode::Themes {
                             // ── Input / theme picker list ─────────────────
-                            egui::ScrollArea::vertical()
+                            let mut scroll = egui::ScrollArea::vertical()
                                 .id_source("mofi_input")
-                                .max_height(max_list_height)
-                                .show(ui, |ui| {
-                                    ui.set_min_width(ui.available_width());
-                                    if self.input_filtered.is_empty() {
-                                        ui.add_space(20.0);
-                                        ui.centered_and_justified(|ui| {
-                                            ui.label(
-                                                egui::RichText::new("No results")
-                                                    .font(FontId::new(15.0, FontFamily::Monospace))
-                                                    .color(t.fg_muted),
-                                            );
-                                        });
+                                .max_height(max_list_height);
+                            if self.scroll_reset_pending {
+                                scroll = scroll.vertical_scroll_offset(0.0);
+                                self.scroll_reset_pending = false;
+                                self.last_scroll_to = usize::MAX;
+                            }
+                            scroll.show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                if self.input_filtered.is_empty() {
+                                    ui.add_space(20.0);
+                                    ui.centered_and_justified(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("No results")
+                                                .font(FontId::new(15.0, FontFamily::Monospace))
+                                                .color(t.fg_muted),
+                                        );
+                                    });
+                                    return;
+                                }
+                                let aw = ui.available_width();
+                                // Collect a snapshot so we don't hold a borrow on self.input_filtered
+                                // while potentially mutating self inside the loop.
+                                let rows: Vec<(usize, usize)> =
+                                    self.input_filtered.iter().copied().enumerate().collect();
+                                let is_themes = self.mode == Mode::Themes;
+                                for (row_idx, item_idx) in rows {
+                                    let sel = row_idx == self.selected;
+                                    let text = self.input_items[item_idx].clone();
+                                    // Per-row icon: theme-specific glyph in themes mode, plain list bullet otherwise.
+                                    let row_icon = if is_themes {
+                                        theme_glyph_for(text.trim_start_matches("* "))
+                                    } else {
+                                        "\u{F0CA}" // nf-fa-list_ul
+                                    };
+                                    let (rr, _) = ui.allocate_exact_size(
+                                        Vec2::new(aw, ROW_HEIGHT),
+                                        egui::Sense::hover(),
+                                    );
+                                    if sel && self.selected != self.last_scroll_to {
+                                        self.last_scroll_to = self.selected;
+                                        ui.scroll_to_rect(rr, None);
+                                    }
+                                    if sel {
+                                        ui.painter().rect_filled(rr, Rounding::ZERO, t.row_sel);
+                                        ui.painter().rect_filled(
+                                            egui::Rect::from_min_size(
+                                                egui::pos2(rr.left(), rr.top() + 4.0),
+                                                Vec2::new(3.0, rr.height() - 8.0),
+                                            ),
+                                            Rounding::ZERO,
+                                            t.accent,
+                                        );
+                                    } else if ui.rect_contains_pointer(rr) {
+                                        ui.painter().rect_filled(rr, Rounding::ZERO, t.row_hover);
+                                    }
+                                    let ix = rr.left() + 14.0;
+                                    ui.painter().text(
+                                        egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
+                                        egui::Align2::CENTER_CENTER,
+                                        row_icon,
+                                        FontId::new(ICON_SIZE * 0.75, FontFamily::Monospace),
+                                        if sel { t.icon_sel } else { t.icon_dim },
+                                    );
+                                    ui.painter().text(
+                                        egui::pos2(ix + ICON_SIZE + 12.0, rr.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        &text,
+                                        FontId::new(16.0, self.medium_font.clone()),
+                                        if sel { t.fg } else { t.fg_dim },
+                                    );
+                                    let click = ui.interact(
+                                        rr,
+                                        egui::Id::new(("input_row", row_idx)),
+                                        egui::Sense::click(),
+                                    );
+                                    if click.hovered() {
+                                        if self.mode == Mode::Themes && self.selected != row_idx {
+                                            self.selected = row_idx;
+                                            self.preview_theme_at_selection();
+                                        } else {
+                                            self.selected = row_idx;
+                                        }
+                                    }
+                                    if click.double_clicked() {
+                                        self.selected = row_idx;
+                                        self.execute_selected();
                                         return;
                                     }
-                                    let aw = ui.available_width();
-                                    // Collect a snapshot so we don't hold a borrow on self.input_filtered
-                                    // while potentially mutating self inside the loop.
-                                    let rows: Vec<(usize, usize)> =
-                                        self.input_filtered.iter().copied().enumerate().collect();
-                                    let is_themes = self.mode == Mode::Themes;
-                                    for (row_idx, item_idx) in rows {
-                                        let sel = row_idx == self.selected;
-                                        let text = self.input_items[item_idx].clone();
-                                        // Per-row icon: theme-specific glyph in themes mode, plain list bullet otherwise.
-                                        let row_icon = if is_themes {
-                                            theme_glyph_for(text.trim_start_matches("* "))
-                                        } else {
-                                            "\u{F0CA}" // nf-fa-list_ul
-                                        };
-                                        let (rr, _) = ui.allocate_exact_size(
-                                            Vec2::new(aw, ROW_HEIGHT),
-                                            egui::Sense::hover(),
-                                        );
-                                        if sel && self.selected != self.last_scroll_to {
-                                            self.last_scroll_to = self.selected;
-                                            let align = if self.scroll_reset_pending {
-                                                self.scroll_reset_pending = false;
-                                                Some(egui::Align::TOP)
-                                            } else {
-                                                None
-                                            };
-                                            ui.scroll_to_rect(rr, align);
-                                        }
-                                        if sel {
-                                            ui.painter().rect_filled(rr, Rounding::ZERO, t.row_sel);
-                                            ui.painter().rect_filled(
-                                                egui::Rect::from_min_size(
-                                                    egui::pos2(rr.left(), rr.top() + 4.0),
-                                                    Vec2::new(3.0, rr.height() - 8.0),
-                                                ),
-                                                Rounding::ZERO,
-                                                t.accent,
-                                            );
-                                        } else if ui.rect_contains_pointer(rr) {
-                                            ui.painter().rect_filled(
-                                                rr,
-                                                Rounding::ZERO,
-                                                t.row_hover,
-                                            );
-                                        }
-                                        let ix = rr.left() + 14.0;
-                                        ui.painter().text(
-                                            egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
-                                            egui::Align2::CENTER_CENTER,
-                                            row_icon,
-                                            FontId::new(ICON_SIZE * 0.75, FontFamily::Monospace),
-                                            if sel { t.icon_sel } else { t.icon_dim },
-                                        );
-                                        ui.painter().text(
-                                            egui::pos2(ix + ICON_SIZE + 12.0, rr.center().y),
-                                            egui::Align2::LEFT_CENTER,
-                                            &text,
-                                            FontId::new(16.0, self.medium_font.clone()),
-                                            if sel { t.fg } else { t.fg_dim },
-                                        );
-                                        let click = ui.interact(
-                                            rr,
-                                            egui::Id::new(("input_row", row_idx)),
-                                            egui::Sense::click(),
-                                        );
-                                        if click.hovered() {
-                                            if self.mode == Mode::Themes && self.selected != row_idx
-                                            {
-                                                self.selected = row_idx;
-                                                self.preview_theme_at_selection();
-                                            } else {
-                                                self.selected = row_idx;
-                                            }
-                                        }
-                                        if click.double_clicked() {
-                                            self.selected = row_idx;
-                                            self.execute_selected();
-                                            return;
-                                        }
-                                    }
-                                });
+                                }
+                            });
                         } else {
                             // ── Normal results list ───────────────────────
-                            egui::ScrollArea::vertical()
+                            let mut scroll = egui::ScrollArea::vertical()
                                 .id_source("mofi_results")
-                                .max_height(max_list_height)
-                                .show(ui, |ui| {
-                                    ui.set_min_width(ui.available_width());
-                                    if self.filtered.is_empty() {
-                                        ui.add_space(20.0);
-                                        ui.centered_and_justified(|ui| {
-                                            ui.label(
-                                                egui::RichText::new("No results")
-                                                    .font(FontId::new(15.0, FontFamily::Monospace))
-                                                    .color(t.fg_muted),
-                                            );
-                                        });
+                                .max_height(max_list_height);
+                            if self.scroll_reset_pending {
+                                scroll = scroll.vertical_scroll_offset(0.0);
+                                self.scroll_reset_pending = false;
+                                self.last_scroll_to = usize::MAX;
+                            }
+                            scroll.show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                if self.filtered.is_empty() {
+                                    ui.add_space(20.0);
+                                    ui.centered_and_justified(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("No results")
+                                                .font(FontId::new(15.0, FontFamily::Monospace))
+                                                .color(t.fg_muted),
+                                        );
+                                    });
+                                    return;
+                                }
+                                let aw = ui.available_width();
+                                for (row_idx, &item_idx) in self.filtered.iter().enumerate() {
+                                    let sel = row_idx == self.selected;
+                                    let item = &self.items[item_idx];
+                                    let glyph = glyph_for_item(item);
+                                    let gc = glyph_color_for_item(item, &t);
+                                    let gc = if sel { gc } else { dim_color(gc) };
+                                    let display = item.display_name();
+                                    let subtitle = item.subtitle();
+
+                                    let (rr, _) = ui.allocate_exact_size(
+                                        Vec2::new(aw, ROW_HEIGHT),
+                                        egui::Sense::hover(),
+                                    );
+                                    if sel && self.selected != self.last_scroll_to {
+                                        self.last_scroll_to = self.selected;
+                                        ui.scroll_to_rect(rr, None);
+                                    }
+
+                                    if sel {
+                                        ui.painter().rect_filled(rr, Rounding::ZERO, t.row_sel);
+                                        ui.painter().rect_filled(
+                                            egui::Rect::from_min_size(
+                                                egui::pos2(rr.left(), rr.top() + 4.0),
+                                                Vec2::new(3.0, rr.height() - 8.0),
+                                            ),
+                                            Rounding::ZERO,
+                                            t.accent,
+                                        );
+                                    } else if ui.rect_contains_pointer(rr) {
+                                        ui.painter().rect_filled(rr, Rounding::ZERO, t.row_hover);
+                                    }
+
+                                    let ix = rr.left() + 14.0;
+                                    ui.painter().text(
+                                        egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
+                                        egui::Align2::CENTER_CENTER,
+                                        glyph,
+                                        FontId::new(ICON_SIZE * 0.75, FontFamily::Monospace),
+                                        gc,
+                                    );
+
+                                    let tx = ix + ICON_SIZE + 12.0;
+                                    if let Some(sub) = subtitle {
+                                        ui.painter().text(
+                                            egui::pos2(tx, rr.center().y - 7.0),
+                                            egui::Align2::LEFT_CENTER,
+                                            &display,
+                                            FontId::new(14.0, self.medium_font.clone()),
+                                            if sel { t.fg } else { t.fg_dim },
+                                        );
+                                        ui.painter().text(
+                                            egui::pos2(tx, rr.center().y + 7.0),
+                                            egui::Align2::LEFT_CENTER,
+                                            &sub,
+                                            FontId::new(13.0, FontFamily::Monospace),
+                                            if sel { t.accent2 } else { t.fg_muted },
+                                        );
+                                    } else {
+                                        ui.painter().text(
+                                            egui::pos2(tx, rr.center().y),
+                                            egui::Align2::LEFT_CENTER,
+                                            &display,
+                                            FontId::new(14.0, self.medium_font.clone()),
+                                            if sel { t.fg } else { t.fg_dim },
+                                        );
+                                    }
+
+                                    let click = ui.interact(
+                                        rr,
+                                        egui::Id::new(("row", row_idx)),
+                                        egui::Sense::click(),
+                                    );
+                                    if click.hovered() {
+                                        self.selected = row_idx;
+                                    }
+                                    if click.double_clicked() {
+                                        self.selected = row_idx;
+                                        self.execute_selected();
                                         return;
                                     }
-                                    let aw = ui.available_width();
-                                    for (row_idx, &item_idx) in self.filtered.iter().enumerate() {
-                                        let sel = row_idx == self.selected;
-                                        let item = &self.items[item_idx];
-                                        let glyph = glyph_for_item(item);
-                                        let gc = glyph_color_for_item(item, &t);
-                                        let gc = if sel { gc } else { dim_color(gc) };
-                                        let display = item.display_name();
-                                        let subtitle = item.subtitle();
-
-                                        let (rr, _) = ui.allocate_exact_size(
-                                            Vec2::new(aw, ROW_HEIGHT),
-                                            egui::Sense::hover(),
-                                        );
-                                        if sel && self.selected != self.last_scroll_to {
-                                            self.last_scroll_to = self.selected;
-                                            let align = if self.scroll_reset_pending {
-                                                self.scroll_reset_pending = false;
-                                                Some(egui::Align::TOP)
-                                            } else {
-                                                None
-                                            };
-                                            ui.scroll_to_rect(rr, align);
-                                        }
-
-                                        if sel {
-                                            ui.painter().rect_filled(rr, Rounding::ZERO, t.row_sel);
-                                            ui.painter().rect_filled(
-                                                egui::Rect::from_min_size(
-                                                    egui::pos2(rr.left(), rr.top() + 4.0),
-                                                    Vec2::new(3.0, rr.height() - 8.0),
-                                                ),
-                                                Rounding::ZERO,
-                                                t.accent,
-                                            );
-                                        } else if ui.rect_contains_pointer(rr) {
-                                            ui.painter().rect_filled(
-                                                rr,
-                                                Rounding::ZERO,
-                                                t.row_hover,
-                                            );
-                                        }
-
-                                        let ix = rr.left() + 14.0;
-                                        ui.painter().text(
-                                            egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
-                                            egui::Align2::CENTER_CENTER,
-                                            glyph,
-                                            FontId::new(ICON_SIZE * 0.75, FontFamily::Monospace),
-                                            gc,
-                                        );
-
-                                        let tx = ix + ICON_SIZE + 12.0;
-                                        if let Some(sub) = subtitle {
-                                            ui.painter().text(
-                                                egui::pos2(tx, rr.center().y - 7.0),
-                                                egui::Align2::LEFT_CENTER,
-                                                &display,
-                                                FontId::new(14.0, self.medium_font.clone()),
-                                                if sel { t.fg } else { t.fg_dim },
-                                            );
-                                            ui.painter().text(
-                                                egui::pos2(tx, rr.center().y + 7.0),
-                                                egui::Align2::LEFT_CENTER,
-                                                &sub,
-                                                FontId::new(13.0, FontFamily::Monospace),
-                                                if sel { t.accent2 } else { t.fg_muted },
-                                            );
-                                        } else {
-                                            ui.painter().text(
-                                                egui::pos2(tx, rr.center().y),
-                                                egui::Align2::LEFT_CENTER,
-                                                &display,
-                                                FontId::new(14.0, self.medium_font.clone()),
-                                                if sel { t.fg } else { t.fg_dim },
-                                            );
-                                        }
-
-                                        let click = ui.interact(
-                                            rr,
-                                            egui::Id::new(("row", row_idx)),
-                                            egui::Sense::click(),
-                                        );
-                                        if click.hovered() {
-                                            self.selected = row_idx;
-                                        }
-                                        if click.double_clicked() {
-                                            self.selected = row_idx;
-                                            self.execute_selected();
-                                            return;
-                                        }
-                                    }
-                                });
+                                }
+                            });
                         }
 
                         // ── Toast ─────────────────────────────────────────

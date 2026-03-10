@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 
 const PID_FILE: &str = "/tmp/mofi.pid";
 const SOCK_FILE: &str = "/tmp/mofi.sock";
+const LOCK_FILE: &str = "/tmp/mofi.lock";
 
 /// Send SIGUSR1 to our own process (called from handle_client threads so that
 /// shared state is fully written *before* the UI thread wakes on the signal).
@@ -736,6 +737,34 @@ pub enum SocketMsg {
 }
 
 fn run_daemon() {
+    // ── Single-instance guard ─────────────────────────────────────────────
+    // Acquire an exclusive flock on a lock file.  If another daemon already
+    // holds the lock, print a message and exit.  The OS releases the lock
+    // automatically when our process exits (even on crash / SIGKILL), so
+    // there are no stale-lock problems.
+    use std::os::unix::io::AsRawFd;
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(LOCK_FILE)
+        .expect("failed to open lock file");
+    let lock_fd = lock_file.as_raw_fd();
+    let lock_ok = unsafe { libc::flock(lock_fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if lock_ok != 0 {
+        // Another daemon holds the lock.
+        let existing_pid = fs::read_to_string(PID_FILE).unwrap_or_default();
+        eprintln!(
+            "mofi: daemon already running (pid {}). Not starting a second instance.",
+            existing_pid.trim()
+        );
+        std::process::exit(0);
+    }
+    // Keep `lock_file` alive for the lifetime of the process — dropping it
+    // would close the fd and release the flock.
+    // (It's moved into `_lock_guard` so it lives until the end of this function.)
+    let _lock_guard = lock_file;
+
     // Bind the socket FIRST so the PID file is only written once the daemon is
     // ready to accept connections.  This eliminates the race where a client
     // reads a valid PID but the socket is not yet listening.
@@ -821,6 +850,7 @@ fn run_daemon() {
         // Clean up runtime files when the event loop exits (SIGTERM or normal close).
         let _ = fs::remove_file(SOCK_FILE);
         let _ = fs::remove_file(PID_FILE);
+        let _ = fs::remove_file(LOCK_FILE);
     }
 
     #[cfg(target_os = "macos")]

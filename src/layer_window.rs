@@ -268,26 +268,22 @@ fn run_inner<A: AppHandler>(mut app: A, sigterm: Arc<AtomicBool>, start_mapped: 
     // at the correct HiDPI density from the very first frame.
     app.setup(&state.egui_ctx);
 
-    // ── Centering fix: query screen logical size and set margins ─────────────
-    // `Anchor::empty()` should centre on most compositors, but on Hyprland we
-    // compute margins explicitly to guarantee positioning.
-    let screen_logical: Option<(i32, i32)> = state
-        .output_state
-        .outputs()
-        .next()
-        .and_then(|o| state.output_state.info(&o))
-        .and_then(|info| info.logical_size);
-    if let Some((sw, sh)) = screen_logical {
+    // ── Centering: margins are computed dynamically in map_surface() ────────
+    // Each time the surface is mapped, map_surface queries the focused monitor
+    // via hyprctl and sets margins to centre the window on that output.
+    // Set initial anchor for the layer shell (will be refined in map_surface).
+    if let Some((sw, sh)) = focused_monitor_logical_size() {
         let margin_x = ((sw - WIN_W as i32) / 2).max(0);
         let margin_y = ((sh - WIN_H as i32) / 2).max(0);
-        eprintln!("[mofi] screen logical {sw}x{sh}, margins top={margin_y} left={margin_x}");
+        eprintln!(
+            "[mofi] initial screen logical {sw}x{sh}, margins top={margin_y} left={margin_x}"
+        );
         state.layer.set_anchor(Anchor::TOP | Anchor::LEFT);
         state.layer.set_margin(margin_y, 0, 0, margin_x);
         state.layer.commit();
-        // Flush the updated anchor/margin before we map.
         event_queue.flush().ok();
     } else {
-        eprintln!("[mofi] screen logical size unavailable, using Anchor::empty() for centering");
+        eprintln!("[mofi] focused monitor unavailable at startup, using Anchor::empty()");
     }
 
     // In oneshot mode, map the surface immediately so the window appears as
@@ -501,20 +497,15 @@ impl LayerState {
         }
 
         // ── Render ────────────────────────────────────────────────────────────
-        // Use the egui panel background colour for the GL clear so the colour
-        // matches the theme and no transparent artefacts appear.
-        let bg = self.egui_ctx.style().visuals.window_fill();
+        // Clear to fully transparent so the semi-transparent panel background
+        // painted by egui (using the theme's bg_alpha) shows through to the
+        // desktop beneath the window.
         let pw = self.phys_w() as i32;
         let ph = self.phys_h() as i32;
         use glow::HasContext as _;
         unsafe {
             self.gl.viewport(0, 0, pw, ph);
-            self.gl.clear_color(
-                bg.r() as f32 / 255.0,
-                bg.g() as f32 / 255.0,
-                bg.b() as f32 / 255.0,
-                1.0,
-            );
+            self.gl.clear_color(0.0, 0.0, 0.0, 0.0);
             self.gl.clear(glow::COLOR_BUFFER_BIT);
         }
 
@@ -539,6 +530,17 @@ impl LayerState {
         // Don't set mapped=true yet — wait for the compositor's configure
         // callback so we know it has accepted the surface before we render.
         self.mapping_pending = true;
+
+        // ── Recompute centering margins for the focused monitor ──────────
+        // Query Hyprland for the currently focused monitor so the window
+        // appears centred on the monitor where the mouse/keyboard focus is,
+        // not just the first output in the list.
+        if let Some((sw, sh)) = focused_monitor_logical_size() {
+            let margin_x = ((sw - w as i32) / 2).max(0);
+            let margin_y = ((sh - h as i32) / 2).max(0);
+            self.layer.set_anchor(Anchor::TOP | Anchor::LEFT);
+            self.layer.set_margin(margin_y, 0, 0, margin_x);
+        }
 
         eprintln!(
             "[mofi] map_surface({w}x{h} logical, {}x{} phys) — waiting for configure",
@@ -1003,4 +1005,31 @@ fn wayland_button_to_egui(button: u32) -> Option<egui::PointerButton> {
         0x112 => Some(egui::PointerButton::Middle),
         _ => None,
     }
+}
+
+// ── Hyprland monitor helpers ──────────────────────────────────────────────────
+
+/// Query `hyprctl monitors -j` to find the focused monitor's logical size.
+/// Returns `Some((width, height))` for the monitor that currently has focus
+/// (where the mouse/keyboard is), or `None` if the query fails.
+fn focused_monitor_logical_size() -> Option<(i32, i32)> {
+    let output = std::process::Command::new("hyprctl")
+        .args(["monitors", "-j"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let monitors: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).ok()?;
+    for m in &monitors {
+        if m.get("focused").and_then(|v| v.as_bool()) == Some(true) {
+            let w = m.get("width").and_then(|v| v.as_i64())? as f64;
+            let h = m.get("height").and_then(|v| v.as_i64())? as f64;
+            let scale = m.get("scale").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            return Some(((w / scale).round() as i32, (h / scale).round() as i32));
+        }
+    }
+    None
 }
