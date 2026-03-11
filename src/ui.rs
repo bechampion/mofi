@@ -256,6 +256,8 @@ pub enum Mode {
     Input,
     /// Activated by `mofi --themes` — same as Input but with live theme preview.
     Themes,
+    /// Single-pane file explorer with zoxide directory completions.
+    Files,
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -290,6 +292,15 @@ pub struct RofiApp {
     // ── Theme hot-reload ──
     theme: Theme,
     config_mtime: Option<SystemTime>,
+    // ── File explorer ──
+    file_pane: crate::files::Pane,
+    /// Cached zoxide query results (directory paths).
+    zoxide_results: Vec<String>,
+    /// The query term that produced the current zoxide_results.
+    zoxide_last_query: String,
+    /// When the user presses Tab while on a zoxide row, this locks the path
+    /// as the drill target so children can be browsed.  Cleared on hide.
+    drill_target: Option<String>,
 }
 
 impl RofiApp {
@@ -352,6 +363,12 @@ impl RofiApp {
             theme_before_preview: None,
             theme,
             config_mtime,
+            file_pane: crate::files::Pane::new(
+                &dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/")),
+            ),
+            zoxide_results: Vec::new(),
+            zoxide_last_query: String::new(),
+            drill_target: None,
         };
         app.refilter(true);
         app
@@ -377,7 +394,7 @@ impl RofiApp {
                 Mode::Apps      => matches!(item, LaunchItem::App(_)),
                 Mode::Clipboard => matches!(item, LaunchItem::Clip(_)),
                 Mode::Pass      => matches!(item, LaunchItem::Pass(_)),
-                Mode::About | Mode::Input | Mode::Themes => false,
+                Mode::About | Mode::Input | Mode::Themes | Mode::Files => false,
             })
             .collect();
 
@@ -443,6 +460,34 @@ impl RofiApp {
         }
     }
 
+    /// Query zoxide for directory completions matching `term`.
+    /// Results are cached — only re-queries when the term changes.
+    fn update_zoxide(&mut self, term: &str) {
+        if term == self.zoxide_last_query {
+            return;
+        }
+        self.zoxide_last_query = term.to_string();
+        if term.is_empty() {
+            self.zoxide_results.clear();
+            return;
+        }
+        let output = std::process::Command::new("zoxide")
+            .args(["query", "-l", term])
+            .output();
+        match output {
+            Ok(o) if o.status.success() => {
+                self.zoxide_results = String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .take(8)
+                    .map(|s| s.to_string())
+                    .collect();
+            }
+            _ => {
+                self.zoxide_results.clear();
+            }
+        }
+    }
+
     fn restore_focus(&mut self) {
         if let Some(app) = self.prev_app.take() { restore_app_focus(&app); }
     }
@@ -459,6 +504,9 @@ impl RofiApp {
         }
         self.input_is_themes = false;
         self.mode = Mode::Apps;
+        self.zoxide_results.clear();
+        self.zoxide_last_query.clear();
+        self.drill_target = None;
         self.refilter(true);
         { let mut l = self.pending_entry.lock().unwrap(); if l.is_none() { *l = Some(None); } }
         {
@@ -570,6 +618,10 @@ impl eframe::App for RofiApp {
                         Some("about") => {
                             self.mode = Mode::About;
                         }
+                        Some("files") => {
+                            self.mode = Mode::Files;
+                            self.file_pane.scan();
+                        }
                         _ => {
                             self.mode = Mode::Apps;
                         }
@@ -629,6 +681,17 @@ impl eframe::App for RofiApp {
         // Consume Ctrl+J / Ctrl+K here — before TextEdit steals them.
         let ctrl_j = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::J));
         let ctrl_k = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::K));
+        // Consume Ctrl+H / Ctrl+L for Files mode navigation (go up / enter dir).
+        let ctrl_h_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::H));
+        let ctrl_l_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::L));
+        // In Files mode consume Tab before TextEdit so it doesn't shift focus.
+        let files_tab_consumed = self.mode == Mode::Files
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Tab));
+        let _ = files_tab_consumed; // Tab handled in Files keyboard block below
+
+        // Approximate repeat counts from consecutive key presses this frame.
+        let down_count = 1usize;
+        let up_count   = 1usize;
 
         if self.mode == Mode::Clipboard {
             self.sync_clipboard();
@@ -669,6 +732,7 @@ impl eframe::App for RofiApp {
                                 (Mode::Apps,      "Apps"),
                                 (Mode::Clipboard, "Clipboard"),
                                 (Mode::Pass,      "Pass"),
+                                (Mode::Files,     "Files"),
                                 (Mode::Themes,    "Themes"),
                                 (Mode::About,     "About"),
                             ];
@@ -701,6 +765,10 @@ impl eframe::App for RofiApp {
                                         self.mode = mode;
                                         self.query.clear();
                                         if mode == Mode::Clipboard { self.sync_clipboard(); }
+                                        if mode == Mode::Files { self.file_pane.scan(); }
+                                        self.zoxide_results.clear();
+                                        self.zoxide_last_query.clear();
+                                        self.drill_target = None;
                                         self.refilter(true);
                                     }
                                 }
@@ -724,6 +792,7 @@ impl eframe::App for RofiApp {
                             Mode::Pass      => "Search passwords…",
                             Mode::Input     => "Filter…",
                             Mode::Themes    => "Filter themes…",
+                            Mode::Files     => "Filter files…",
                             Mode::About     => "",
                         };
 
@@ -742,11 +811,12 @@ impl eframe::App for RofiApp {
                         let tab   = ctx.input(|i| i.key_pressed(Key::Tab));
                         let enter = ctx.input(|i| i.key_pressed(Key::Enter));
 
-                        if tab && self.mode != Mode::Input {
+                        if tab && self.mode != Mode::Input && self.mode != Mode::Files {
                             let next = match self.mode {
                                 Mode::Apps      => Mode::Clipboard,
                                 Mode::Clipboard => Mode::Pass,
-                                Mode::Pass      => Mode::Themes,
+                                Mode::Pass      => Mode::Files,
+                                Mode::Files     => Mode::Themes,
                                 Mode::Themes    => Mode::About,
                                 Mode::About     => Mode::Apps,
                                 Mode::Input     => Mode::Input,
@@ -757,6 +827,10 @@ impl eframe::App for RofiApp {
                                 self.mode = next;
                                 self.query.clear();
                                 if self.mode == Mode::Clipboard { self.sync_clipboard(); }
+                                if self.mode == Mode::Files { self.file_pane.scan(); }
+                                self.zoxide_results.clear();
+                                self.zoxide_last_query.clear();
+                                self.drill_target = None;
                                 self.refilter(true);
                             }
                         }
@@ -771,19 +845,159 @@ impl eframe::App for RofiApp {
                                 self.selected = self.selected.checked_sub(1).unwrap_or(len - 1);
                                 if self.mode == Mode::Themes { self.preview_theme_at_selection(); }
                             }
-                        } else {
+                        } else if self.mode != Mode::Files {
                             let len = self.filtered.len();
                             if down && len > 0 { self.selected = (self.selected + 1) % len; }
                             if up   && len > 0 { self.selected = self.selected.checked_sub(1).unwrap_or(len - 1); }
                         }
 
-                        if enter { self.execute_selected(); return; }
+                        if enter && self.mode != Mode::Files { self.execute_selected(); return; }
+
+                        // ── Files mode keyboard ───────────────────────────
+                        if self.mode == Mode::Files {
+                            let q = self.query.to_lowercase();
+
+                            // ── Drill-target management ──
+                            if let Some(ref dt) = self.drill_target {
+                                let prefix = dt.to_lowercase();
+                                if !q.starts_with(&prefix) {
+                                    self.drill_target = None;
+                                }
+                            }
+                            // Tab pressed while on a zoxide row → activate drill
+                            let q_tokens_check: Vec<&str> = q.split_whitespace().collect();
+                            let zc_check = if q_tokens_check.is_empty() { 0 } else { self.zoxide_results.len() };
+                            if tab && self.drill_target.is_none() && self.selected < zc_check {
+                                let zpath = self.zoxide_results[self.selected].clone();
+                                self.drill_target = Some(zpath.clone());
+                                self.query = format!("{}/", zpath);
+                                self.selected = 0;
+                                if let Some(mut state) = egui::TextEdit::load_state(ctx, response.id) {
+                                    let ccursor = egui::text::CCursor::new(self.query.len());
+                                    state.cursor.set_char_range(Some(egui::text::CCursorRange::one(ccursor)));
+                                    state.store(ctx, response.id);
+                                }
+                            }
+
+                            let q = self.query.to_lowercase();
+                            let drill_mode = self.drill_target.is_some();
+                            let q_tokens: Vec<&str> = if let Some(ref dt) = self.drill_target {
+                                let prefix_len = dt.len() + 1;
+                                if q.len() > prefix_len { q[prefix_len..].split_whitespace().collect() }
+                                else { Vec::new() }
+                            } else {
+                                q.split_whitespace().collect()
+                            };
+
+                            if drill_mode {
+                                // ── DRILL MODE ──
+                                let drill_path = self.drill_target.clone().unwrap();
+                                let drill_children: Vec<crate::files::FileEntry> =
+                                    crate::files::dir_children(
+                                        &std::path::PathBuf::from(&drill_path),
+                                        &q_tokens.iter().copied().collect::<Vec<_>>(),
+                                    );
+                                let total = drill_children.len();
+                                if total > 0 && self.selected >= total { self.selected = 0; }
+
+                                if ctrl_h_pressed {
+                                    self.drill_target = None;
+                                    self.file_pane.go_up();
+                                    self.query.clear();
+                                    self.zoxide_results.clear();
+                                    self.zoxide_last_query.clear();
+                                    self.selected = 0;
+                                }
+                                if ctrl_l_pressed || enter {
+                                    if let Some(de) = drill_children.get(self.selected) {
+                                        if de.is_dir {
+                                            let p = de.path.clone();
+                                            self.file_pane = crate::files::Pane::new(&p);
+                                            self.file_pane.scan();
+                                            self.query.clear();
+                                            self.zoxide_results.clear();
+                                            self.zoxide_last_query.clear();
+                                            self.drill_target = None;
+                                            self.selected = 0;
+                                        } else {
+                                            crate::files::open_file(&de.path);
+                                            self.hide(ctx);
+                                            return;
+                                        }
+                                    }
+                                }
+                                if down && total > 0 { self.selected = (self.selected + down_count).min(total - 1); }
+                                if up   && total > 0 { self.selected = self.selected.saturating_sub(up_count); }
+                            } else {
+                                // ── NORMAL MODE ──
+                                let file_filtered: Vec<usize> = self.file_pane.entries.iter()
+                                    .enumerate()
+                                    .filter(|(_, e)| {
+                                        if q_tokens.is_empty() { return true; }
+                                        let haystack = e.path.to_string_lossy().to_lowercase();
+                                        q_tokens.iter().all(|tok| haystack.contains(tok))
+                                    })
+                                    .map(|(i, _)| i)
+                                    .collect();
+                                let zoxide_count = if q.is_empty() { 0 } else { self.zoxide_results.len() };
+                                let total = file_filtered.len() + zoxide_count;
+                                if total > 0 && self.selected >= total { self.selected = 0; }
+
+                                if ctrl_h_pressed {
+                                    self.file_pane.go_up();
+                                    self.query.clear();
+                                    self.zoxide_results.clear();
+                                    self.zoxide_last_query.clear();
+                                    self.drill_target = None;
+                                    self.selected = 0;
+                                }
+                                if ctrl_l_pressed || enter {
+                                    if self.selected < zoxide_count {
+                                        let dir = self.zoxide_results[self.selected].clone();
+                                        let path = std::path::PathBuf::from(&dir);
+                                        if path.is_dir() {
+                                            self.file_pane = crate::files::Pane::new(&path);
+                                            self.file_pane.scan();
+                                        }
+                                        self.query.clear();
+                                        self.zoxide_results.clear();
+                                        self.zoxide_last_query.clear();
+                                        self.drill_target = None;
+                                        self.selected = 0;
+                                    } else if let Some(&entry_idx) = file_filtered.get(self.selected - zoxide_count) {
+                                        self.file_pane.selected = entry_idx;
+                                        use crate::files::EnterAction;
+                                        match self.file_pane.enter_selected() {
+                                            Some(EnterAction::NavigatedDir) => {
+                                                self.query.clear();
+                                                self.zoxide_results.clear();
+                                                self.zoxide_last_query.clear();
+                                                self.drill_target = None;
+                                                self.selected = 0;
+                                            }
+                                            Some(EnterAction::OpenFile(path)) => {
+                                                crate::files::open_file(&path);
+                                                self.hide(ctx);
+                                                return;
+                                            }
+                                            None => {}
+                                        }
+                                    }
+                                }
+                                if down && total > 0 { self.selected = (self.selected + down_count).min(total - 1); }
+                                if up   && total > 0 { self.selected = self.selected.saturating_sub(up_count); }
+                            }
+                        }
+
                         if response.changed() {
                             if self.mode == Mode::Input || self.mode == Mode::Themes {
                                 self.refilter_input();
                                 if self.mode == Mode::Themes { self.preview_theme_at_selection(); }
-                            } else {
+                            } else if self.mode != Mode::Files {
                                 self.refilter(true);
+                            }
+                            if self.mode == Mode::Files {
+                                self.update_zoxide(&self.query.clone());
                             }
                         }
 
@@ -892,6 +1106,310 @@ impl eframe::App for RofiApp {
                                     if click.double_clicked() { self.selected = row_idx; self.execute_selected(); return; }
                                 }
                             });
+                        } else if self.mode == Mode::Files {
+                            // ── Single-pane file explorer ─────────────────
+                            use crate::files::{format_size, format_time, glyph_for_file};
+
+                            let q = self.query.to_lowercase();
+                            let cwd_display = self.file_pane.cwd.to_string_lossy().to_string();
+                            let drill_target = self.drill_target.clone();
+                            let drill_mode = drill_target.is_some();
+
+                            let q_tokens: Vec<&str> = if let Some(ref dt) = drill_target {
+                                let prefix_len = dt.to_lowercase().len() + 1;
+                                if q.len() > prefix_len { q[prefix_len..].split_whitespace().collect() }
+                                else { Vec::new() }
+                            } else {
+                                q.split_whitespace().collect()
+                            };
+
+                            struct RowData {
+                                name: String,
+                                path: String,
+                                is_dir: bool,
+                                size: u64,
+                                modified: i64,
+                                owner: String,
+                                glyph: &'static str,
+                                is_git: bool,
+                            }
+
+                            let zoxide_rows: Vec<String>;
+                            let file_rows: Vec<RowData>;
+                            let drill_path_for_breadcrumb = drill_target.clone();
+
+                            if drill_mode {
+                                let dt = drill_target.unwrap();
+                                zoxide_rows = Vec::new();
+                                let children = crate::files::dir_children(
+                                    &std::path::PathBuf::from(&dt),
+                                    &q_tokens,
+                                );
+                                file_rows = children.iter().map(|e| RowData {
+                                    name: e.name.clone(),
+                                    path: e.path.to_string_lossy().to_string(),
+                                    is_dir: e.is_dir,
+                                    size: e.size,
+                                    modified: e.modified,
+                                    owner: e.owner.clone(),
+                                    glyph: glyph_for_file(e),
+                                    is_git: e.source == crate::files::Source::Git,
+                                }).collect();
+                            } else {
+                                zoxide_rows = if q.is_empty() { Vec::new() } else { self.zoxide_results.clone() };
+                                let file_filtered: Vec<usize> = self.file_pane.entries.iter()
+                                    .enumerate()
+                                    .filter(|(_, e)| {
+                                        if q_tokens.is_empty() { return true; }
+                                        let haystack = e.path.to_string_lossy().to_lowercase();
+                                        q_tokens.iter().all(|tok| haystack.contains(tok))
+                                    })
+                                    .map(|(i, _)| i)
+                                    .collect();
+                                file_rows = file_filtered.iter().map(|&i| {
+                                    let e = &self.file_pane.entries[i];
+                                    RowData {
+                                        name: e.name.clone(),
+                                        path: e.path.to_string_lossy().to_string(),
+                                        is_dir: e.is_dir,
+                                        size: e.size,
+                                        modified: e.modified,
+                                        owner: e.owner.clone(),
+                                        glyph: glyph_for_file(e),
+                                        is_git: e.source == crate::files::Source::Git,
+                                    }
+                                }).collect();
+                            }
+
+                            let zoxide_count = zoxide_rows.len();
+                            let selected = self.selected;
+                            let breadcrumb_h = 34.0_f32;
+                            let file_list_height = max_list_height - breadcrumb_h;
+
+                            egui::ScrollArea::vertical()
+                                .id_source("mofi_files")
+                                .max_height(file_list_height)
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    let total = file_rows.len() + zoxide_count;
+                                    if total == 0 {
+                                        ui.add_space(20.0);
+                                        ui.centered_and_justified(|ui| {
+                                            ui.label(egui::RichText::new("Empty")
+                                                .font(FontId::new(11.0, FontFamily::Monospace))
+                                                .color(t.fg_muted));
+                                        });
+                                        return;
+                                    }
+                                    let aw = ui.available_width();
+
+                                    // ── Zoxide "jump to" rows ──
+                                    for (zi, zpath) in zoxide_rows.iter().enumerate() {
+                                        let sel = selected == zi;
+                                        let (rr, _) = ui.allocate_exact_size(Vec2::new(aw, ROW_HEIGHT), egui::Sense::hover());
+                                        if sel {
+                                            ui.scroll_to_rect(rr, None);
+                                            ui.painter().rect_filled(rr, Rounding::ZERO, t.row_sel);
+                                        }
+                                        let ix = rr.left() + 4.0;
+                                        let gc = if sel { t.accent2 } else { dim_color(t.accent2) };
+                                        ui.painter().text(
+                                            egui::pos2(ix + ICON_SIZE * 0.5, rr.center().y),
+                                            egui::Align2::CENTER_CENTER,
+                                            "\u{F126D}", // nf-md-folder_marker
+                                            FontId::new(16.0, FontFamily::Monospace),
+                                            gc,
+                                        );
+                                        let name_x = ix + ICON_SIZE + 8.0;
+                                        ui.painter().text(
+                                            egui::pos2(name_x, rr.center().y),
+                                            egui::Align2::LEFT_CENTER,
+                                            zpath,
+                                            FontId::new(14.0, FontFamily::Monospace),
+                                            gc,
+                                        );
+                                    }
+
+                                    // ── Separator between zoxide and file rows ──
+                                    if !zoxide_rows.is_empty() && !file_rows.is_empty() {
+                                        ui.add_space(2.0);
+                                        let sep_x = ui.cursor().left()..=ui.cursor().left() + aw;
+                                        ui.painter().hline(sep_x, ui.cursor().top(), Stroke::new(0.5, t.separator));
+                                        ui.add_space(2.0);
+                                    }
+
+                                    // ── File/child entry rows ──
+                                    let row_offset = zoxide_count;
+                                    for (fi, row) in file_rows.iter().enumerate() {
+                                        let combined_idx = row_offset + fi;
+                                        let sel = selected == combined_idx;
+                                        let (rr, _) = ui.allocate_exact_size(Vec2::new(aw, ROW_HEIGHT), egui::Sense::hover());
+                                        if sel {
+                                            ui.scroll_to_rect(rr, None);
+                                            ui.painter().rect_filled(rr, Rounding::ZERO, t.row_sel);
+                                        }
+
+                                        let glyph_color = if row.is_dir { t.accent } else { t.fg_muted };
+                                        let gc = if sel { glyph_color } else { dim_color(glyph_color) };
+                                        let ix = rr.left() + 4.0;
+
+                                        ui.painter().text(
+                                            egui::pos2(ix + ICON_SIZE * 0.5, rr.center().y),
+                                            egui::Align2::CENTER_CENTER,
+                                            row.glyph,
+                                            FontId::new(16.0, FontFamily::Monospace),
+                                            gc,
+                                        );
+
+                                        // Name with match highlighting
+                                        let name_x = ix + ICON_SIZE + 8.0;
+                                        let name_color = if sel { t.fg } else { t.fg_dim };
+                                        let highlight_color = t.match_hl;
+                                        let name_font = FontId::new(14.0, FontFamily::Monospace);
+
+                                        if q_tokens.is_empty() {
+                                            ui.painter().text(
+                                                egui::pos2(name_x, rr.center().y),
+                                                egui::Align2::LEFT_CENTER,
+                                                &row.name, name_font.clone(), name_color,
+                                            );
+                                        } else {
+                                            let name_lower = row.name.to_lowercase();
+                                            let mut highlighted = vec![false; row.name.len()];
+                                            for tok in &q_tokens {
+                                                let tok_lower = tok.to_lowercase();
+                                                let mut start = 0;
+                                                while let Some(pos) = name_lower[start..].find(&tok_lower) {
+                                                    let abs = start + pos;
+                                                    for i in abs..abs + tok_lower.len() {
+                                                        if i < highlighted.len() { highlighted[i] = true; }
+                                                    }
+                                                    start = abs + 1;
+                                                }
+                                            }
+                                            let mut cx = name_x;
+                                            let mut seg_start = 0;
+                                            while seg_start < row.name.len() {
+                                                let is_hl = highlighted[seg_start];
+                                                let mut seg_end = seg_start + 1;
+                                                while seg_end < row.name.len() && highlighted[seg_end] == is_hl {
+                                                    seg_end += 1;
+                                                }
+                                                let seg = &row.name[seg_start..seg_end];
+                                                let col = if is_hl { highlight_color } else { name_color };
+                                                let galley = ui.painter().layout_no_wrap(seg.to_string(), name_font.clone(), col);
+                                                let w = galley.rect.width();
+                                                ui.painter().galley(
+                                                    egui::pos2(cx, rr.center().y - galley.rect.height() * 0.5),
+                                                    galley, col,
+                                                );
+                                                cx += w;
+                                                seg_start = seg_end;
+                                            }
+                                        }
+
+                                        // Right-aligned metadata
+                                        let meta_font = FontId::new(11.0, FontFamily::Monospace);
+                                        let dim = |c: Color32| -> Color32 {
+                                            Color32::from_rgba_premultiplied(
+                                                (c.r() as u16 * 2 / 3) as u8,
+                                                (c.g() as u16 * 2 / 3) as u8,
+                                                (c.b() as u16 * 2 / 3) as u8,
+                                                c.a(),
+                                            )
+                                        };
+                                        let mut rx = rr.right() - 8.0;
+
+                                        if !row.is_dir {
+                                            let size_str = format_size(row.size);
+                                            ui.painter().text(
+                                                egui::pos2(rx, rr.center().y), egui::Align2::RIGHT_CENTER,
+                                                &size_str, meta_font.clone(),
+                                                if sel { t.accent } else { dim(t.accent) },
+                                            );
+                                        }
+                                        rx -= 56.0;
+
+                                        let date_str = format_time(row.modified);
+                                        ui.painter().text(
+                                            egui::pos2(rx, rr.center().y), egui::Align2::RIGHT_CENTER,
+                                            &date_str, meta_font.clone(),
+                                            if sel { t.accent2 } else { dim(t.accent2) },
+                                        );
+                                        rx -= 100.0;
+
+                                        ui.painter().text(
+                                            egui::pos2(rx, rr.center().y), egui::Align2::RIGHT_CENTER,
+                                            &row.owner, meta_font.clone(),
+                                            if sel { t.fg_muted } else { dim(t.fg_muted) },
+                                        );
+                                        rx -= 70.0;
+
+                                        if row.is_git {
+                                            ui.painter().text(
+                                                egui::pos2(rx, rr.center().y), egui::Align2::RIGHT_CENTER,
+                                                "\u{EA84}", meta_font, // nf-cod-github
+                                                if sel { t.accent2 } else { dim(t.accent2) },
+                                            );
+                                        }
+                                    }
+                                });
+
+                            // ── Rainbow path bar (pinned to bottom) ──────
+                            let outer = ui.max_rect();
+                            let bar_y = outer.bottom() - 6.0;
+                            let bar_left = outer.left() + 8.0;
+                            let bar_right = outer.right() - 8.0;
+
+                            ui.painter().hline(
+                                outer.left()..=outer.right(),
+                                bar_y - 14.0,
+                                Stroke::new(0.5, t.separator),
+                            );
+
+                            let breadcrumb_path: String;
+                            if let Some(ref dp) = drill_path_for_breadcrumb {
+                                if selected < file_rows.len() {
+                                    breadcrumb_path = file_rows[selected].path.clone();
+                                } else {
+                                    breadcrumb_path = dp.clone();
+                                }
+                            } else if selected < zoxide_count {
+                                breadcrumb_path = zoxide_rows[selected].clone();
+                            } else if selected - zoxide_count < file_rows.len() {
+                                breadcrumb_path = file_rows[selected - zoxide_count].path.clone();
+                            } else {
+                                breadcrumb_path = cwd_display.clone();
+                            }
+
+                            let rainbow: &[Color32] = &[
+                                Color32::from_rgb(255, 107, 107),
+                                Color32::from_rgb(255, 180, 107),
+                                Color32::from_rgb(255, 238, 140),
+                                Color32::from_rgb(140, 255, 170),
+                                Color32::from_rgb(130, 210, 255),
+                                Color32::from_rgb(180, 150, 255),
+                                Color32::from_rgb(230, 150, 255),
+                            ];
+
+                            let bc_font = FontId::new(14.0, FontFamily::Monospace);
+                            let slash_font = FontId::new(14.0, FontFamily::Monospace);
+                            let components: Vec<&str> = breadcrumb_path.split('/').filter(|s| !s.is_empty()).collect();
+                            let mut cx = bar_left;
+
+                            let r = ui.painter().text(egui::pos2(cx, bar_y), egui::Align2::LEFT_CENTER, "/", slash_font.clone(), t.fg_muted);
+                            cx = r.right();
+
+                            for (ci, comp) in components.iter().enumerate() {
+                                let color = rainbow[ci % rainbow.len()];
+                                let r = ui.painter().text(egui::pos2(cx, bar_y), egui::Align2::LEFT_CENTER, comp, bc_font.clone(), color);
+                                cx = r.right();
+                                if ci < components.len() - 1 {
+                                    let r = ui.painter().text(egui::pos2(cx, bar_y), egui::Align2::LEFT_CENTER, "/", slash_font.clone(), t.fg_muted);
+                                    cx = r.right();
+                                }
+                                if cx > bar_right { break; }
+                            }
                         } else {
                             // ── Normal results list ───────────────────────
                             egui::ScrollArea::vertical().max_height(max_list_height).show(ui, |ui| {
