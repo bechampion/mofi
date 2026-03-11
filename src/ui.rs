@@ -384,6 +384,7 @@ pub enum Mode {
     Apps,
     Clipboard,
     Pass,
+    Files,
     About,
     /// Activated by `mofi --input`.
     Input,
@@ -454,6 +455,12 @@ pub struct RofiApp {
     /// Cached textures for clipboard image thumbnails (keyed by file path).
     #[cfg(target_os = "linux")]
     image_textures: std::collections::HashMap<String, egui::TextureHandle>,
+    /// Single-pane file explorer state.
+    file_pane: crate::files::Pane,
+    /// Cached zoxide query results (directory paths).
+    zoxide_results: Vec<String>,
+    /// The query term that produced the current zoxide_results.
+    zoxide_last_query: String,
 }
 
 impl RofiApp {
@@ -608,6 +615,11 @@ impl RofiApp {
             tray_handle: None,
             #[cfg(target_os = "linux")]
             image_textures: std::collections::HashMap::new(),
+            file_pane: crate::files::Pane::new(
+                &dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/")),
+            ),
+            zoxide_results: Vec::new(),
+            zoxide_last_query: String::new(),
         };
         app.refilter(true);
         app
@@ -642,7 +654,7 @@ impl RofiApp {
             return Some((tex.clone(), (w as u32, h as u32)));
         }
         let data = std::fs::read(path).ok()?;
-        let img = image::load_from_memory_with_format(&data, image::ImageFormat::Png).ok()?;
+        let img = image::load_from_memory(&data).ok()?;
         let rgba = img.to_rgba8();
         let (w, h) = rgba.dimensions();
         let color_image =
@@ -684,7 +696,7 @@ impl RofiApp {
                 Mode::Apps => matches!(item, LaunchItem::App(_)),
                 Mode::Clipboard => matches!(item, LaunchItem::Clip(_)),
                 Mode::Pass => matches!(item, LaunchItem::Pass(_)),
-                Mode::About | Mode::Input | Mode::Themes => false,
+                Mode::About | Mode::Input | Mode::Themes | Mode::Files => false,
             })
             .collect();
 
@@ -785,6 +797,34 @@ impl RofiApp {
         }
     }
 
+    /// Query zoxide for directory completions matching `term`.
+    /// Results are cached — only re-queries when the term changes.
+    fn update_zoxide(&mut self, term: &str) {
+        if term == self.zoxide_last_query {
+            return;
+        }
+        self.zoxide_last_query = term.to_string();
+        if term.is_empty() {
+            self.zoxide_results.clear();
+            return;
+        }
+        let output = std::process::Command::new("zoxide")
+            .args(["query", "-l", term])
+            .output();
+        match output {
+            Ok(o) if o.status.success() => {
+                self.zoxide_results = String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .take(8)
+                    .map(|s| s.to_string())
+                    .collect();
+            }
+            _ => {
+                self.zoxide_results.clear();
+            }
+        }
+    }
+
     fn restore_focus(&mut self) {
         #[cfg(target_os = "macos")]
         if let Some(app) = self.prev_app.take() {
@@ -810,6 +850,8 @@ impl RofiApp {
         self.had_keyboard_focus_ever = false;
         self.toast = None;
         self.last_scroll_to = usize::MAX;
+        self.zoxide_results.clear();
+        self.zoxide_last_query.clear();
         // Request scroll reset so the next open starts at the top.
         self.request_scroll_reset();
         // If we were in themes mode and the user cancelled, restore original theme.
@@ -895,6 +937,7 @@ impl RofiApp {
                 let mode_glyph: Option<&str> = match self.mode {
                     Mode::Apps => Some("\u{F0E7}"),      // nf-fa-bolt
                     Mode::Clipboard => Some("\u{F0C6}"), // nf-fa-paperclip
+                    Mode::Files => Some("\u{F07B}"),     // nf-fa-folder
                     _ => None,                           // Pass: use per-item glyph
                 };
                 if let Some(&item_idx) = self.filtered.get(self.selected) {
@@ -912,6 +955,7 @@ impl RofiApp {
                         Mode::Apps => "Apps",
                         Mode::Clipboard => "Clipboard",
                         Mode::Pass => "Pass",
+                        Mode::Files => "Files",
                         _ => "mofi",
                     };
                     (
@@ -1097,6 +1141,10 @@ impl RofiApp {
                             #[cfg(target_os = "linux")]
                             self.preload_clipboard_textures(ctx);
                         }
+                        Some("files") => {
+                            self.mode = Mode::Files;
+                            self.file_pane.scan();
+                        }
                         _ => {
                             self.mode = Mode::Apps;
                         }
@@ -1126,6 +1174,10 @@ impl RofiApp {
                         self.sync_clipboard();
                         #[cfg(target_os = "linux")]
                         self.preload_clipboard_textures(ctx);
+                    }
+                    Some("files") => {
+                        self.mode = Mode::Files;
+                        self.file_pane.scan();
                     }
                     _ => {
                         self.mode = Mode::Apps;
@@ -1241,6 +1293,9 @@ impl RofiApp {
         // them.  We count repeats so holding the key moves multiple rows.
         let mut ctrl_j_count: usize = 0;
         let mut ctrl_k_count: usize = 0;
+        // In Files mode, Ctrl+H/L switch panes.
+        let mut ctrl_h_pressed = false;
+        let mut ctrl_l_pressed = false;
         ctx.input_mut(|i| {
             i.events.retain(|ev| {
                 if let egui::Event::Key {
@@ -1258,6 +1313,14 @@ impl RofiApp {
                         if *key == Key::K {
                             ctrl_k_count += 1;
                             return false; // consume
+                        }
+                        if *key == Key::H {
+                            ctrl_h_pressed = true;
+                            return false;
+                        }
+                        if *key == Key::L {
+                            ctrl_l_pressed = true;
+                            return false;
                         }
                     }
                 }
@@ -1302,6 +1365,7 @@ impl RofiApp {
                                 (Mode::Apps, "Apps"),
                                 (Mode::Clipboard, "Clipboard"),
                                 (Mode::Pass, "Pass"),
+                                (Mode::Files, "Files"),
                                 (Mode::Themes, "Themes"),
                                 (Mode::About, "About"),
                             ];
@@ -1371,6 +1435,7 @@ impl RofiApp {
                             Mode::Apps => "Search apps…",
                             Mode::Clipboard => "Filter clipboard…",
                             Mode::Pass => "Search passwords…",
+                            Mode::Files => "Filter files…",
                             Mode::Input => "Filter…",
                             Mode::Themes => "Filter themes…",
                             Mode::About => "",
@@ -1399,7 +1464,8 @@ impl RofiApp {
                             let next = match self.mode {
                                 Mode::Apps => Mode::Clipboard,
                                 Mode::Clipboard => Mode::Pass,
-                                Mode::Pass => Mode::Themes,
+                                Mode::Pass => Mode::Files,
+                                Mode::Files => Mode::Themes,
                                 Mode::Themes => Mode::About,
                                 Mode::About => Mode::Apps,
                                 Mode::Input => Mode::Input,
@@ -1409,6 +1475,8 @@ impl RofiApp {
                             } else {
                                 self.mode = next;
                                 self.query.clear();
+                                self.zoxide_results.clear();
+                                self.zoxide_last_query.clear();
                                 if self.mode == Mode::Clipboard {
                                     self.sync_clipboard();
                                     #[cfg(target_os = "linux")]
@@ -1434,7 +1502,7 @@ impl RofiApp {
                                     self.preview_theme_at_selection();
                                 }
                             }
-                        } else {
+                        } else if self.mode != Mode::Files {
                             let show_shell_row =
                                 self.mode == Mode::Apps && self.query.trim().starts_with('!');
                             let len = self.filtered.len() + if show_shell_row { 1 } else { 0 };
@@ -1447,10 +1515,93 @@ impl RofiApp {
                             }
                         }
 
-                        if enter {
+                        if enter && self.mode != Mode::Files {
                             self.execute_selected();
                             return;
                         }
+
+                        // ── Files mode keyboard ───────────────────
+                        if self.mode == Mode::Files {
+                            // Build filtered index list so navigation respects the query.
+                            let q = self.query.to_lowercase();
+                            let file_filtered: Vec<usize> = self
+                                .file_pane
+                                .entries
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, e)| q.is_empty() || e.name.to_lowercase().contains(&q))
+                                .map(|(i, _)| i)
+                                .collect();
+
+                            // Combined row count: filtered file entries first,
+                            // then zoxide results (only when query is non-empty) at the bottom.
+                            let zoxide_count = if q.is_empty() {
+                                0
+                            } else {
+                                self.zoxide_results.len()
+                            };
+                            let total = file_filtered.len() + zoxide_count;
+
+                            // Clamp selection to combined list.
+                            if total > 0 && self.selected >= total {
+                                self.selected = 0;
+                            }
+
+                            // Ctrl+H → go up to parent
+                            if ctrl_h_pressed {
+                                self.file_pane.go_up();
+                                self.query.clear();
+                                self.zoxide_results.clear();
+                                self.zoxide_last_query.clear();
+                                self.selected = 0;
+                            }
+                            // Ctrl+L or Enter → enter dir / open file / jump to zoxide dir
+                            if ctrl_l_pressed || enter {
+                                if self.selected >= file_filtered.len() && zoxide_count > 0 {
+                                    // Zoxide row selected — navigate to that directory
+                                    let zi = self.selected - file_filtered.len();
+                                    let dir = self.zoxide_results[zi].clone();
+                                    let path = std::path::PathBuf::from(&dir);
+                                    if path.is_dir() {
+                                        self.file_pane = crate::files::Pane::new(&path);
+                                        self.file_pane.scan();
+                                    }
+                                    self.query.clear();
+                                    self.zoxide_results.clear();
+                                    self.zoxide_last_query.clear();
+                                    self.selected = 0;
+                                } else {
+                                    // File entry selected
+                                    if let Some(&entry_idx) = file_filtered.get(self.selected) {
+                                        self.file_pane.selected = entry_idx;
+                                        use crate::files::EnterAction;
+                                        match self.file_pane.enter_selected() {
+                                            Some(EnterAction::NavigatedDir) => {
+                                                self.query.clear();
+                                                self.zoxide_results.clear();
+                                                self.zoxide_last_query.clear();
+                                                self.selected = 0;
+                                            }
+                                            Some(EnterAction::OpenFile(path)) => {
+                                                crate::files::open_file(&path);
+                                                self.should_close = true;
+                                                self.oneshot_result = Some(None);
+                                                return;
+                                            }
+                                            None => {}
+                                        }
+                                    }
+                                }
+                            }
+                            // Navigate within combined list
+                            if down && total > 0 {
+                                self.selected = (self.selected + down_count).min(total - 1);
+                            }
+                            if up && total > 0 {
+                                self.selected = self.selected.saturating_sub(up_count);
+                            }
+                        }
+
                         if response.changed() {
                             if self.mode == Mode::Input || self.mode == Mode::Themes {
                                 self.refilter_input();
@@ -1459,6 +1610,9 @@ impl RofiApp {
                                 }
                             } else {
                                 self.refilter(true);
+                            }
+                            if self.mode == Mode::Files {
+                                self.update_zoxide(&self.query.clone());
                             }
                         }
 
@@ -1607,6 +1761,253 @@ impl RofiApp {
                                         self.execute_selected();
                                         return;
                                     }
+                                }
+                            });
+                        } else if self.mode == Mode::Files {
+                            // ── Single-pane file explorer ─────────────
+                            use crate::files::{format_size, format_time, glyph_for_file};
+
+                            // Snapshot the data we need so the scroll closure doesn't
+                            // borrow self.file_pane (which would conflict with
+                            // self.load_image_texture).
+                            let q = self.query.to_lowercase();
+                            let cwd_display = self.file_pane.cwd.to_string_lossy().to_string();
+
+                            // Zoxide rows (only when query is non-empty)
+                            let zoxide_rows: Vec<String> = if q.is_empty() {
+                                Vec::new()
+                            } else {
+                                self.zoxide_results.clone()
+                            };
+                            let zoxide_count = zoxide_rows.len();
+
+                            struct RowData {
+                                name: String,
+                                is_dir: bool,
+                                size: u64,
+                                modified: i64,
+                                owner: String,
+                                glyph: &'static str,
+                            }
+
+                            let file_rows: Vec<RowData> = self
+                                .file_pane
+                                .entries
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, e)| q.is_empty() || e.name.to_lowercase().contains(&q))
+                                .map(|(_, e)| RowData {
+                                    name: e.name.clone(),
+                                    is_dir: e.is_dir,
+                                    size: e.size,
+                                    modified: e.modified,
+                                    owner: e.owner.clone(),
+                                    glyph: glyph_for_file(e),
+                                })
+                                .collect();
+
+                            let selected = self.selected;
+
+                            // Path header
+                            let avail_w = ui.available_width();
+                            let max_chars = (avail_w / 7.5) as usize;
+                            let short_path = if cwd_display.len() > max_chars {
+                                format!("…{}", &cwd_display[cwd_display.len() - (max_chars - 1)..])
+                            } else {
+                                cwd_display
+                            };
+                            ui.label(
+                                egui::RichText::new(&short_path)
+                                    .font(FontId::new(12.0, FontFamily::Monospace))
+                                    .color(t.accent),
+                            );
+                            ui.add_space(2.0);
+                            let sep_x = ui.cursor().left()..=ui.cursor().left() + avail_w;
+                            ui.painter().hline(
+                                sep_x,
+                                ui.cursor().top(),
+                                Stroke::new(0.5, t.separator),
+                            );
+                            ui.add_space(2.0);
+
+                            // Scrollable file list
+                            let scroll = egui::ScrollArea::vertical()
+                                .id_source(("mofi_files", self.scroll_generation))
+                                .max_height(max_list_height);
+                            scroll.show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                let total = file_rows.len() + zoxide_count;
+                                if total == 0 {
+                                    ui.add_space(20.0);
+                                    ui.centered_and_justified(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("Empty")
+                                                .font(FontId::new(15.0, FontFamily::Monospace))
+                                                .color(t.fg_muted),
+                                        );
+                                    });
+                                    return;
+                                }
+                                let row_h = ROW_HEIGHT;
+                                let aw = ui.available_width();
+
+                                // ── File entry rows ────────────────────
+                                for (fi, row) in file_rows.iter().enumerate() {
+                                    let sel = selected == fi;
+                                    let (rr, _) = ui.allocate_exact_size(
+                                        Vec2::new(aw, row_h),
+                                        egui::Sense::hover(),
+                                    );
+
+                                    if sel {
+                                        ui.scroll_to_rect(rr, None);
+                                        ui.painter().rect_filled(rr, Rounding::ZERO, t.row_sel);
+                                    }
+
+                                    let glyph_color =
+                                        if row.is_dir { t.accent } else { t.fg_muted };
+                                    let gc = if sel {
+                                        glyph_color
+                                    } else {
+                                        dim_color(glyph_color)
+                                    };
+
+                                    let ix = rr.left() + 4.0;
+
+                                    // Glyph icon
+                                    ui.painter().text(
+                                        egui::pos2(ix + ICON_SIZE * 0.5, rr.center().y),
+                                        egui::Align2::CENTER_CENTER,
+                                        row.glyph,
+                                        FontId::new(16.0, FontFamily::Monospace),
+                                        gc,
+                                    );
+
+                                    // Name
+                                    let name_x = ix + ICON_SIZE + 8.0;
+                                    let name_color = if sel { t.fg } else { t.fg_dim };
+                                    ui.painter().text(
+                                        egui::pos2(name_x, rr.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        &row.name,
+                                        FontId::new(14.0, FontFamily::Monospace),
+                                        name_color,
+                                    );
+
+                                    // Right-aligned metadata: owner  date  size
+                                    let meta_font = FontId::new(11.0, FontFamily::Monospace);
+                                    let size_color = t.accent;
+                                    let date_color = t.accent2;
+                                    let owner_color = t.fg_muted;
+                                    let dim = |c: egui::Color32| -> egui::Color32 {
+                                        egui::Color32::from_rgba_premultiplied(
+                                            (c.r() as u16 * 2 / 3) as u8,
+                                            (c.g() as u16 * 2 / 3) as u8,
+                                            (c.b() as u16 * 2 / 3) as u8,
+                                            c.a(),
+                                        )
+                                    };
+                                    let mut rx = rr.right() - 8.0;
+
+                                    // Size (right-most)
+                                    let size_col = 56.0;
+                                    if !row.is_dir {
+                                        let size_str = format_size(row.size);
+                                        ui.painter().text(
+                                            egui::pos2(rx, rr.center().y),
+                                            egui::Align2::RIGHT_CENTER,
+                                            &size_str,
+                                            meta_font.clone(),
+                                            if sel { size_color } else { dim(size_color) },
+                                        );
+                                    }
+                                    rx -= size_col;
+
+                                    // Date
+                                    let date_str = format_time(row.modified);
+                                    ui.painter().text(
+                                        egui::pos2(rx, rr.center().y),
+                                        egui::Align2::RIGHT_CENTER,
+                                        &date_str,
+                                        meta_font.clone(),
+                                        if sel { date_color } else { dim(date_color) },
+                                    );
+                                    rx -= 100.0;
+
+                                    // Owner
+                                    ui.painter().text(
+                                        egui::pos2(rx, rr.center().y),
+                                        egui::Align2::RIGHT_CENTER,
+                                        &row.owner,
+                                        meta_font,
+                                        if sel { owner_color } else { dim(owner_color) },
+                                    );
+                                }
+
+                                // ── Separator between file entries and zoxide ──
+                                if !zoxide_rows.is_empty() && !file_rows.is_empty() {
+                                    ui.add_space(2.0);
+                                    let sep_x = ui.cursor().left()..=ui.cursor().left() + aw;
+                                    ui.painter().hline(
+                                        sep_x,
+                                        ui.cursor().top(),
+                                        Stroke::new(0.5, t.separator),
+                                    );
+                                    ui.add_space(2.0);
+                                }
+
+                                // ── Zoxide "jump to" rows (at the bottom) ──
+                                let file_count = file_rows.len();
+                                for (zi, zpath) in zoxide_rows.iter().enumerate() {
+                                    let combined_idx = file_count + zi;
+                                    let sel = selected == combined_idx;
+                                    let (rr, _) = ui.allocate_exact_size(
+                                        Vec2::new(aw, row_h),
+                                        egui::Sense::hover(),
+                                    );
+
+                                    if sel {
+                                        ui.scroll_to_rect(rr, None);
+                                        ui.painter().rect_filled(rr, Rounding::ZERO, t.row_sel);
+                                    }
+
+                                    let ix = rr.left() + 4.0;
+
+                                    // Folder glyph in accent2 color
+                                    let gc = if sel { t.accent2 } else { dim_color(t.accent2) };
+                                    ui.painter().text(
+                                        egui::pos2(ix + ICON_SIZE * 0.5, rr.center().y),
+                                        egui::Align2::CENTER_CENTER,
+                                        "\u{f07c}", // nf-fa-folder_open
+                                        FontId::new(16.0, FontFamily::Monospace),
+                                        gc,
+                                    );
+
+                                    // Path label in accent2 color
+                                    let name_x = ix + ICON_SIZE + 8.0;
+                                    let name_color =
+                                        if sel { t.accent2 } else { dim_color(t.accent2) };
+                                    ui.painter().text(
+                                        egui::pos2(name_x, rr.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        zpath,
+                                        FontId::new(14.0, FontFamily::Monospace),
+                                        name_color,
+                                    );
+
+                                    // Right-aligned "z" hint
+                                    let hint_color = if sel {
+                                        t.fg_muted
+                                    } else {
+                                        dim_color(t.fg_muted)
+                                    };
+                                    ui.painter().text(
+                                        egui::pos2(rr.right() - 8.0, rr.center().y),
+                                        egui::Align2::RIGHT_CENTER,
+                                        "z",
+                                        FontId::new(11.0, FontFamily::Monospace),
+                                        hint_color,
+                                    );
                                 }
                             });
                         } else {

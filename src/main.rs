@@ -1,6 +1,7 @@
 mod apps;
 mod clipboard;
 mod config;
+mod files;
 mod frecency;
 mod launcher;
 mod pass;
@@ -51,6 +52,12 @@ fn main() {
             linux_client_main("clip");
             #[cfg(not(target_os = "linux"))]
             show_tab_main("clip");
+        }
+        "--files" => {
+            #[cfg(target_os = "linux")]
+            linux_client_main("files");
+            #[cfg(not(target_os = "linux"))]
+            show_tab_main("files");
         }
         "--pass" => {
             show_tab_main("pass");
@@ -594,6 +601,7 @@ WantedBy=graphical-session.target
     println!("    {} --client     (launcher)", bin_str);
     println!("    {} --password   (jump to Pass tab)", bin_str);
     println!("    {} --clipboard  (jump to Clipboard tab)", bin_str);
+    println!("    {} --files      (jump to Files tab)", bin_str);
     println!("  Examples:");
     println!(
         "    Hyprland  → bind = SUPER, Space, exec, {} --client",

@@ -824,14 +824,35 @@ impl KeyboardHandler for LayerState {
         if let Some(ref utf8) = utf8 {
             self.egui_input.events.push(egui::Event::Text(utf8.clone()));
         }
-        // Start key repeat tracking.
-        let now = std::time::Instant::now();
-        self.repeat_key = Some(RepeatState {
-            keysym: event.keysym,
-            pressed_at: now,
-            last_repeat: now,
-            utf8,
-        });
+        // Start key repeat tracking — only for navigation / modifier keys,
+        // NOT for plain text input (which would cause stuck-key rapid fire).
+        let should_repeat = self.modifiers.ctrl
+            || self.modifiers.alt
+            || matches!(
+                event.keysym,
+                Keysym::Up
+                    | Keysym::Down
+                    | Keysym::Left
+                    | Keysym::Right
+                    | Keysym::BackSpace
+                    | Keysym::Delete
+                    | Keysym::Tab
+                    | Keysym::Home
+                    | Keysym::End
+                    | Keysym::Page_Up
+                    | Keysym::Page_Down
+            );
+        if should_repeat {
+            let now = std::time::Instant::now();
+            self.repeat_key = Some(RepeatState {
+                keysym: event.keysym,
+                pressed_at: now,
+                last_repeat: now,
+                utf8,
+            });
+        } else {
+            self.repeat_key = None;
+        }
     }
 
     fn release_key(

@@ -10,7 +10,7 @@
 ```
 
 > A fast, keyboard-driven launcher built with Rust + egui.
-> App launcher · Clipboard history · Password Store integration · Shell commands · Theme picker · Pipe-select mode.
+> App launcher · Clipboard history · Password Store integration · File explorer · Shell commands · Theme picker · Pipe-select mode.
 >
 > Runs on **macOS** (eframe) and **Linux/Wayland** (zwlr-layer-shell).
 
@@ -27,6 +27,13 @@
   - Linux: polls `wl-paste`, pastes back via `wl-copy`. Supports **image clipboard** with thumbnail previews (80px-tall thumbnails generated at capture time)
   - Image entries are deduplicated by comparing actual PNG bytes
 - **Pass integration** — browse and copy passwords from your `~/.password-store` via [`pass`](https://www.passwordstore.org/). Copied passwords are **auto-cleared from the clipboard after 45 seconds**
+- **File explorer** — single-pane, keyboard-driven file browser with mc-style navigation
+  - Sorted by modification time (newest first), directories grouped before files
+  - File metadata: owner, date, size — each in a distinct accent colour
+  - Nerd Font glyphs per file type (images, code, archives, audio, video, documents, etc.)
+  - **Zoxide integration** — type a query to see [zoxide](https://github.com/ajeetdsouza/zoxide) directory matches at the bottom of the list (shown in a distinct colour). Press Enter on a zoxide result to jump directly to that directory
+  - `Ctrl+H` — navigate to parent directory
+  - `Ctrl+L` / `Enter` — enter directory or open file (via `xdg-open`)
 - **Theme picker** — 10 built-in themes with live preview; switch instantly from the Themes tab or `mofi --themes`
 - **Pipe-select mode** — `mofi --input` reads lines from stdin, presents them as a fuzzy-searchable list, and prints the selected line to stdout (exit 0) or exits 1 on cancel
 - **Maple Mono NF** — Nerd Font glyphs for every icon, no image loading
@@ -72,14 +79,16 @@ brew install skhd pass pinentry-mac
 | `wl-clipboard` (`wl-copy`, `wl-paste`) | Clipboard read/write |
 | `gtk-launch` | Launching `.desktop` applications |
 | [pass](https://www.passwordstore.org/) | Password store (optional) |
+| [zoxide](https://github.com/ajeetdsouza/zoxide) | Smart directory jumper for Files tab (optional) |
 | Maple Mono NF | Font — install system-wide or in `~/.local/share/fonts/` |
 
 ```bash
 # Arch
-pacman -S wl-clipboard pass
+pacman -S wl-clipboard pass zoxide
 
 # Debian/Ubuntu
 apt install wl-clipboard pass
+# zoxide: see https://github.com/ajeetdsouza/zoxide#installation
 ```
 
 **Environment variable:** set `MOFI_SCALE` to match your display scale factor (e.g. `MOFI_SCALE=1.5` for 150% HiDPI).
@@ -220,8 +229,9 @@ For Sway, add equivalent `bindsym` entries to `~/.config/sway/config`.
 | `Cmd+Space` / `Super+Space` | Open mofi on Apps tab |
 | `Cmd+Shift+P` / `Super+Shift+P` | Open mofi on Pass tab |
 | `Cmd+Shift+Y` / `Super+Shift+Y` | Open mofi on Clipboard tab |
+| `Cmd+Shift+F` / `Super+Shift+F` | Open mofi on Files tab |
 | `Escape` | Close / dismiss |
-| `Tab` | Cycle tabs: Apps → Clipboard → Pass → Themes → About |
+| `Tab` | Cycle tabs: Apps → Clipboard → Pass → Files → Themes → About |
 | `↓` / `Ctrl+J` | Move selection down |
 | `↑` / `Ctrl+K` | Move selection up |
 | `Enter` | Launch / copy / confirm selected item |
@@ -232,6 +242,14 @@ For Sway, add equivalent `bindsym` entries to `~/.config/sway/config`.
 |--------|-----------|
 | *(none)* | Fuzzy-search installed applications |
 | `!` | Shell command — e.g. `!killall waybar` shows a "Run: killall waybar" row; Enter executes it |
+
+### Files tab keybindings
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+H` | Navigate to parent directory |
+| `Ctrl+L` / `Enter` | Enter directory or open file |
+| Type any text | Filter current directory entries + show zoxide matches at bottom |
 
 ---
 
@@ -281,6 +299,7 @@ mofi --daemon     persistent egui window (hidden by default)
 mofi --client     toggle show/hide on Apps tab
 mofi --pass       show mofi on the Pass tab
 mofi --clip       show mofi on the Clipboard tab
+mofi --files      show mofi on the Files tab
 mofi --input      pipe-select: reads stdin, sends items to daemon, prints selection
 mofi --themes     theme picker with live preview
 mofi --install    (macOS only) install plist, skhd hotkeys, create config
