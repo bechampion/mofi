@@ -684,10 +684,12 @@ impl eframe::App for RofiApp {
         // Consume Ctrl+H / Ctrl+L for Files mode navigation (go up / enter dir).
         let ctrl_h_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::H));
         let ctrl_l_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::L));
-        // In Files mode consume Tab before TextEdit so it doesn't shift focus.
+        // Shift+Tab cycles modes (works in all modes including Files).
+        let shift_tab = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, Key::Tab));
+        // In Files mode consume bare Tab before TextEdit so it doesn't shift focus.
         let files_tab_consumed = self.mode == Mode::Files
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Tab));
-        let _ = files_tab_consumed; // Tab handled in Files keyboard block below
+        let _ = files_tab_consumed; // bare Tab handled in Files keyboard block below
 
         // Approximate repeat counts from consecutive key presses this frame.
         let down_count = 1usize;
@@ -786,24 +788,55 @@ impl eframe::App for RofiApp {
                         ui.add_space(10.0);
 
                         // ── Search bar ────────────────────────────────────
-                        let hint = match self.mode {
-                            Mode::Apps      => "Search apps…",
-                            Mode::Clipboard => "Filter clipboard…",
-                            Mode::Pass      => "Search passwords…",
-                            Mode::Input     => "Filter…",
-                            Mode::Themes    => "Filter themes…",
-                            Mode::Files     => "Filter files…",
-                            Mode::About     => "",
+                        // In Files drill mode we show only the filter suffix (after the
+                        // locked drill-target prefix) so the input box stays clean.
+                        let drill_prefix_len = self.drill_target.as_ref()
+                            .map(|dt| dt.len() + 1) // +1 for the trailing '/'
+                            .unwrap_or(0);
+                        let mut edit_str: String = if drill_prefix_len > 0 && self.mode == Mode::Files {
+                            self.query[drill_prefix_len.min(self.query.len())..].to_string()
+                        } else {
+                            self.query.clone()
+                        };
+
+                        let hint = if self.mode == Mode::Files {
+                            if let Some(ref dt) = self.drill_target {
+                                let basename = std::path::Path::new(dt)
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or(dt.as_str());
+                                format!("Filter {}…", basename)
+                            } else {
+                                "Filter files…".to_string()
+                            }
+                        } else {
+                            match self.mode {
+                                Mode::Apps      => "Search apps…".to_string(),
+                                Mode::Clipboard => "Filter clipboard…".to_string(),
+                                Mode::Pass      => "Search passwords…".to_string(),
+                                Mode::Input     => "Filter…".to_string(),
+                                Mode::Themes    => "Filter themes…".to_string(),
+                                Mode::About     => "".to_string(),
+                                Mode::Files     => unreachable!(),
+                            }
                         };
 
                         let response = ui.add(
-                            egui::TextEdit::singleline(&mut self.query)
+                            egui::TextEdit::singleline(&mut edit_str)
                                 .hint_text(egui::RichText::new(hint).color(t.fg_muted))
                                 .font(FontId::new(15.0, FontFamily::Monospace))
                                 .text_color(t.fg)
                                 .frame(false)
                                 .desired_width(f32::INFINITY),
                         );
+                        // Sync edit_str back to self.query (prepend drill prefix if active).
+                        if drill_prefix_len > 0 && self.mode == Mode::Files {
+                            if let Some(ref dt) = self.drill_target {
+                                self.query = format!("{}/{}", dt, edit_str);
+                            }
+                        } else {
+                            self.query = edit_str;
+                        }
                         response.request_focus();
 
                         let down  = ctx.input(|i| i.key_pressed(Key::ArrowDown)) || ctrl_j;
@@ -811,7 +844,11 @@ impl eframe::App for RofiApp {
                         let tab   = ctx.input(|i| i.key_pressed(Key::Tab));
                         let enter = ctx.input(|i| i.key_pressed(Key::Enter));
 
-                        if tab && self.mode != Mode::Input && self.mode != Mode::Files {
+                        // Tab cycles forward (not in Input or Files — Files uses Tab for drill).
+                        // Shift+Tab cycles forward too (works in all modes including Files).
+                        let cycle_forward  = (tab && self.mode != Mode::Input && self.mode != Mode::Files)
+                                          || (shift_tab && self.mode != Mode::Input);
+                        if cycle_forward {
                             let next = match self.mode {
                                 Mode::Apps      => Mode::Clipboard,
                                 Mode::Clipboard => Mode::Pass,
@@ -872,8 +909,10 @@ impl eframe::App for RofiApp {
                                 self.drill_target = Some(zpath.clone());
                                 self.query = format!("{}/", zpath);
                                 self.selected = 0;
+                                // The TextEdit now only shows the suffix after the drill prefix,
+                                // so place the cursor at position 0 (start of the empty suffix).
                                 if let Some(mut state) = egui::TextEdit::load_state(ctx, response.id) {
-                                    let ccursor = egui::text::CCursor::new(self.query.len());
+                                    let ccursor = egui::text::CCursor::new(0);
                                     state.cursor.set_char_range(Some(egui::text::CCursorRange::one(ccursor)));
                                     state.store(ctx, response.id);
                                 }
@@ -1183,12 +1222,10 @@ impl eframe::App for RofiApp {
 
                             let zoxide_count = zoxide_rows.len();
                             let selected = self.selected;
-                            let breadcrumb_h = 34.0_f32;
-                            let file_list_height = max_list_height - breadcrumb_h;
 
                             egui::ScrollArea::vertical()
                                 .id_source("mofi_files")
-                                .max_height(file_list_height)
+                                .max_height(max_list_height)
                                 .show(ui, |ui| {
                                     ui.set_min_width(ui.available_width());
                                     let total = file_rows.len() + zoxide_count;
@@ -1355,17 +1392,18 @@ impl eframe::App for RofiApp {
                                     }
                                 });
 
-                            // ── Rainbow path bar (pinned to bottom) ──────
-                            let outer = ui.max_rect();
-                            let bar_y = outer.bottom() - 6.0;
-                            let bar_left = outer.left() + 8.0;
-                            let bar_right = outer.right() - 8.0;
-
+                            // ── Rainbow path bar (below scroll area) ──────
+                            ui.add_space(4.0);
                             ui.painter().hline(
-                                outer.left()..=outer.right(),
-                                bar_y - 14.0,
+                                ui.max_rect().x_range(),
+                                ui.cursor().top(),
                                 Stroke::new(0.5, t.separator),
                             );
+                            ui.add_space(4.0);
+
+                            let bar_left = ui.cursor().left();
+                            let bar_right = ui.max_rect().right() - 8.0;
+                            let bar_y = ui.cursor().top() + 8.0;
 
                             let breadcrumb_path: String;
                             if let Some(ref dp) = drill_path_for_breadcrumb {
