@@ -461,6 +461,10 @@ pub struct RofiApp {
     zoxide_results: Vec<String>,
     /// The query term that produced the current zoxide_results.
     zoxide_last_query: String,
+    /// When the user presses space while focused on a zoxide row, this locks
+    /// the zoxide path so children can be drilled into.  Cleared on hide,
+    /// tab-switch, Ctrl+H, or when the query no longer contains a space.
+    drill_target: Option<String>,
 }
 
 impl RofiApp {
@@ -620,6 +624,7 @@ impl RofiApp {
             ),
             zoxide_results: Vec::new(),
             zoxide_last_query: String::new(),
+            drill_target: None,
         };
         app.refilter(true);
         app
@@ -852,6 +857,7 @@ impl RofiApp {
         self.last_scroll_to = usize::MAX;
         self.zoxide_results.clear();
         self.zoxide_last_query.clear();
+        self.drill_target = None;
         // Request scroll reset so the next open starts at the top.
         self.request_scroll_reset();
         // If we were in themes mode and the user cancelled, restore original theme.
@@ -1094,7 +1100,7 @@ impl RofiApp {
                 #[cfg(target_os = "macos")]
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 #[cfg(not(target_os = "macos"))]
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(810.0, 550.0)));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1280.0, 550.0)));
                 #[cfg(target_os = "macos")]
                 {
                     self.prev_app = capture_previous_app();
@@ -1477,6 +1483,7 @@ impl RofiApp {
                                 self.query.clear();
                                 self.zoxide_results.clear();
                                 self.zoxide_last_query.clear();
+                                self.drill_target = None;
                                 if self.mode == Mode::Clipboard {
                                     self.sync_clipboard();
                                     #[cfg(target_os = "linux")]
@@ -1524,55 +1531,169 @@ impl RofiApp {
                         if self.mode == Mode::Files {
                             // Build filtered index list so navigation respects the query.
                             let q = self.query.to_lowercase();
-                            let file_filtered: Vec<usize> = self
-                                .file_pane
-                                .entries
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, e)| q.is_empty() || e.name.to_lowercase().contains(&q))
-                                .map(|(i, _)| i)
-                                .collect();
+                            let q_tokens: Vec<&str> = q.split_whitespace().collect();
+                            let has_space = q.contains(' ');
 
-                            // Combined row count: filtered file entries first,
-                            // then zoxide results (only when query is non-empty) at the bottom.
-                            let zoxide_count = if q.is_empty() {
-                                0
-                            } else {
-                                self.zoxide_results.len()
-                            };
-                            let total = file_filtered.len() + zoxide_count;
-
-                            // Clamp selection to combined list.
-                            if total > 0 && self.selected >= total {
-                                self.selected = 0;
+                            // ── Drill-target management ──
+                            // When the user types a space while focused on a
+                            // zoxide row, lock that path as the drill target.
+                            // When the space is deleted, release it.
+                            if !has_space {
+                                self.drill_target = None;
+                            }
+                            // Set drill target on first space if currently on a zoxide row
+                            if has_space && self.drill_target.is_none() {
+                                let zc = if q_tokens.is_empty() {
+                                    0
+                                } else {
+                                    self.zoxide_results.len()
+                                };
+                                if self.selected < zc {
+                                    self.drill_target =
+                                        Some(self.zoxide_results[self.selected].clone());
+                                    // Jump selection to first child (index 1;
+                                    // index 0 is the locked zoxide row).
+                                    self.selected = 1;
+                                }
                             }
 
-                            // Ctrl+H → go up to parent
-                            if ctrl_h_pressed {
-                                self.file_pane.go_up();
-                                self.query.clear();
-                                self.zoxide_results.clear();
-                                self.zoxide_last_query.clear();
-                                self.selected = 0;
-                            }
-                            // Ctrl+L or Enter → enter dir / open file / jump to zoxide dir
-                            if ctrl_l_pressed || enter {
-                                if self.selected >= file_filtered.len() && zoxide_count > 0 {
-                                    // Zoxide row selected — navigate to that directory
-                                    let zi = self.selected - file_filtered.len();
-                                    let dir = self.zoxide_results[zi].clone();
-                                    let path = std::path::PathBuf::from(&dir);
-                                    if path.is_dir() {
-                                        self.file_pane = crate::files::Pane::new(&path);
-                                        self.file_pane.scan();
-                                    }
+                            let drill_mode = self.drill_target.is_some();
+
+                            if drill_mode {
+                                // ── DRILL MODE ──
+                                // Child tokens = everything after the first space.
+                                let child_tokens: Vec<&str> = if q_tokens.len() >= 2 {
+                                    q_tokens[1..].to_vec()
+                                } else {
+                                    Vec::new()
+                                };
+                                let drill_path = self.drill_target.clone().unwrap();
+                                let drill_children: Vec<crate::files::FileEntry> =
+                                    crate::files::dir_children(
+                                        &std::path::PathBuf::from(&drill_path),
+                                        &child_tokens.iter().copied().collect::<Vec<_>>(),
+                                    );
+                                // Virtual list: row 0 = locked zoxide path,
+                                // rows 1..N = children.
+                                let total = 1 + drill_children.len();
+
+                                // Clamp selection (keep >=1 so we stay on children
+                                // after the initial switch, but allow 0 to re-focus
+                                // the parent row).
+                                if self.selected >= total {
+                                    self.selected = if total > 1 { 1 } else { 0 };
+                                }
+
+                                // Ctrl+H → exit drill mode, go up
+                                if ctrl_h_pressed {
+                                    self.drill_target = None;
+                                    self.file_pane.go_up();
                                     self.query.clear();
                                     self.zoxide_results.clear();
                                     self.zoxide_last_query.clear();
                                     self.selected = 0;
+                                }
+
+                                // Enter / Ctrl+L
+                                if ctrl_l_pressed || enter {
+                                    if self.selected == 0 {
+                                        // Enter on the drill target itself → navigate into it
+                                        let path = std::path::PathBuf::from(&drill_path);
+                                        if path.is_dir() {
+                                            self.file_pane = crate::files::Pane::new(&path);
+                                            self.file_pane.scan();
+                                        }
+                                        self.query.clear();
+                                        self.zoxide_results.clear();
+                                        self.zoxide_last_query.clear();
+                                        self.drill_target = None;
+                                        self.selected = 0;
+                                    } else {
+                                        let ci = self.selected - 1;
+                                        if let Some(de) = drill_children.get(ci) {
+                                            if de.is_dir {
+                                                let p = de.path.clone();
+                                                self.file_pane = crate::files::Pane::new(&p);
+                                                self.file_pane.scan();
+                                                self.query.clear();
+                                                self.zoxide_results.clear();
+                                                self.zoxide_last_query.clear();
+                                                self.drill_target = None;
+                                                self.selected = 0;
+                                            } else {
+                                                crate::files::open_file(&de.path);
+                                                self.should_close = true;
+                                                self.oneshot_result = Some(None);
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Navigate
+                                if down && total > 0 {
+                                    self.selected = (self.selected + down_count).min(total - 1);
+                                }
+                                if up && total > 0 {
+                                    self.selected = self.selected.saturating_sub(up_count);
+                                }
+                            } else {
+                                // ── NORMAL MODE (no drill) ──
+
+                                let file_filtered: Vec<usize> = self
+                                    .file_pane
+                                    .entries
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, e)| {
+                                        if q_tokens.is_empty() {
+                                            return true;
+                                        }
+                                        let haystack = e.path.to_string_lossy().to_lowercase();
+                                        q_tokens.iter().all(|tok| haystack.contains(tok))
+                                    })
+                                    .map(|(i, _)| i)
+                                    .collect();
+
+                                let zoxide_count = if q.is_empty() {
+                                    0
                                 } else {
-                                    // File entry selected
-                                    if let Some(&entry_idx) = file_filtered.get(self.selected) {
+                                    self.zoxide_results.len()
+                                };
+                                let total = file_filtered.len() + zoxide_count;
+
+                                if total > 0 && self.selected >= total {
+                                    self.selected = 0;
+                                }
+
+                                // Ctrl+H → go up to parent
+                                if ctrl_h_pressed {
+                                    self.file_pane.go_up();
+                                    self.query.clear();
+                                    self.zoxide_results.clear();
+                                    self.zoxide_last_query.clear();
+                                    self.drill_target = None;
+                                    self.selected = 0;
+                                }
+                                // Ctrl+L or Enter
+                                if ctrl_l_pressed || enter {
+                                    if self.selected < zoxide_count {
+                                        // Zoxide row selected — navigate to that directory
+                                        let dir = self.zoxide_results[self.selected].clone();
+                                        let path = std::path::PathBuf::from(&dir);
+                                        if path.is_dir() {
+                                            self.file_pane = crate::files::Pane::new(&path);
+                                            self.file_pane.scan();
+                                        }
+                                        self.query.clear();
+                                        self.zoxide_results.clear();
+                                        self.zoxide_last_query.clear();
+                                        self.drill_target = None;
+                                        self.selected = 0;
+                                    } else if let Some(&entry_idx) =
+                                        file_filtered.get(self.selected - zoxide_count)
+                                    {
+                                        // Normal pane entry
                                         self.file_pane.selected = entry_idx;
                                         use crate::files::EnterAction;
                                         match self.file_pane.enter_selected() {
@@ -1580,6 +1701,7 @@ impl RofiApp {
                                                 self.query.clear();
                                                 self.zoxide_results.clear();
                                                 self.zoxide_last_query.clear();
+                                                self.drill_target = None;
                                                 self.selected = 0;
                                             }
                                             Some(EnterAction::OpenFile(path)) => {
@@ -1592,13 +1714,13 @@ impl RofiApp {
                                         }
                                     }
                                 }
-                            }
-                            // Navigate within combined list
-                            if down && total > 0 {
-                                self.selected = (self.selected + down_count).min(total - 1);
-                            }
-                            if up && total > 0 {
-                                self.selected = self.selected.saturating_sub(up_count);
+                                // Navigate within combined list
+                                if down && total > 0 {
+                                    self.selected = (self.selected + down_count).min(total - 1);
+                                }
+                                if up && total > 0 {
+                                    self.selected = self.selected.saturating_sub(up_count);
+                                }
                             }
                         }
 
@@ -1630,7 +1752,8 @@ impl RofiApp {
                         ui.add_space(6.0);
 
                         // ── Panels ────────────────────────────────────────
-                        let max_list_height = ui.available_height();
+                        let breadcrumb_h = if self.mode == Mode::Files { 34.0 } else { 0.0 };
+                        let max_list_height = ui.available_height() - breadcrumb_h;
 
                         if self.mode == Mode::About {
                             ui.add_space(18.0);
@@ -1772,63 +1895,100 @@ impl RofiApp {
                             // self.load_image_texture).
                             let q = self.query.to_lowercase();
                             let cwd_display = self.file_pane.cwd.to_string_lossy().to_string();
+                            let q_tokens: Vec<&str> = q.split_whitespace().collect();
 
-                            // Zoxide rows (only when query is non-empty)
-                            let zoxide_rows: Vec<String> = if q.is_empty() {
-                                Vec::new()
-                            } else {
-                                self.zoxide_results.clone()
-                            };
-                            let zoxide_count = zoxide_rows.len();
+                            let drill_target = self.drill_target.clone();
+                            let drill_mode = drill_target.is_some();
 
                             struct RowData {
                                 name: String,
+                                path: String,
                                 is_dir: bool,
                                 size: u64,
                                 modified: i64,
                                 owner: String,
                                 glyph: &'static str,
+                                is_git: bool,
                             }
 
-                            let file_rows: Vec<RowData> = self
-                                .file_pane
-                                .entries
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, e)| q.is_empty() || e.name.to_lowercase().contains(&q))
-                                .map(|(_, e)| RowData {
-                                    name: e.name.clone(),
-                                    is_dir: e.is_dir,
-                                    size: e.size,
-                                    modified: e.modified,
-                                    owner: e.owner.clone(),
-                                    glyph: glyph_for_file(e),
-                                })
-                                .collect();
+                            // In drill mode we show: locked zoxide row (idx 0)
+                            // + children.  In normal mode: zoxide rows + file entries.
+                            let locked_zoxide: Option<String>;
+                            let zoxide_rows: Vec<String>;
+                            let file_rows: Vec<RowData>;
 
-                            let selected = self.selected;
+                            if drill_mode {
+                                let dt = drill_target.unwrap();
+                                locked_zoxide = Some(dt.clone());
+                                zoxide_rows = Vec::new(); // not shown in drill mode
 
-                            // Path header
-                            let avail_w = ui.available_width();
-                            let max_chars = (avail_w / 7.5) as usize;
-                            let short_path = if cwd_display.len() > max_chars {
-                                format!("…{}", &cwd_display[cwd_display.len() - (max_chars - 1)..])
+                                let child_tokens: Vec<&str> = if q_tokens.len() >= 2 {
+                                    q_tokens[1..].to_vec()
+                                } else {
+                                    Vec::new()
+                                };
+                                let children = crate::files::dir_children(
+                                    &std::path::PathBuf::from(&dt),
+                                    &child_tokens,
+                                );
+                                file_rows = children
+                                    .iter()
+                                    .map(|e| RowData {
+                                        name: e.name.clone(),
+                                        path: e.path.to_string_lossy().to_string(),
+                                        is_dir: e.is_dir,
+                                        size: e.size,
+                                        modified: e.modified,
+                                        owner: e.owner.clone(),
+                                        glyph: glyph_for_file(e),
+                                        is_git: e.source == crate::files::Source::Git,
+                                    })
+                                    .collect();
                             } else {
-                                cwd_display
-                            };
-                            ui.label(
-                                egui::RichText::new(&short_path)
-                                    .font(FontId::new(12.0, FontFamily::Monospace))
-                                    .color(t.accent),
-                            );
-                            ui.add_space(2.0);
-                            let sep_x = ui.cursor().left()..=ui.cursor().left() + avail_w;
-                            ui.painter().hline(
-                                sep_x,
-                                ui.cursor().top(),
-                                Stroke::new(0.5, t.separator),
-                            );
-                            ui.add_space(2.0);
+                                locked_zoxide = None;
+                                zoxide_rows = if q.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    self.zoxide_results.clone()
+                                };
+
+                                let file_filtered: Vec<usize> = self
+                                    .file_pane
+                                    .entries
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, e)| {
+                                        if q_tokens.is_empty() {
+                                            return true;
+                                        }
+                                        let haystack = e.path.to_string_lossy().to_lowercase();
+                                        q_tokens.iter().all(|tok| haystack.contains(tok))
+                                    })
+                                    .map(|(i, _)| i)
+                                    .collect();
+
+                                file_rows = file_filtered
+                                    .iter()
+                                    .map(|&i| {
+                                        let e = &self.file_pane.entries[i];
+                                        RowData {
+                                            name: e.name.clone(),
+                                            path: e.path.to_string_lossy().to_string(),
+                                            is_dir: e.is_dir,
+                                            size: e.size,
+                                            modified: e.modified,
+                                            owner: e.owner.clone(),
+                                            glyph: glyph_for_file(e),
+                                            is_git: e.source == crate::files::Source::Git,
+                                        }
+                                    })
+                                    .collect();
+                            }
+
+                            let zoxide_count = zoxide_rows.len();
+                            // In drill mode, row 0 = locked zoxide row, rest = children
+                            let drill_offset: usize = if locked_zoxide.is_some() { 1 } else { 0 };
+                            let selected = self.selected;
 
                             // Scrollable file list
                             let scroll = egui::ScrollArea::vertical()
@@ -1836,7 +1996,7 @@ impl RofiApp {
                                 .max_height(max_list_height);
                             scroll.show(ui, |ui| {
                                 ui.set_min_width(ui.available_width());
-                                let total = file_rows.len() + zoxide_count;
+                                let total = file_rows.len() + zoxide_count + drill_offset;
                                 if total == 0 {
                                     ui.add_space(20.0);
                                     ui.centered_and_justified(|ui| {
@@ -1851,9 +2011,105 @@ impl RofiApp {
                                 let row_h = ROW_HEIGHT;
                                 let aw = ui.available_width();
 
-                                // ── File entry rows ────────────────────
+                                // ── Locked zoxide row (drill mode only, always idx 0) ──
+                                if let Some(ref lz) = locked_zoxide {
+                                    let sel = selected == 0;
+                                    let (rr, _) = ui.allocate_exact_size(
+                                        Vec2::new(aw, row_h),
+                                        egui::Sense::hover(),
+                                    );
+                                    if sel {
+                                        ui.scroll_to_rect(rr, None);
+                                        ui.painter().rect_filled(rr, Rounding::ZERO, t.row_sel);
+                                    }
+                                    let ix = rr.left() + 4.0;
+                                    let gc = if sel { t.accent2 } else { dim_color(t.accent2) };
+                                    ui.painter().text(
+                                        egui::pos2(ix + ICON_SIZE * 0.5, rr.center().y),
+                                        egui::Align2::CENTER_CENTER,
+                                        "\u{F126D}", // nf-md-folder_marker
+                                        FontId::new(16.0, FontFamily::Monospace),
+                                        gc,
+                                    );
+                                    let name_x = ix + ICON_SIZE + 8.0;
+                                    let name_color =
+                                        if sel { t.accent2 } else { dim_color(t.accent2) };
+                                    ui.painter().text(
+                                        egui::pos2(name_x, rr.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        lz,
+                                        FontId::new(14.0, FontFamily::Monospace),
+                                        name_color,
+                                    );
+
+                                    // Separator after locked row
+                                    if !file_rows.is_empty() {
+                                        ui.add_space(2.0);
+                                        let sep_x = ui.cursor().left()..=ui.cursor().left() + aw;
+                                        ui.painter().hline(
+                                            sep_x,
+                                            ui.cursor().top(),
+                                            Stroke::new(0.5, t.separator),
+                                        );
+                                        ui.add_space(2.0);
+                                    }
+                                }
+
+                                // ── Zoxide "jump to" rows (normal mode only) ──
+                                for (zi, zpath) in zoxide_rows.iter().enumerate() {
+                                    let sel = selected == zi;
+                                    let (rr, _) = ui.allocate_exact_size(
+                                        Vec2::new(aw, row_h),
+                                        egui::Sense::hover(),
+                                    );
+
+                                    if sel {
+                                        ui.scroll_to_rect(rr, None);
+                                        ui.painter().rect_filled(rr, Rounding::ZERO, t.row_sel);
+                                    }
+
+                                    let ix = rr.left() + 4.0;
+
+                                    let gc = if sel { t.accent2 } else { dim_color(t.accent2) };
+                                    ui.painter().text(
+                                        egui::pos2(ix + ICON_SIZE * 0.5, rr.center().y),
+                                        egui::Align2::CENTER_CENTER,
+                                        "\u{F126D}", // nf-md-folder_marker
+                                        FontId::new(16.0, FontFamily::Monospace),
+                                        gc,
+                                    );
+
+                                    let name_x = ix + ICON_SIZE + 8.0;
+                                    let name_color =
+                                        if sel { t.accent2 } else { dim_color(t.accent2) };
+                                    ui.painter().text(
+                                        egui::pos2(name_x, rr.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        zpath,
+                                        FontId::new(14.0, FontFamily::Monospace),
+                                        name_color,
+                                    );
+                                }
+
+                                // ── Separator between zoxide and file entries (normal mode) ──
+                                if !zoxide_rows.is_empty() && !file_rows.is_empty() {
+                                    ui.add_space(2.0);
+                                    let sep_x = ui.cursor().left()..=ui.cursor().left() + aw;
+                                    ui.painter().hline(
+                                        sep_x,
+                                        ui.cursor().top(),
+                                        Stroke::new(0.5, t.separator),
+                                    );
+                                    ui.add_space(2.0);
+                                }
+
+                                // ── File/child entry rows ────────────────────
+                                // In drill mode: offset by 1 (locked zoxide at idx 0).
+                                // In normal mode: offset by zoxide_count.
+                                let row_offset = zoxide_count + drill_offset;
                                 for (fi, row) in file_rows.iter().enumerate() {
-                                    let sel = selected == fi;
+                                    let combined_idx = row_offset + fi;
+                                    let sel = selected == combined_idx;
                                     let (rr, _) = ui.allocate_exact_size(
                                         Vec2::new(aw, row_h),
                                         egui::Sense::hover(),
@@ -1883,16 +2139,71 @@ impl RofiApp {
                                         gc,
                                     );
 
-                                    // Name
+                                    // Name (with match highlighting)
                                     let name_x = ix + ICON_SIZE + 8.0;
                                     let name_color = if sel { t.fg } else { t.fg_dim };
-                                    ui.painter().text(
-                                        egui::pos2(name_x, rr.center().y),
-                                        egui::Align2::LEFT_CENTER,
-                                        &row.name,
-                                        FontId::new(14.0, FontFamily::Monospace),
-                                        name_color,
-                                    );
+                                    let highlight_color = t.accent;
+                                    let name_font = FontId::new(14.0, FontFamily::Monospace);
+
+                                    if q_tokens.is_empty() {
+                                        ui.painter().text(
+                                            egui::pos2(name_x, rr.center().y),
+                                            egui::Align2::LEFT_CENTER,
+                                            &row.name,
+                                            name_font.clone(),
+                                            name_color,
+                                        );
+                                    } else {
+                                        // Build a mask of which chars are highlighted
+                                        let name_lower = row.name.to_lowercase();
+                                        let mut highlighted = vec![false; row.name.len()];
+                                        for tok in &q_tokens {
+                                            let tok_lower = tok.to_lowercase();
+                                            let mut start = 0;
+                                            while let Some(pos) =
+                                                name_lower[start..].find(&tok_lower)
+                                            {
+                                                let abs = start + pos;
+                                                for i in abs..abs + tok_lower.len() {
+                                                    if i < highlighted.len() {
+                                                        highlighted[i] = true;
+                                                    }
+                                                }
+                                                start = abs + 1;
+                                            }
+                                        }
+                                        // Paint segments with alternating colors
+                                        let mut cx = name_x;
+                                        let mut seg_start = 0;
+                                        while seg_start < row.name.len() {
+                                            let is_hl = highlighted[seg_start];
+                                            let mut seg_end = seg_start + 1;
+                                            while seg_end < row.name.len()
+                                                && highlighted[seg_end] == is_hl
+                                            {
+                                                seg_end += 1;
+                                            }
+                                            let seg = &row.name[seg_start..seg_end];
+                                            let col =
+                                                if is_hl { highlight_color } else { name_color };
+                                            let galley = ui.painter().layout_no_wrap(
+                                                seg.to_string(),
+                                                name_font.clone(),
+                                                col,
+                                            );
+                                            let w = galley.rect.width();
+                                            ui.painter().galley(
+                                                egui::pos2(
+                                                    cx,
+                                                    rr.center().y - galley.rect.height() * 0.5,
+                                                ),
+                                                galley,
+                                                col,
+                                            );
+                                            cx += w;
+                                            seg_start = seg_end;
+                                        }
+                                    }
 
                                     // Right-aligned metadata: owner  date  size
                                     let meta_font = FontId::new(11.0, FontFamily::Monospace);
@@ -1939,79 +2250,119 @@ impl RofiApp {
                                         egui::pos2(rx, rr.center().y),
                                         egui::Align2::RIGHT_CENTER,
                                         &row.owner,
-                                        meta_font,
+                                        meta_font.clone(),
                                         if sel { owner_color } else { dim(owner_color) },
                                     );
-                                }
+                                    rx -= 70.0;
 
-                                // ── Separator between file entries and zoxide ──
-                                if !zoxide_rows.is_empty() && !file_rows.is_empty() {
-                                    ui.add_space(2.0);
-                                    let sep_x = ui.cursor().left()..=ui.cursor().left() + aw;
-                                    ui.painter().hline(
-                                        sep_x,
-                                        ui.cursor().top(),
-                                        Stroke::new(0.5, t.separator),
-                                    );
-                                    ui.add_space(2.0);
-                                }
-
-                                // ── Zoxide "jump to" rows (at the bottom) ──
-                                let file_count = file_rows.len();
-                                for (zi, zpath) in zoxide_rows.iter().enumerate() {
-                                    let combined_idx = file_count + zi;
-                                    let sel = selected == combined_idx;
-                                    let (rr, _) = ui.allocate_exact_size(
-                                        Vec2::new(aw, row_h),
-                                        egui::Sense::hover(),
-                                    );
-
-                                    if sel {
-                                        ui.scroll_to_rect(rr, None);
-                                        ui.painter().rect_filled(rr, Rounding::ZERO, t.row_sel);
+                                    // Git badge (rightmost badge column)
+                                    if row.is_git {
+                                        let badge_color = t.accent2;
+                                        ui.painter().text(
+                                            egui::pos2(rx, rr.center().y),
+                                            egui::Align2::RIGHT_CENTER,
+                                            "\u{EA84}", // nf-cod-github
+                                            meta_font,
+                                            if sel { badge_color } else { dim(badge_color) },
+                                        );
                                     }
-
-                                    let ix = rr.left() + 4.0;
-
-                                    // Folder glyph in accent2 color
-                                    let gc = if sel { t.accent2 } else { dim_color(t.accent2) };
-                                    ui.painter().text(
-                                        egui::pos2(ix + ICON_SIZE * 0.5, rr.center().y),
-                                        egui::Align2::CENTER_CENTER,
-                                        "\u{f07c}", // nf-fa-folder_open
-                                        FontId::new(16.0, FontFamily::Monospace),
-                                        gc,
-                                    );
-
-                                    // Path label in accent2 color
-                                    let name_x = ix + ICON_SIZE + 8.0;
-                                    let name_color =
-                                        if sel { t.accent2 } else { dim_color(t.accent2) };
-                                    ui.painter().text(
-                                        egui::pos2(name_x, rr.center().y),
-                                        egui::Align2::LEFT_CENTER,
-                                        zpath,
-                                        FontId::new(14.0, FontFamily::Monospace),
-                                        name_color,
-                                    );
-
-                                    // Right-aligned "z" hint
-                                    let hint_color = if sel {
-                                        t.fg_muted
-                                    } else {
-                                        dim_color(t.fg_muted)
-                                    };
-                                    ui.painter().text(
-                                        egui::pos2(rr.right() - 8.0, rr.center().y),
-                                        egui::Align2::RIGHT_CENTER,
-                                        "z",
-                                        FontId::new(11.0, FontFamily::Monospace),
-                                        hint_color,
-                                    );
                                 }
                             });
+
+                            // ── Path bar (pinned to bottom of panel) ──
+                            // Paint at an absolute Y near the bottom of the
+                            // available rect so it never moves with content.
+                            let outer = ui.max_rect();
+                            let bar_y = outer.bottom() - 6.0;
+                            let bar_left = outer.left() + 8.0;
+                            let bar_right = outer.right() - 8.0;
+
+                            // Separator line above the path
+                            ui.painter().hline(
+                                outer.left()..=outer.right(),
+                                bar_y - 14.0,
+                                Stroke::new(0.5, t.separator),
+                            );
+
+                            // Determine the full path to display
+                            let breadcrumb_path: String;
+                            if let Some(ref lz) = locked_zoxide {
+                                if selected == 0 {
+                                    breadcrumb_path = lz.clone();
+                                } else if selected - 1 < file_rows.len() {
+                                    breadcrumb_path = file_rows[selected - 1].path.clone();
+                                } else {
+                                    breadcrumb_path = lz.clone();
+                                }
+                            } else if selected < zoxide_count {
+                                breadcrumb_path = zoxide_rows[selected].clone();
+                            } else if selected - zoxide_count < file_rows.len() {
+                                breadcrumb_path = file_rows[selected - zoxide_count].path.clone();
+                            } else {
+                                breadcrumb_path = cwd_display.clone();
+                            }
+
+                            // Rainbow palette for path components
+                            let rainbow: &[egui::Color32] = &[
+                                egui::Color32::from_rgb(255, 107, 107), // red
+                                egui::Color32::from_rgb(255, 180, 107), // orange
+                                egui::Color32::from_rgb(255, 238, 140), // yellow
+                                egui::Color32::from_rgb(140, 255, 170), // green
+                                egui::Color32::from_rgb(130, 210, 255), // blue
+                                egui::Color32::from_rgb(180, 150, 255), // indigo
+                                egui::Color32::from_rgb(230, 150, 255), // violet
+                            ];
+
+                            let bc_font = FontId::new(14.0, self.medium_font.clone());
+                            let slash_font = FontId::new(14.0, FontFamily::Monospace);
+
+                            let components: Vec<&str> = breadcrumb_path
+                                .split('/')
+                                .filter(|s| !s.is_empty())
+                                .collect();
+
+                            let mut cx = bar_left;
+
+                            // Leading /
+                            let r = ui.painter().text(
+                                egui::pos2(cx, bar_y),
+                                egui::Align2::LEFT_CENTER,
+                                "/",
+                                slash_font.clone(),
+                                t.fg_muted,
+                            );
+                            cx = r.right();
+
+                            for (ci, comp) in components.iter().enumerate() {
+                                let color = rainbow[ci % rainbow.len()];
+
+                                let r = ui.painter().text(
+                                    egui::pos2(cx, bar_y),
+                                    egui::Align2::LEFT_CENTER,
+                                    comp,
+                                    bc_font.clone(),
+                                    color,
+                                );
+                                cx = r.right();
+
+                                // Slash after each component (including last for dirs,
+                                // skip for last if it's a file)
+                                if ci < components.len() - 1 {
+                                    let r = ui.painter().text(
+                                        egui::pos2(cx, bar_y),
+                                        egui::Align2::LEFT_CENTER,
+                                        "/",
+                                        slash_font.clone(),
+                                        t.fg_muted,
+                                    );
+                                    cx = r.right();
+                                }
+
+                                if cx > bar_right {
+                                    break;
+                                }
+                            }
                         } else {
-                            // ── Normal results list ───────────────────────
                             let scroll = egui::ScrollArea::vertical()
                                 .id_source(("mofi_results", self.scroll_generation))
                                 .max_height(max_list_height);
