@@ -1457,6 +1457,28 @@ impl RofiApp {
                         );
                         response.request_focus();
 
+                        // In drill mode, overlay a subtle background on the path portion
+                        if let Some(ref dt) = self.drill_target {
+                            let prefix = format!("{} ", dt);
+                            let galley = ui.painter().layout_no_wrap(
+                                prefix.clone(),
+                                FontId::new(20.0, FontFamily::Monospace),
+                                egui::Color32::TRANSPARENT,
+                            );
+                            let text_rect = response.rect;
+                            let path_rect = egui::Rect::from_min_size(
+                                egui::pos2(text_rect.left(), text_rect.top()),
+                                egui::vec2(galley.rect.width(), text_rect.height()),
+                            );
+                            let bg = egui::Color32::from_rgba_premultiplied(
+                                t.match_hl.r() / 5,
+                                t.match_hl.g() / 5,
+                                t.match_hl.b() / 5,
+                                50,
+                            );
+                            ui.painter().rect_filled(path_rect, Rounding::same(3.0), bg);
+                        }
+
                         let arrow_down = ctx.input(|i| i.key_pressed(Key::ArrowDown));
                         let arrow_up = ctx.input(|i| i.key_pressed(Key::ArrowUp));
                         let down_count = ctrl_j_count.max(if arrow_down { 1 } else { 0 });
@@ -1531,57 +1553,76 @@ impl RofiApp {
                         if self.mode == Mode::Files {
                             // Build filtered index list so navigation respects the query.
                             let q = self.query.to_lowercase();
-                            let q_tokens: Vec<&str> = q.split_whitespace().collect();
-                            let has_space = q.contains(' ');
 
                             // ── Drill-target management ──
                             // When the user types a space while focused on a
-                            // zoxide row, lock that path as the drill target.
-                            // When the space is deleted, release it.
-                            if !has_space {
-                                self.drill_target = None;
+                            // zoxide row, lock that path as the drill target
+                            // and replace the query with the full path + space.
+                            // Clear drill when the query no longer starts with
+                            // the locked path.
+                            if let Some(ref dt) = self.drill_target {
+                                let prefix = format!("{} ", dt.to_lowercase());
+                                if !q.starts_with(&prefix) {
+                                    self.drill_target = None;
+                                }
                             }
-                            // Set drill target on first space if currently on a zoxide row
-                            if has_space && self.drill_target.is_none() {
-                                let zc = if q_tokens.is_empty() {
+                            // Detect space typed while on a zoxide row → activate drill
+                            if q.ends_with(' ') && self.drill_target.is_none() {
+                                let pre_tokens: Vec<&str> = q.trim().split_whitespace().collect();
+                                let zc = if pre_tokens.is_empty() {
                                     0
                                 } else {
                                     self.zoxide_results.len()
                                 };
                                 if self.selected < zc {
-                                    self.drill_target =
-                                        Some(self.zoxide_results[self.selected].clone());
-                                    // Jump selection to first child (index 1;
-                                    // index 0 is the locked zoxide row).
-                                    self.selected = 1;
+                                    let zpath = self.zoxide_results[self.selected].clone();
+                                    self.drill_target = Some(zpath.clone());
+                                    self.query = format!("{} ", zpath);
+                                    self.selected = 0; // children start at 0 now (no locked row)
+                                                       // Move cursor to end of input
+                                    if let Some(mut state) =
+                                        egui::TextEdit::load_state(ctx, response.id)
+                                    {
+                                        let ccursor = egui::text::CCursor::new(self.query.len());
+                                        state.cursor.set_char_range(Some(
+                                            egui::text::CCursorRange::one(ccursor),
+                                        ));
+                                        state.store(ctx, response.id);
+                                    }
                                 }
                             }
 
+                            let q = self.query.to_lowercase(); // re-read after possible mutation
                             let drill_mode = self.drill_target.is_some();
+
+                            // Compute tokens: in drill mode, tokens come from
+                            // the suffix after the path; in normal mode, from
+                            // the full query.
+                            let q_tokens: Vec<&str> = if let Some(ref dt) = self.drill_target {
+                                let prefix_len = dt.len() + 1; // path + space
+                                if q.len() > prefix_len {
+                                    q[prefix_len..].split_whitespace().collect()
+                                } else {
+                                    Vec::new()
+                                }
+                            } else {
+                                q.split_whitespace().collect()
+                            };
 
                             if drill_mode {
                                 // ── DRILL MODE ──
-                                // Child tokens = everything after the first space.
-                                let child_tokens: Vec<&str> = if q_tokens.len() >= 2 {
-                                    q_tokens[1..].to_vec()
-                                } else {
-                                    Vec::new()
-                                };
+                                // Children directly indexed from 0 (no locked row).
+                                let child_tokens = q_tokens.clone();
                                 let drill_path = self.drill_target.clone().unwrap();
                                 let drill_children: Vec<crate::files::FileEntry> =
                                     crate::files::dir_children(
                                         &std::path::PathBuf::from(&drill_path),
                                         &child_tokens.iter().copied().collect::<Vec<_>>(),
                                     );
-                                // Virtual list: row 0 = locked zoxide path,
-                                // rows 1..N = children.
-                                let total = 1 + drill_children.len();
+                                let total = drill_children.len();
 
-                                // Clamp selection (keep >=1 so we stay on children
-                                // after the initial switch, but allow 0 to re-focus
-                                // the parent row).
-                                if self.selected >= total {
-                                    self.selected = if total > 1 { 1 } else { 0 };
+                                if total > 0 && self.selected >= total {
+                                    self.selected = 0;
                                 }
 
                                 // Ctrl+H → exit drill mode, go up
@@ -1596,36 +1637,21 @@ impl RofiApp {
 
                                 // Enter / Ctrl+L
                                 if ctrl_l_pressed || enter {
-                                    if self.selected == 0 {
-                                        // Enter on the drill target itself → navigate into it
-                                        let path = std::path::PathBuf::from(&drill_path);
-                                        if path.is_dir() {
-                                            self.file_pane = crate::files::Pane::new(&path);
+                                    if let Some(de) = drill_children.get(self.selected) {
+                                        if de.is_dir {
+                                            let p = de.path.clone();
+                                            self.file_pane = crate::files::Pane::new(&p);
                                             self.file_pane.scan();
-                                        }
-                                        self.query.clear();
-                                        self.zoxide_results.clear();
-                                        self.zoxide_last_query.clear();
-                                        self.drill_target = None;
-                                        self.selected = 0;
-                                    } else {
-                                        let ci = self.selected - 1;
-                                        if let Some(de) = drill_children.get(ci) {
-                                            if de.is_dir {
-                                                let p = de.path.clone();
-                                                self.file_pane = crate::files::Pane::new(&p);
-                                                self.file_pane.scan();
-                                                self.query.clear();
-                                                self.zoxide_results.clear();
-                                                self.zoxide_last_query.clear();
-                                                self.drill_target = None;
-                                                self.selected = 0;
-                                            } else {
-                                                crate::files::open_file(&de.path);
-                                                self.should_close = true;
-                                                self.oneshot_result = Some(None);
-                                                return;
-                                            }
+                                            self.query.clear();
+                                            self.zoxide_results.clear();
+                                            self.zoxide_last_query.clear();
+                                            self.drill_target = None;
+                                            self.selected = 0;
+                                        } else {
+                                            crate::files::open_file(&de.path);
+                                            self.should_close = true;
+                                            self.oneshot_result = Some(None);
+                                            return;
                                         }
                                     }
                                 }
@@ -1895,10 +1921,22 @@ impl RofiApp {
                             // self.load_image_texture).
                             let q = self.query.to_lowercase();
                             let cwd_display = self.file_pane.cwd.to_string_lossy().to_string();
-                            let q_tokens: Vec<&str> = q.split_whitespace().collect();
 
                             let drill_target = self.drill_target.clone();
                             let drill_mode = drill_target.is_some();
+
+                            // Compute tokens: in drill mode, from suffix after
+                            // path; in normal mode, from the full query.
+                            let q_tokens: Vec<&str> = if let Some(ref dt) = drill_target {
+                                let prefix_len = dt.to_lowercase().len() + 1;
+                                if q.len() > prefix_len {
+                                    q[prefix_len..].split_whitespace().collect()
+                                } else {
+                                    Vec::new()
+                                }
+                            } else {
+                                q.split_whitespace().collect()
+                            };
 
                             struct RowData {
                                 name: String,
@@ -1911,25 +1949,20 @@ impl RofiApp {
                                 is_git: bool,
                             }
 
-                            // In drill mode we show: locked zoxide row (idx 0)
-                            // + children.  In normal mode: zoxide rows + file entries.
-                            let locked_zoxide: Option<String>;
+                            // In drill mode we show children only (path is in
+                            // the input). In normal mode: zoxide rows + file entries.
                             let zoxide_rows: Vec<String>;
                             let file_rows: Vec<RowData>;
+                            let drill_path_for_breadcrumb = drill_target.clone();
 
                             if drill_mode {
                                 let dt = drill_target.unwrap();
-                                locked_zoxide = Some(dt.clone());
                                 zoxide_rows = Vec::new(); // not shown in drill mode
 
-                                let child_tokens: Vec<&str> = if q_tokens.len() >= 2 {
-                                    q_tokens[1..].to_vec()
-                                } else {
-                                    Vec::new()
-                                };
+                                // q_tokens already holds child tokens
                                 let children = crate::files::dir_children(
                                     &std::path::PathBuf::from(&dt),
-                                    &child_tokens,
+                                    &q_tokens,
                                 );
                                 file_rows = children
                                     .iter()
@@ -1945,7 +1978,6 @@ impl RofiApp {
                                     })
                                     .collect();
                             } else {
-                                locked_zoxide = None;
                                 zoxide_rows = if q.is_empty() {
                                     Vec::new()
                                 } else {
@@ -1986,8 +2018,6 @@ impl RofiApp {
                             }
 
                             let zoxide_count = zoxide_rows.len();
-                            // In drill mode, row 0 = locked zoxide row, rest = children
-                            let drill_offset: usize = if locked_zoxide.is_some() { 1 } else { 0 };
                             let selected = self.selected;
 
                             // Scrollable file list
@@ -1996,7 +2026,7 @@ impl RofiApp {
                                 .max_height(max_list_height);
                             scroll.show(ui, |ui| {
                                 ui.set_min_width(ui.available_width());
-                                let total = file_rows.len() + zoxide_count + drill_offset;
+                                let total = file_rows.len() + zoxide_count;
                                 if total == 0 {
                                     ui.add_space(20.0);
                                     ui.centered_and_justified(|ui| {
@@ -2010,50 +2040,6 @@ impl RofiApp {
                                 }
                                 let row_h = ROW_HEIGHT;
                                 let aw = ui.available_width();
-
-                                // ── Locked zoxide row (drill mode only, always idx 0) ──
-                                if let Some(ref lz) = locked_zoxide {
-                                    let sel = selected == 0;
-                                    let (rr, _) = ui.allocate_exact_size(
-                                        Vec2::new(aw, row_h),
-                                        egui::Sense::hover(),
-                                    );
-                                    if sel {
-                                        ui.scroll_to_rect(rr, None);
-                                        ui.painter().rect_filled(rr, Rounding::ZERO, t.row_sel);
-                                    }
-                                    let ix = rr.left() + 4.0;
-                                    let gc = if sel { t.accent2 } else { dim_color(t.accent2) };
-                                    ui.painter().text(
-                                        egui::pos2(ix + ICON_SIZE * 0.5, rr.center().y),
-                                        egui::Align2::CENTER_CENTER,
-                                        "\u{F126D}", // nf-md-folder_marker
-                                        FontId::new(16.0, FontFamily::Monospace),
-                                        gc,
-                                    );
-                                    let name_x = ix + ICON_SIZE + 8.0;
-                                    let name_color =
-                                        if sel { t.accent2 } else { dim_color(t.accent2) };
-                                    ui.painter().text(
-                                        egui::pos2(name_x, rr.center().y),
-                                        egui::Align2::LEFT_CENTER,
-                                        lz,
-                                        FontId::new(14.0, FontFamily::Monospace),
-                                        name_color,
-                                    );
-
-                                    // Separator after locked row
-                                    if !file_rows.is_empty() {
-                                        ui.add_space(2.0);
-                                        let sep_x = ui.cursor().left()..=ui.cursor().left() + aw;
-                                        ui.painter().hline(
-                                            sep_x,
-                                            ui.cursor().top(),
-                                            Stroke::new(0.5, t.separator),
-                                        );
-                                        ui.add_space(2.0);
-                                    }
-                                }
 
                                 // ── Zoxide "jump to" rows (normal mode only) ──
                                 for (zi, zpath) in zoxide_rows.iter().enumerate() {
@@ -2106,7 +2092,7 @@ impl RofiApp {
                                 // ── File/child entry rows ────────────────────
                                 // In drill mode: offset by 1 (locked zoxide at idx 0).
                                 // In normal mode: offset by zoxide_count.
-                                let row_offset = zoxide_count + drill_offset;
+                                let row_offset = zoxide_count;
                                 for (fi, row) in file_rows.iter().enumerate() {
                                     let combined_idx = row_offset + fi;
                                     let sel = selected == combined_idx;
@@ -2142,7 +2128,7 @@ impl RofiApp {
                                     // Name (with match highlighting)
                                     let name_x = ix + ICON_SIZE + 8.0;
                                     let name_color = if sel { t.fg } else { t.fg_dim };
-                                    let highlight_color = t.accent;
+                                    let highlight_color = t.match_hl;
                                     let name_font = FontId::new(14.0, FontFamily::Monospace);
 
                                     if q_tokens.is_empty() {
@@ -2286,13 +2272,11 @@ impl RofiApp {
 
                             // Determine the full path to display
                             let breadcrumb_path: String;
-                            if let Some(ref lz) = locked_zoxide {
-                                if selected == 0 {
-                                    breadcrumb_path = lz.clone();
-                                } else if selected - 1 < file_rows.len() {
-                                    breadcrumb_path = file_rows[selected - 1].path.clone();
+                            if let Some(ref dp) = drill_path_for_breadcrumb {
+                                if selected < file_rows.len() {
+                                    breadcrumb_path = file_rows[selected].path.clone();
                                 } else {
-                                    breadcrumb_path = lz.clone();
+                                    breadcrumb_path = dp.clone();
                                 }
                             } else if selected < zoxide_count {
                                 breadcrumb_path = zoxide_rows[selected].clone();

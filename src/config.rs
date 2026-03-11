@@ -73,6 +73,7 @@ pub struct Theme {
     pub icon_dim: Color32,      // icon when row not selected
     pub toast: Color32,         // toast message text
     pub brand: Color32,         // "Mofi" label in tab bar
+    pub match_hl: Color32,      // highlight color for search-match text (pink/green)
 }
 
 const fn c(r: u8, g: u8, b: u8) -> Color32 {
@@ -129,6 +130,7 @@ fn kanagawa() -> Theme {
         icon_dim: c(0x54, 0x54, 0x6D),
         toast: c(0x98, 0xBB, 0x6C),
         brand: c(0x54, 0x54, 0x6D),
+        match_hl: c(0xD2, 0x7E, 0x99), // kanagawa sakura pink
     }
 }
 
@@ -152,6 +154,7 @@ fn gruvbox() -> Theme {
         icon_dim: c(0x66, 0x5C, 0x54),
         toast: c(0xB8, 0xBB, 0x26), // green
         brand: c(0x66, 0x5C, 0x54),
+        match_hl: c(0xB8, 0xBB, 0x26), // gruvbox bright green
     }
 }
 
@@ -175,6 +178,7 @@ fn nord() -> Theme {
         icon_dim: c(0x4C, 0x56, 0x6A),
         toast: c(0xA3, 0xBE, 0x8C), // green
         brand: c(0x4C, 0x56, 0x6A),
+        match_hl: c(0xA3, 0xBE, 0x8C), // nord aurora green
     }
 }
 
@@ -198,6 +202,7 @@ fn tokyonight() -> Theme {
         icon_dim: c(0x41, 0x4A, 0x67),
         toast: c(0x9E, 0xCE, 0x6A), // green
         brand: c(0x41, 0x4A, 0x67),
+        match_hl: c(0xFF, 0x00, 0x7C), // tokyonight magenta/pink
     }
 }
 
@@ -221,6 +226,7 @@ fn dracula() -> Theme {
         icon_dim: c(0x62, 0x72, 0xA4),
         toast: c(0x50, 0xFA, 0x7B), // green
         brand: c(0x62, 0x72, 0xA4),
+        match_hl: c(0xFF, 0x79, 0xC6), // dracula pink
     }
 }
 
@@ -244,6 +250,7 @@ fn solarized() -> Theme {
         icon_dim: c(0x58, 0x6E, 0x75),
         toast: c(0x85, 0x99, 0x00), // green
         brand: c(0x58, 0x6E, 0x75),
+        match_hl: c(0xD3, 0x36, 0x82), // solarized magenta
     }
 }
 
@@ -267,6 +274,7 @@ fn monokai() -> Theme {
         icon_dim: c(0x75, 0x71, 0x5E),
         toast: c(0xA6, 0xE2, 0x2E), // green
         brand: c(0x75, 0x71, 0x5E),
+        match_hl: c(0xF9, 0x26, 0x72), // monokai pink
     }
 }
 
@@ -290,6 +298,7 @@ fn catppuccin() -> Theme {
         icon_dim: c(0x58, 0x5B, 0x70),
         toast: c(0xA6, 0xE3, 0xA1), // green
         brand: c(0x58, 0x5B, 0x70),
+        match_hl: c(0xF3, 0x8B, 0xA8), // catppuccin pink
     }
 }
 
@@ -313,6 +322,7 @@ fn onedark() -> Theme {
         icon_dim: c(0x4B, 0x52, 0x63),
         toast: c(0x98, 0xC3, 0x79), // green
         brand: c(0x4B, 0x52, 0x63),
+        match_hl: c(0x98, 0xC3, 0x79), // onedark green
     }
 }
 
@@ -336,5 +346,6 @@ fn rosepine() -> Theme {
         icon_dim: c(0x6E, 0x6A, 0x86),
         toast: c(0x31, 0x74, 0x8F), // pine (teal)
         brand: c(0x6E, 0x6A, 0x86),
+        match_hl: c(0xEB, 0x6F, 0x92), // rosepine love (pink)
     }
 }
