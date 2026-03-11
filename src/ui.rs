@@ -1302,6 +1302,7 @@ impl RofiApp {
         // In Files mode, Ctrl+H/L switch panes.
         let mut ctrl_h_pressed = false;
         let mut ctrl_l_pressed = false;
+        let current_mode = self.mode;
         ctx.input_mut(|i| {
             i.events.retain(|ev| {
                 if let egui::Event::Key {
@@ -1328,6 +1329,10 @@ impl RofiApp {
                             ctrl_l_pressed = true;
                             return false;
                         }
+                    }
+                    // Consume Tab in Files mode so it doesn't shift focus
+                    if *key == Key::Tab && current_mode == Mode::Files {
+                        return false;
                     }
                 }
                 true // keep
@@ -1459,7 +1464,7 @@ impl RofiApp {
 
                         // In drill mode, overlay a subtle background on the path portion
                         if let Some(ref dt) = self.drill_target {
-                            let prefix = format!("{} ", dt);
+                            let prefix = format!("{}/", dt);
                             let galley = ui.painter().layout_no_wrap(
                                 prefix.clone(),
                                 FontId::new(20.0, FontFamily::Monospace),
@@ -1488,7 +1493,7 @@ impl RofiApp {
                         let tab = ctx.input(|i| i.key_pressed(Key::Tab));
                         let enter = ctx.input(|i| i.key_pressed(Key::Enter));
 
-                        if tab && self.mode != Mode::Input {
+                        if tab && self.mode != Mode::Input && self.mode != Mode::Files {
                             let next = match self.mode {
                                 Mode::Apps => Mode::Clipboard,
                                 Mode::Clipboard => Mode::Pass,
@@ -1553,23 +1558,21 @@ impl RofiApp {
                         if self.mode == Mode::Files {
                             // Build filtered index list so navigation respects the query.
                             let q = self.query.to_lowercase();
+                            let q_tokens: Vec<&str> = q.split_whitespace().collect();
 
                             // ── Drill-target management ──
-                            // When the user types a space while focused on a
-                            // zoxide row, lock that path as the drill target
-                            // and replace the query with the full path + space.
-                            // Clear drill when the query no longer starts with
-                            // the locked path.
+                            // Tab on a zoxide row locks that path as the drill
+                            // target and replaces the query with the full path.
+                            // Backspacing into the path clears drill mode.
                             if let Some(ref dt) = self.drill_target {
-                                let prefix = format!("{} ", dt.to_lowercase());
+                                let prefix = dt.to_lowercase();
                                 if !q.starts_with(&prefix) {
                                     self.drill_target = None;
                                 }
                             }
-                            // Detect space typed while on a zoxide row → activate drill
-                            if q.ends_with(' ') && self.drill_target.is_none() {
-                                let pre_tokens: Vec<&str> = q.trim().split_whitespace().collect();
-                                let zc = if pre_tokens.is_empty() {
+                            // Tab pressed while on a zoxide row → activate drill
+                            if tab && self.drill_target.is_none() {
+                                let zc = if q_tokens.is_empty() {
                                     0
                                 } else {
                                     self.zoxide_results.len()
@@ -1577,9 +1580,9 @@ impl RofiApp {
                                 if self.selected < zc {
                                     let zpath = self.zoxide_results[self.selected].clone();
                                     self.drill_target = Some(zpath.clone());
-                                    self.query = format!("{} ", zpath);
-                                    self.selected = 0; // children start at 0 now (no locked row)
-                                                       // Move cursor to end of input
+                                    self.query = format!("{}/", zpath);
+                                    self.selected = 0;
+                                    // Move cursor to end of input
                                     if let Some(mut state) =
                                         egui::TextEdit::load_state(ctx, response.id)
                                     {
@@ -1596,10 +1599,10 @@ impl RofiApp {
                             let drill_mode = self.drill_target.is_some();
 
                             // Compute tokens: in drill mode, tokens come from
-                            // the suffix after the path; in normal mode, from
+                            // the suffix after the path/; in normal mode, from
                             // the full query.
                             let q_tokens: Vec<&str> = if let Some(ref dt) = self.drill_target {
-                                let prefix_len = dt.len() + 1; // path + space
+                                let prefix_len = dt.len() + 1; // path + /
                                 if q.len() > prefix_len {
                                     q[prefix_len..].split_whitespace().collect()
                                 } else {
