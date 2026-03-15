@@ -21,7 +21,7 @@
 - **App launcher** — fuzzy-search installed applications with frecency-based sorting
   - macOS: scans `.app` bundles across `/Applications`, `/System/Applications`, and `~/Applications`
   - Linux: scans `.desktop` files from XDG data dirs, launched via `gtk-launch`
-- **Shell command execution** — prefix any query with `!` in the Apps tab to run it as a shell command (e.g. `!killall waybar`, `!htop`). The command runs detached via `sh -c` with `setsid`
+- **Shell command execution** — prefix any query with `!` in the Apps tab to run it as a shell command (e.g. `!killall waybar`, `!htop`). The command runs detached via `sh -c` with `setsid`. Previous commands are persisted to `~/.local/share/mofi/shell_history.json` and shown as a searchable history list — type `!` to see all past commands, or `!kill` to filter history entries matching "kill"
 - **Clipboard history** — persistent, searchable history of everything you've copied (up to 100 entries)
   - macOS: polls the system pasteboard
   - Linux: polls `wl-paste`, pastes back via `wl-copy`. Supports **image clipboard** with thumbnail previews (80px-tall thumbnails generated at capture time)
@@ -241,7 +241,7 @@ For Sway, add equivalent `bindsym` entries to `~/.config/sway/config`.
 | Prefix | Behaviour |
 |--------|-----------|
 | *(none)* | Fuzzy-search installed applications |
-| `!` | Shell command — e.g. `!killall waybar` shows a "Run: killall waybar" row; Enter executes it |
+| `!` | Shell command — e.g. `!killall waybar` shows a "Run: killall waybar" row; Enter executes it. Previous commands are saved and shown as a filterable history list below the run row |
 
 ### Files tab keybindings
 

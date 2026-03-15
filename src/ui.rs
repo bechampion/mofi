@@ -377,6 +377,38 @@ fn load_fonts(ctx: &egui::Context) -> FontFamily {
     medium_family
 }
 
+// ── Shell command history ─────────────────────────────────────────────────────
+
+const MAX_SHELL_HISTORY: usize = 500;
+
+fn shell_history_path() -> std::path::PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share")
+        })
+        .join("mofi")
+        .join("shell_history.json")
+}
+
+fn load_shell_history() -> Vec<String> {
+    let path = shell_history_path();
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+fn save_shell_history(history: &[String]) {
+    let path = shell_history_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_vec(history) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
 // ── Mode ──────────────────────────────────────────────────────────────────────
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -465,6 +497,8 @@ pub struct RofiApp {
     /// the zoxide path so children can be drilled into.  Cleared on hide,
     /// tab-switch, Ctrl+H, or when the query no longer contains a space.
     drill_target: Option<String>,
+    /// Shell command history for `!command` mode (most recent last).
+    shell_history: Vec<String>,
 }
 
 impl RofiApp {
@@ -625,6 +659,7 @@ impl RofiApp {
             zoxide_results: Vec::new(),
             zoxide_last_query: String::new(),
             drill_target: None,
+            shell_history: load_shell_history(),
         };
         app.refilter(true);
         app
@@ -792,11 +827,33 @@ impl RofiApp {
                 }
             }
         } else if self.mode == Mode::Apps && self.query.trim().starts_with('!') {
-            // Selected the synthetic "Run in shell" row — execute query as
-            // a shell command (strip the leading '!').
-            let cmd = self.query.trim().trim_start_matches('!').trim();
-            #[cfg(target_os = "linux")]
-            launch_shell_command(cmd);
+            // In shell mode the first row is "Run: <current command>" and
+            // subsequent rows are matching history entries.
+            let history_matches = self.filtered_shell_history();
+            let shell_row_idx = self.filtered.len(); // index of "Run:" row
+            let cmd = if self.selected == shell_row_idx {
+                // The "Run in shell" row — execute the current query.
+                self.query.trim().trim_start_matches('!').trim().to_string()
+            } else if self.selected > shell_row_idx {
+                // A history entry row.
+                let hist_idx = self.selected - shell_row_idx - 1;
+                history_matches.get(hist_idx).cloned().unwrap_or_default()
+            } else {
+                String::new()
+            };
+            if !cmd.is_empty() {
+                // Record in shell history (avoid consecutive duplicates).
+                if self.shell_history.last().map_or(true, |last| *last != cmd) {
+                    self.shell_history.push(cmd.clone());
+                    if self.shell_history.len() > MAX_SHELL_HISTORY {
+                        let drain = self.shell_history.len() - MAX_SHELL_HISTORY;
+                        self.shell_history.drain(..drain);
+                    }
+                    save_shell_history(&self.shell_history);
+                }
+                #[cfg(target_os = "linux")]
+                launch_shell_command(&cmd);
+            }
             self.oneshot_result = Some(None);
             self.should_close = true;
         }
@@ -814,7 +871,9 @@ impl RofiApp {
             return;
         }
         let output = std::process::Command::new("zoxide")
-            .args(["query", "-l", term])
+            .arg("query")
+            .arg("-l")
+            .args(term.split_whitespace())
             .output();
         match output {
             Ok(o) if o.status.success() => {
@@ -835,6 +894,35 @@ impl RofiApp {
         if let Some(app) = self.prev_app.take() {
             restore_app_focus(&app);
         }
+    }
+
+    /// Return shell history entries matching the current query (after `!`),
+    /// most-recent first, deduplicated.  Excludes the exact current command
+    /// (since that's already shown in the "Run:" row).
+    fn filtered_shell_history(&self) -> Vec<String> {
+        let term = self
+            .query
+            .trim()
+            .trim_start_matches('!')
+            .trim()
+            .to_lowercase();
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        for cmd in self.shell_history.iter().rev() {
+            let lower = cmd.to_lowercase();
+            if !seen.insert(lower.clone()) {
+                continue;
+            }
+            // If there's a search term, the entry must contain it.
+            // If the term is empty, show all history.
+            if !term.is_empty() && lower == term {
+                continue; // skip exact match (already the "Run:" row)
+            }
+            if term.is_empty() || lower.contains(&term) {
+                result.push(cmd.clone());
+            }
+        }
+        result
     }
 
     /// Reset a scroll area's offset to zero by clearing its persisted state.
@@ -1302,6 +1390,10 @@ impl RofiApp {
         // In Files mode, Ctrl+H/L switch panes.
         let mut ctrl_h_pressed = false;
         let mut ctrl_l_pressed = false;
+        let mut ctrl_d_pressed = false;
+        let mut ctrl_u_pressed = false;
+        let mut tab_pressed = false;
+        let mut ctrl_tab_pressed = false;
         let current_mode = self.mode;
         ctx.input_mut(|i| {
             i.events.retain(|ev| {
@@ -1329,9 +1421,24 @@ impl RofiApp {
                             ctrl_l_pressed = true;
                             return false;
                         }
+                        if *key == Key::D {
+                            ctrl_d_pressed = true;
+                            return false;
+                        }
+                        if *key == Key::U {
+                            ctrl_u_pressed = true;
+                            return false;
+                        }
+                        // Ctrl+Tab cycles modes
+                        if *key == Key::Tab {
+                            ctrl_tab_pressed = true;
+                            return false;
+                        }
                     }
-                    // Consume Tab in Files mode so it doesn't shift focus
-                    if *key == Key::Tab && current_mode == Mode::Files {
+                    // Consume plain Tab in Files mode so it doesn't shift focus;
+                    // capture the press so drill activation can use it.
+                    if *key == Key::Tab && !modifiers.ctrl && current_mode == Mode::Files {
+                        tab_pressed = true;
                         return false;
                     }
                 }
@@ -1486,14 +1593,21 @@ impl RofiApp {
 
                         let arrow_down = ctx.input(|i| i.key_pressed(Key::ArrowDown));
                         let arrow_up = ctx.input(|i| i.key_pressed(Key::ArrowUp));
-                        let down_count = ctrl_j_count.max(if arrow_down { 1 } else { 0 });
-                        let up_count = ctrl_k_count.max(if arrow_up { 1 } else { 0 });
+                        const HALF_PAGE: usize = 5;
+                        let mut down_count = ctrl_j_count.max(if arrow_down { 1 } else { 0 });
+                        let mut up_count = ctrl_k_count.max(if arrow_up { 1 } else { 0 });
+                        if ctrl_d_pressed {
+                            down_count = down_count.max(HALF_PAGE);
+                        }
+                        if ctrl_u_pressed {
+                            up_count = up_count.max(HALF_PAGE);
+                        }
                         let down = down_count > 0;
                         let up = up_count > 0;
-                        let tab = ctx.input(|i| i.key_pressed(Key::Tab));
+                        let tab = tab_pressed || ctx.input(|i| i.key_pressed(Key::Tab));
                         let enter = ctx.input(|i| i.key_pressed(Key::Enter));
 
-                        if tab && self.mode != Mode::Input && self.mode != Mode::Files {
+                        if ctrl_tab_pressed && self.mode != Mode::Input {
                             let next = match self.mode {
                                 Mode::Apps => Mode::Clipboard,
                                 Mode::Clipboard => Mode::Pass,
@@ -1539,7 +1653,14 @@ impl RofiApp {
                         } else if self.mode != Mode::Files {
                             let show_shell_row =
                                 self.mode == Mode::Apps && self.query.trim().starts_with('!');
-                            let len = self.filtered.len() + if show_shell_row { 1 } else { 0 };
+                            let shell_hist_count = if show_shell_row {
+                                self.filtered_shell_history().len()
+                            } else {
+                                0
+                            };
+                            let len = self.filtered.len()
+                                + if show_shell_row { 1 } else { 0 }
+                                + shell_hist_count;
                             if down && len > 0 {
                                 let new_sel = (self.selected + down_count).min(len - 1);
                                 self.selected = new_sel;
@@ -1819,7 +1940,7 @@ impl RofiApp {
                                 ui.add_space(8.0);
                                 ui.label(
                                     egui::RichText::new(
-                                        "Super/Mod key  open · Esc  close · Tab  cycle tabs",
+                                        "Super/Mod key  open · Esc  close · C-Tab  cycle tabs",
                                     )
                                     .font(FontId::new(13.0, FontFamily::Monospace))
                                     .color(t.fg_muted),
@@ -2357,11 +2478,18 @@ impl RofiApp {
                                 ui.set_min_width(ui.available_width());
                                 // In Apps mode with a non-empty query, we show
                                 // an extra "Run: <query>" row at the end so the
-                                // user can execute arbitrary shell commands.
+                                // user can execute arbitrary shell commands,
+                                // followed by matching shell history entries.
                                 let show_shell_row =
                                     self.mode == Mode::Apps && self.query.trim().starts_with('!');
-                                let total_rows =
-                                    self.filtered.len() + if show_shell_row { 1 } else { 0 };
+                                let shell_history_entries = if show_shell_row {
+                                    self.filtered_shell_history()
+                                } else {
+                                    Vec::new()
+                                };
+                                let total_rows = self.filtered.len()
+                                    + if show_shell_row { 1 } else { 0 }
+                                    + shell_history_entries.len();
                                 if total_rows == 0 {
                                     ui.add_space(20.0);
                                     ui.centered_and_justified(|ui| {
@@ -2558,6 +2686,53 @@ impl RofiApp {
                                         FontId::new(14.0, self.medium_font.clone()),
                                         if sel { t.fg } else { t.fg_dim },
                                     );
+
+                                    // ── Shell history rows ────────────────
+                                    let history_glyph = "\u{F1DA}"; // nf-fa-history
+                                    for (hi, hist_cmd) in shell_history_entries.iter().enumerate() {
+                                        let hist_row_idx = shell_row_idx + 1 + hi;
+                                        let sel = self.selected == hist_row_idx;
+
+                                        let (rr, _) = ui.allocate_exact_size(
+                                            Vec2::new(aw, ROW_HEIGHT),
+                                            egui::Sense::hover(),
+                                        );
+                                        if sel && self.selected != self.last_scroll_to {
+                                            self.last_scroll_to = self.selected;
+                                            ui.scroll_to_rect(rr, None);
+                                        }
+                                        if sel {
+                                            ui.painter().rect_filled(rr, Rounding::ZERO, t.row_sel);
+                                            ui.painter().rect_filled(
+                                                egui::Rect::from_min_size(
+                                                    egui::pos2(rr.left(), rr.top() + 4.0),
+                                                    Vec2::new(3.0, rr.height() - 8.0),
+                                                ),
+                                                Rounding::ZERO,
+                                                t.accent,
+                                            );
+                                        }
+                                        let ix = rr.left() + 14.0;
+                                        ui.painter().text(
+                                            egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
+                                            egui::Align2::CENTER_CENTER,
+                                            history_glyph,
+                                            FontId::new(ICON_SIZE * 0.75, FontFamily::Monospace),
+                                            if sel {
+                                                t.fg_muted
+                                            } else {
+                                                dim_color(t.fg_muted)
+                                            },
+                                        );
+                                        let tx = ix + ICON_SIZE + 12.0;
+                                        ui.painter().text(
+                                            egui::pos2(tx, rr.center().y),
+                                            egui::Align2::LEFT_CENTER,
+                                            hist_cmd,
+                                            FontId::new(14.0, self.medium_font.clone()),
+                                            if sel { t.fg } else { t.fg_dim },
+                                        );
+                                    }
                                 }
                             });
                         }

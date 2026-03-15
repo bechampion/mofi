@@ -63,8 +63,8 @@ impl Pane {
                 Err(_) => continue,
             };
             let name = entry.file_name().to_string_lossy().to_string();
-            // Skip hidden files
-            if name.starts_with('.') {
+            // Skip hidden files and vendor directories
+            if name.starts_with('.') || name == "vendor" {
                 continue;
             }
             let modified = meta.mtime();
@@ -279,7 +279,7 @@ pub fn dir_children(dir: &Path, tokens: &[&str]) -> Vec<FileEntry> {
                 Err(_) => continue,
             };
             let name = child.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
+            if name.starts_with('.') || name == "vendor" {
                 continue;
             }
             let child_path = child.path();
