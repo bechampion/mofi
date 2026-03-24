@@ -45,8 +45,8 @@ fn restore_app_focus(app: &NSRunningApplication) {
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const ICON_SIZE: f32 = 30.0;
-const ROW_HEIGHT: f32 = 48.0;
+const ICON_SIZE: f32 = 18.0;
+const ROW_HEIGHT: f32 = 28.0;
 
 /// Return the paths to look for the custom fonts, in priority order.
 /// On macOS: ~/Library/Fonts  On Linux: ~/.local/share/fonts and system paths.
@@ -1472,7 +1472,7 @@ impl RofiApp {
                 ui.painter()
                     .rect_stroke(panel_rect, Rounding::ZERO, Stroke::new(1.5, t.border));
 
-                let inner = panel_rect.shrink2(Vec2::new(16.0, 14.0));
+                let inner = panel_rect.shrink2(Vec2::new(4.0, 8.0));
                 ui.allocate_ui_at_rect(inner, |ui| {
                     ui.vertical(|ui| {
                         // ── Mode tabs ─────────────────────────────────────
@@ -1501,7 +1501,7 @@ impl RofiApp {
                                 let selected = self.mode == mode;
                                 let btn = egui::Button::new(
                                     egui::RichText::new(label)
-                                        .font(FontId::new(14.0, FontFamily::Monospace))
+                                        .font(FontId::new(13.0, FontFamily::Monospace))
                                         .color(if selected { t.accent } else { t.fg_muted }),
                                 )
                                 .fill(if selected {
@@ -1539,7 +1539,7 @@ impl RofiApp {
                                 |ui| {
                                     ui.label(
                                         egui::RichText::new("Mofi")
-                                            .font(FontId::new(15.0, self.medium_font.clone()))
+                                            .font(FontId::new(13.0, self.medium_font.clone()))
                                             .color(t.brand),
                                     );
                                 },
@@ -1562,7 +1562,7 @@ impl RofiApp {
                         let response = ui.add(
                             egui::TextEdit::singleline(&mut self.query)
                                 .hint_text(egui::RichText::new(hint).color(t.fg_muted))
-                                .font(FontId::new(20.0, FontFamily::Monospace))
+                                .font(FontId::new(17.0, FontFamily::Monospace))
                                 .text_color(t.fg)
                                 .frame(false)
                                 .desired_width(f32::INFINITY),
@@ -1574,7 +1574,7 @@ impl RofiApp {
                             let prefix = format!("{}/", dt);
                             let galley = ui.painter().layout_no_wrap(
                                 prefix.clone(),
-                                FontId::new(20.0, FontFamily::Monospace),
+                                FontId::new(17.0, FontFamily::Monospace),
                                 egui::Color32::TRANSPARENT,
                             );
                             let text_rect = response.rect;
@@ -1593,7 +1593,7 @@ impl RofiApp {
 
                         let arrow_down = ctx.input(|i| i.key_pressed(Key::ArrowDown));
                         let arrow_up = ctx.input(|i| i.key_pressed(Key::ArrowUp));
-                        const HALF_PAGE: usize = 5;
+                        const HALF_PAGE: usize = 6;
                         let mut down_count = ctrl_j_count.max(if arrow_down { 1 } else { 0 });
                         let mut up_count = ctrl_k_count.max(if arrow_up { 1 } else { 0 });
                         if ctrl_d_pressed {
@@ -1910,31 +1910,31 @@ impl RofiApp {
                             ui.vertical_centered(|ui| {
                                 ui.label(
                                     egui::RichText::new("Mofi")
-                                        .font(FontId::new(27.0, self.medium_font.clone()))
+                                        .font(FontId::new(23.0, self.medium_font.clone()))
                                         .color(t.accent),
                                 );
                                 ui.add_space(4.0);
                                 ui.label(
                                     egui::RichText::new("v0.1.0")
-                                        .font(FontId::new(14.0, FontFamily::Monospace))
+                                        .font(FontId::new(13.0, FontFamily::Monospace))
                                         .color(t.fg_muted),
                                 );
                                 ui.add_space(14.0);
                                 ui.label(
                                     egui::RichText::new("App launcher · Clipboard · Pass")
-                                        .font(FontId::new(15.0, FontFamily::Monospace))
+                                        .font(FontId::new(13.0, FontFamily::Monospace))
                                         .color(t.fg_dim),
                                 );
                                 ui.add_space(14.0);
                                 ui.label(
                                     egui::RichText::new("\u{F09B}  github.com/bechampion/mofi")
-                                        .font(FontId::new(15.0, FontFamily::Monospace))
+                                        .font(FontId::new(13.0, FontFamily::Monospace))
                                         .color(t.accent2),
                                 );
                                 ui.add_space(14.0);
                                 ui.label(
                                     egui::RichText::new(format!("Theme: {}", t.name))
-                                        .font(FontId::new(14.0, FontFamily::Monospace))
+                                        .font(FontId::new(13.0, FontFamily::Monospace))
                                         .color(t.fg_muted),
                                 );
                                 ui.add_space(8.0);
@@ -1942,7 +1942,7 @@ impl RofiApp {
                                     egui::RichText::new(
                                         "Super/Mod key  open · Esc  close · C-Tab  cycle tabs",
                                     )
-                                    .font(FontId::new(13.0, FontFamily::Monospace))
+                                    .font(FontId::new(12.0, FontFamily::Monospace))
                                     .color(t.fg_muted),
                                 );
                             });
@@ -1958,7 +1958,7 @@ impl RofiApp {
                                     ui.centered_and_justified(|ui| {
                                         ui.label(
                                             egui::RichText::new("No results")
-                                                .font(FontId::new(15.0, FontFamily::Monospace))
+                                                .font(FontId::new(13.0, FontFamily::Monospace))
                                                 .color(t.fg_muted),
                                         );
                                     });
@@ -2001,7 +2001,7 @@ impl RofiApp {
                                         ui.painter().rect_filled(rr, Rounding::ZERO, t.row_hover);
                                     }
 
-                                    let ix = rr.left() + 14.0;
+                                    let ix = rr.left() + 4.0;
                                     ui.painter().text(
                                         egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
                                         egui::Align2::CENTER_CENTER,
@@ -2010,10 +2010,10 @@ impl RofiApp {
                                         if sel { t.icon_sel } else { t.icon_dim },
                                     );
                                     ui.painter().text(
-                                        egui::pos2(ix + ICON_SIZE + 12.0, rr.center().y),
+                                        egui::pos2(ix + ICON_SIZE + 6.0, rr.center().y),
                                         egui::Align2::LEFT_CENTER,
                                         &text,
-                                        FontId::new(16.0, self.medium_font.clone()),
+                                        FontId::new(14.0, self.medium_font.clone()),
                                         if sel { t.fg } else { t.fg_dim },
                                     );
                                     let click = ui.interact(
@@ -2156,7 +2156,7 @@ impl RofiApp {
                                     ui.centered_and_justified(|ui| {
                                         ui.label(
                                             egui::RichText::new("Empty")
-                                                .font(FontId::new(15.0, FontFamily::Monospace))
+                                                .font(FontId::new(13.0, FontFamily::Monospace))
                                                 .color(t.fg_muted),
                                         );
                                     });
@@ -2185,7 +2185,7 @@ impl RofiApp {
                                         egui::pos2(ix + ICON_SIZE * 0.5, rr.center().y),
                                         egui::Align2::CENTER_CENTER,
                                         "\u{F126D}", // nf-md-folder_marker
-                                        FontId::new(16.0, FontFamily::Monospace),
+                                        FontId::new(15.0, FontFamily::Monospace),
                                         gc,
                                     );
 
@@ -2196,7 +2196,7 @@ impl RofiApp {
                                         egui::pos2(name_x, rr.center().y),
                                         egui::Align2::LEFT_CENTER,
                                         zpath,
-                                        FontId::new(14.0, FontFamily::Monospace),
+                                        FontId::new(13.0, FontFamily::Monospace),
                                         name_color,
                                     );
                                 }
@@ -2245,7 +2245,7 @@ impl RofiApp {
                                         egui::pos2(ix + ICON_SIZE * 0.5, rr.center().y),
                                         egui::Align2::CENTER_CENTER,
                                         row.glyph,
-                                        FontId::new(16.0, FontFamily::Monospace),
+                                        FontId::new(15.0, FontFamily::Monospace),
                                         gc,
                                     );
 
@@ -2253,7 +2253,7 @@ impl RofiApp {
                                     let name_x = ix + ICON_SIZE + 8.0;
                                     let name_color = if sel { t.fg } else { t.fg_dim };
                                     let highlight_color = t.match_hl;
-                                    let name_font = FontId::new(14.0, FontFamily::Monospace);
+                                    let name_font = FontId::new(13.0, FontFamily::Monospace);
 
                                     if q_tokens.is_empty() {
                                         ui.painter().text(
@@ -2421,8 +2421,8 @@ impl RofiApp {
                                 egui::Color32::from_rgb(230, 150, 255), // violet
                             ];
 
-                            let bc_font = FontId::new(14.0, self.medium_font.clone());
-                            let slash_font = FontId::new(14.0, FontFamily::Monospace);
+                            let bc_font = FontId::new(13.0, self.medium_font.clone());
+                            let slash_font = FontId::new(13.0, FontFamily::Monospace);
 
                             let components: Vec<&str> = breadcrumb_path
                                 .split('/')
@@ -2495,7 +2495,7 @@ impl RofiApp {
                                     ui.centered_and_justified(|ui| {
                                         ui.label(
                                             egui::RichText::new("No results")
-                                                .font(FontId::new(15.0, FontFamily::Monospace))
+                                                .font(FontId::new(13.0, FontFamily::Monospace))
                                                 .color(t.fg_muted),
                                         );
                                     });
@@ -2544,7 +2544,7 @@ impl RofiApp {
                                         ui.painter().rect_filled(rr, Rounding::ZERO, t.row_hover);
                                     }
 
-                                    let ix = rr.left() + 14.0;
+                                    let ix = rr.left() + 4.0;
 
                                     // Check if this is an image clipboard entry — show thumbnail.
                                     let mut drew_thumbnail = false;
@@ -2575,7 +2575,7 @@ impl RofiApp {
                                                 egui::pos2(lx, rr.center().y - 7.0),
                                                 egui::Align2::LEFT_CENTER,
                                                 &display,
-                                                FontId::new(14.0, self.medium_font.clone()),
+                                                FontId::new(13.0, self.medium_font.clone()),
                                                 if sel { t.fg } else { t.fg_dim },
                                             );
                                             if let Some(ref sub) = subtitle {
@@ -2583,7 +2583,7 @@ impl RofiApp {
                                                     egui::pos2(lx, rr.center().y + 7.0),
                                                     egui::Align2::LEFT_CENTER,
                                                     sub,
-                                                    FontId::new(13.0, FontFamily::Monospace),
+                                                    FontId::new(12.0, FontFamily::Monospace),
                                                     if sel { t.accent2 } else { t.fg_muted },
                                                 );
                                             }
@@ -2600,20 +2600,20 @@ impl RofiApp {
                                             gc,
                                         );
 
-                                        let tx = ix + ICON_SIZE + 12.0;
+                                        let tx = ix + ICON_SIZE + 6.0;
                                         if let Some(sub) = subtitle {
                                             ui.painter().text(
                                                 egui::pos2(tx, rr.center().y - 7.0),
                                                 egui::Align2::LEFT_CENTER,
                                                 &display,
-                                                FontId::new(14.0, self.medium_font.clone()),
+                                                FontId::new(13.0, self.medium_font.clone()),
                                                 if sel { t.fg } else { t.fg_dim },
                                             );
                                             ui.painter().text(
                                                 egui::pos2(tx, rr.center().y + 7.0),
                                                 egui::Align2::LEFT_CENTER,
                                                 &sub,
-                                                FontId::new(13.0, FontFamily::Monospace),
+                                                FontId::new(12.0, FontFamily::Monospace),
                                                 if sel { t.accent2 } else { t.fg_muted },
                                             );
                                         } else {
@@ -2621,7 +2621,7 @@ impl RofiApp {
                                                 egui::pos2(tx, rr.center().y),
                                                 egui::Align2::LEFT_CENTER,
                                                 &display,
-                                                FontId::new(14.0, self.medium_font.clone()),
+                                                FontId::new(13.0, self.medium_font.clone()),
                                                 if sel { t.fg } else { t.fg_dim },
                                             );
                                         }
@@ -2670,7 +2670,7 @@ impl RofiApp {
                                             t.accent,
                                         );
                                     }
-                                    let ix = rr.left() + 14.0;
+                                    let ix = rr.left() + 4.0;
                                     ui.painter().text(
                                         egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
                                         egui::Align2::CENTER_CENTER,
@@ -2678,12 +2678,12 @@ impl RofiApp {
                                         FontId::new(ICON_SIZE * 0.75, FontFamily::Monospace),
                                         if sel { t.accent } else { dim_color(t.accent) },
                                     );
-                                    let tx = ix + ICON_SIZE + 12.0;
+                                    let tx = ix + ICON_SIZE + 6.0;
                                     ui.painter().text(
                                         egui::pos2(tx, rr.center().y),
                                         egui::Align2::LEFT_CENTER,
                                         &shell_label,
-                                        FontId::new(14.0, self.medium_font.clone()),
+                                        FontId::new(13.0, self.medium_font.clone()),
                                         if sel { t.fg } else { t.fg_dim },
                                     );
 
@@ -2712,7 +2712,7 @@ impl RofiApp {
                                                 t.accent,
                                             );
                                         }
-                                        let ix = rr.left() + 14.0;
+                                        let ix = rr.left() + 4.0;
                                         ui.painter().text(
                                             egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
                                             egui::Align2::CENTER_CENTER,
@@ -2724,12 +2724,12 @@ impl RofiApp {
                                                 dim_color(t.fg_muted)
                                             },
                                         );
-                                        let tx = ix + ICON_SIZE + 12.0;
+                                        let tx = ix + ICON_SIZE + 6.0;
                                         ui.painter().text(
                                             egui::pos2(tx, rr.center().y),
                                             egui::Align2::LEFT_CENTER,
                                             hist_cmd,
-                                            FontId::new(14.0, self.medium_font.clone()),
+                                            FontId::new(13.0, self.medium_font.clone()),
                                             if sel { t.fg } else { t.fg_dim },
                                         );
                                     }
@@ -2744,7 +2744,7 @@ impl RofiApp {
                                 ui.horizontal(|ui| {
                                     ui.label(
                                         egui::RichText::new(msg.as_str())
-                                            .font(FontId::new(15.0, FontFamily::Monospace))
+                                            .font(FontId::new(13.0, FontFamily::Monospace))
                                             .color(t.toast),
                                     );
                                 });
