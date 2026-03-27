@@ -164,6 +164,40 @@ fn pass_emoji_bytes(name: &str) -> &'static [u8] {
     }
 }
 
+fn clip_emoji_key(entry: &ClipboardEntry) -> &'static str {
+    if entry.is_image() {
+        return "image";
+    }
+    let text = entry.text().unwrap_or("").trim();
+    if text.starts_with("http://") || text.starts_with("https://") || text.starts_with("ftp://") {
+        "globe"
+    } else if !text.contains('\n') && text.contains('@') && text.contains('.') {
+        "mail"
+    } else if !text.contains('\n')
+        && text.len() <= 64
+        && text
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == 'x' || c == 'X' || c == '-' || c == '_')
+    {
+        "tag"
+    } else if text.contains('\n') {
+        "note"
+    } else {
+        "doc"
+    }
+}
+
+fn clip_emoji_bytes(entry: &ClipboardEntry) -> Option<&'static [u8]> {
+    match clip_emoji_key(entry) {
+        "image" => None,
+        "globe" => Some(include_bytes!("../assets/clipboard-globe.png")),
+        "mail" => Some(include_bytes!("../assets/clipboard-mail.png")),
+        "tag" => Some(include_bytes!("../assets/clipboard-tag.png")),
+        "note" => Some(include_bytes!("../assets/clipboard-note.png")),
+        _ => Some(include_bytes!("../assets/clipboard-doc.png")),
+    }
+}
+
 /// Returns a representative Nerd Font glyph for each built-in theme name.
 fn theme_glyph_for(name: &str) -> &'static str {
     match name {
@@ -222,9 +256,34 @@ fn glyph_for_app(name: &str) -> &'static str {
     else                                                               { "\u{F2D0}" }
 }
 
-fn glyph_color_for_item(item: &LaunchItem, t: &Theme) -> Color32 {
+fn clip_accent(entry: &ClipboardEntry) -> Color32 {
+    if entry.is_image() {
+        return kana::SPRING_BLUE;
+    }
+    let text = entry.text().unwrap_or("").trim();
+    if text.starts_with("http://") || text.starts_with("https://") || text.starts_with("ftp://") {
+        kana::CRYSTAL_BLUE
+    } else if !text.contains('\n') && text.contains('@') && text.contains('.') {
+        kana::SAKURA_PINK
+    } else if text.starts_with('/') || text.starts_with("~/") {
+        kana::SPRING_GREEN
+    } else if !text.contains('\n')
+        && text.len() <= 64
+        && text
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == 'x' || c == 'X' || c == '-' || c == '_')
+    {
+        kana::CARP_YELLOW
+    } else if text.contains('\n') {
+        kana::WAVE_AQUA2
+    } else {
+        kana::SURIMI_ORANGE
+    }
+}
+
+fn glyph_color_for_item(item: &LaunchItem, _t: &Theme) -> Color32 {
     match item {
-        LaunchItem::Clip(_) => t.accent2,
+        LaunchItem::Clip(c) => clip_accent(c),
         LaunchItem::Pass(p) => pass_accent(&p.name),
         LaunchItem::App(a)  => accent_for_name(&a.name),
     }
@@ -328,6 +387,7 @@ pub struct RofiApp {
     clip_thumb_cache: RefCell<HashMap<u64, egui::TextureHandle>>,
     app_icon_cache: RefCell<HashMap<String, egui::TextureHandle>>,
     pass_emoji_cache: RefCell<HashMap<String, egui::TextureHandle>>,
+    clip_emoji_cache: RefCell<HashMap<String, egui::TextureHandle>>,
 }
 
 impl RofiApp {
@@ -401,6 +461,7 @@ impl RofiApp {
             clip_thumb_cache: RefCell::new(HashMap::new()),
             app_icon_cache: RefCell::new(HashMap::new()),
             pass_emoji_cache: RefCell::new(HashMap::new()),
+            clip_emoji_cache: RefCell::new(HashMap::new()),
         };
         app.refilter(true);
         app
@@ -683,6 +744,32 @@ impl RofiApp {
         self.pass_emoji_cache.borrow_mut().insert(key.to_string(), tex);
         Some(id)
     }
+
+    fn clip_emoji_id(&self, ctx: &egui::Context, entry: &ClipboardEntry) -> Option<egui::TextureId> {
+        let key = clip_emoji_key(entry);
+        let bytes = clip_emoji_bytes(entry)?;
+
+        if let Some(tex) = self.clip_emoji_cache.borrow().get(key) {
+            return Some(tex.id());
+        }
+
+        let decoded = image::load_from_memory_with_format(bytes, image::ImageFormat::Png).ok()?;
+        let rgba = decoded.thumbnail(64, 64).to_rgba8();
+        let (w, h) = rgba.dimensions();
+        if w == 0 || h == 0 {
+            return None;
+        }
+
+        let color = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+        let tex = ctx.load_texture(
+            format!("clip-emoji-{}", key),
+            color,
+            egui::TextureOptions::LINEAR,
+        );
+        let id = tex.id();
+        self.clip_emoji_cache.borrow_mut().insert(key.to_string(), tex);
+        Some(id)
+    }
 }
 
 // ── eframe::App ───────────────────────────────────────────────────────────────
@@ -817,6 +904,8 @@ impl eframe::App for RofiApp {
         // Consume Ctrl+H / Ctrl+L for Files mode navigation (go up / enter dir).
         let ctrl_h_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::H));
         let ctrl_l_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::L));
+        // Ctrl+D in Files mode: convert selected zoxide row into a drill target.
+        let ctrl_d_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, Key::D));
         // Shift+Tab cycles modes (works in all modes including Files).
         let shift_tab = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, Key::Tab));
         // In Files mode consume bare Tab before TextEdit so it doesn't shift focus.
@@ -978,7 +1067,7 @@ impl eframe::App for RofiApp {
 
         let down  = ctx.input(|i| i.key_pressed(Key::ArrowDown)) || ctrl_j;
         let up    = ctx.input(|i| i.key_pressed(Key::ArrowUp))   || ctrl_k;
-        let tab   = ctx.input(|i| i.key_pressed(Key::Tab));
+        let tab   = ctx.input(|i| i.key_pressed(Key::Tab)) || files_tab_consumed;
         let enter = ctx.input(|i| i.key_pressed(Key::Enter));
         let cmd_e = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::E));
         let cmd_f = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::F));
@@ -1028,9 +1117,9 @@ impl eframe::App for RofiApp {
             self.custom_commands.clear();
         }
 
-                        // Tab cycles forward (not in Input or Files — Files uses Tab for drill).
-                        // Shift+Tab cycles forward too (works in all modes including Files).
-                        let cycle_forward  = (tab && self.mode != Mode::Input && self.mode != Mode::Files)
+                        // Tab cycles forward in all non-input modes.
+                        // Shift+Tab also cycles (same direction by design).
+                        let cycle_forward  = (tab && self.mode != Mode::Input)
                                           || (shift_tab && self.mode != Mode::Input);
                         if cycle_forward {
                             let next = match self.mode {
@@ -1089,10 +1178,10 @@ impl eframe::App for RofiApp {
                                     self.drill_target = None;
                                 }
                             }
-                            // Tab pressed while on a zoxide row → activate drill
+                            // Ctrl+D pressed while on a zoxide row → activate drill
                             let q_tokens_check: Vec<&str> = q.split_whitespace().collect();
                             let zc_check = if q_tokens_check.is_empty() { 0 } else { self.zoxide_results.len() };
-                            if tab && self.drill_target.is_none() && self.selected < zc_check {
+                            if ctrl_d_pressed && self.drill_target.is_none() && self.selected < zc_check {
                                 let zpath = self.zoxide_results[self.selected].clone();
                                 self.drill_target = Some(zpath.clone());
                                 self.query = format!("{}/", zpath);
@@ -1752,6 +1841,49 @@ impl eframe::App for RofiApp {
                                     }
 
                                     if !drew_thumb {
+                                        if let LaunchItem::Clip(clip) = item {
+                                            if let Some(tex_id) = self.clip_emoji_id(ctx, clip) {
+                                                let icon_h = (ROW_HEIGHT - 10.0).max(14.0);
+                                                let icon_rect = egui::Rect::from_min_size(
+                                                    egui::pos2(ix, rr.center().y - icon_h * 0.5),
+                                                    Vec2::new(icon_h, icon_h),
+                                                );
+                                                ui.painter().image(
+                                                    tex_id,
+                                                    icon_rect,
+                                                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                                    Color32::WHITE,
+                                                );
+                                                tx = icon_rect.right() + 10.0;
+                                                drew_thumb = true;
+                                            }
+                                        }
+                                    }
+
+                                    if !drew_thumb {
+                                        if let LaunchItem::Clip(clip) = item {
+                                            if !clip.is_image() {
+                                                let clip_c = clip_accent(clip);
+                                                let clip_chip = egui::Rect::from_center_size(
+                                                    egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
+                                                    Vec2::new(17.0, 17.0),
+                                                );
+                                                let clip_bg = if sel {
+                                                    Color32::from_rgba_unmultiplied(clip_c.r(), clip_c.g(), clip_c.b(), 220)
+                                                } else {
+                                                    Color32::from_rgba_unmultiplied(clip_c.r(), clip_c.g(), clip_c.b(), 170)
+                                                };
+                                                ui.painter().rect_filled(clip_chip, Rounding::same(4.0), clip_bg);
+                                                ui.painter().rect_stroke(
+                                                    clip_chip,
+                                                    Rounding::same(4.0),
+                                                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, if sel { 210 } else { 170 })),
+                                                );
+                                            }
+                                        }
+                                    }
+
+                                    if !drew_thumb {
                                         if let LaunchItem::App(app) = item {
                                             if let Some(tex_id) = self.app_icon_id(ctx, app) {
                                                 let icon_h = (ROW_HEIGHT - 8.0).max(16.0);
@@ -1792,6 +1924,16 @@ impl eframe::App for RofiApp {
                                     }
 
                                     if !drew_thumb {
+                                        let clip_chip_icon = match item {
+                                            LaunchItem::Clip(c) => !c.is_image(),
+                                            _ => false,
+                                        };
+                                        let icon_color = if clip_chip_icon {
+                                            Color32::from_rgb(248, 252, 255)
+                                        } else {
+                                            gc
+                                        };
+
                                         if matches!(item, LaunchItem::Pass(_)) {
                                             let chip_bg = match item {
                                                 LaunchItem::Pass(p) => pass_chip_bg(&p.name, sel),
@@ -1818,7 +1960,7 @@ impl eframe::App for RofiApp {
                                             egui::Align2::CENTER_CENTER,
                                             glyph,
                                             FontId::new(ICON_SIZE * 0.75, FontFamily::Monospace),
-                                            gc,
+                                            icon_color,
                                         );
                                     }
 
