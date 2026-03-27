@@ -115,7 +115,7 @@ fn kanagawa() -> Theme {
     Theme {
         name:          "kanagawa",
         bg:            c(0x16, 0x16, 0x1D),
-        bg_alpha:      210,
+        bg_alpha:      235,
         row_hover:     c(0x2A, 0x2A, 0x37),
         row_sel:       c(0x2D, 0x4F, 0x67),
         border:        c(0x54, 0x54, 0x6D),
@@ -139,7 +139,7 @@ fn gruvbox() -> Theme {
     Theme {
         name:          "gruvbox",
         bg:            c(0x28, 0x28, 0x28),
-        bg_alpha:      220,
+        bg_alpha:      242,
         row_hover:     c(0x3C, 0x38, 0x36),
         row_sel:       c(0x50, 0x49, 0x45),
         border:        c(0x66, 0x5C, 0x54),
@@ -163,7 +163,7 @@ fn nord() -> Theme {
     Theme {
         name:          "nord",
         bg:            c(0x2E, 0x34, 0x40),
-        bg_alpha:      220,
+        bg_alpha:      242,
         row_hover:     c(0x3B, 0x42, 0x52),
         row_sel:       c(0x43, 0x4C, 0x5E),
         border:        c(0x4C, 0x56, 0x6A),
@@ -187,7 +187,7 @@ fn tokyonight() -> Theme {
     Theme {
         name:          "tokyonight",
         bg:            c(0x1A, 0x1B, 0x26),
-        bg_alpha:      215,
+        bg_alpha:      238,
         row_hover:     c(0x24, 0x28, 0x3A),
         row_sel:       c(0x28, 0x3A, 0x57),
         border:        c(0x41, 0x4A, 0x67),
@@ -211,7 +211,7 @@ fn dracula() -> Theme {
     Theme {
         name:          "dracula",
         bg:            c(0x28, 0x2A, 0x36),
-        bg_alpha:      220,
+        bg_alpha:      242,
         row_hover:     c(0x38, 0x3A, 0x4A),
         row_sel:       c(0x44, 0x47, 0x5A),
         border:        c(0x62, 0x72, 0xA4),
@@ -235,7 +235,7 @@ fn solarized() -> Theme {
     Theme {
         name:          "solarized",
         bg:            c(0x00, 0x2B, 0x36),
-        bg_alpha:      220,
+        bg_alpha:      242,
         row_hover:     c(0x07, 0x36, 0x42),
         row_sel:       c(0x0D, 0x3D, 0x4E),
         border:        c(0x58, 0x6E, 0x75),
@@ -259,7 +259,7 @@ fn monokai() -> Theme {
     Theme {
         name:          "monokai",
         bg:            c(0x27, 0x28, 0x22),
-        bg_alpha:      220,
+        bg_alpha:      242,
         row_hover:     c(0x38, 0x39, 0x30),
         row_sel:       c(0x49, 0x49, 0x3E),
         border:        c(0x75, 0x71, 0x5E),
@@ -283,7 +283,7 @@ fn catppuccin() -> Theme {
     Theme {
         name:          "catppuccin",
         bg:            c(0x1E, 0x1E, 0x2E),
-        bg_alpha:      215,
+        bg_alpha:      238,
         row_hover:     c(0x31, 0x32, 0x44),
         row_sel:       c(0x45, 0x47, 0x5A),
         border:        c(0x58, 0x5B, 0x70),
@@ -307,7 +307,7 @@ fn onedark() -> Theme {
     Theme {
         name:          "onedark",
         bg:            c(0x28, 0x2C, 0x34),
-        bg_alpha:      220,
+        bg_alpha:      242,
         row_hover:     c(0x33, 0x37, 0x3E),
         row_sel:       c(0x3E, 0x44, 0x51),
         border:        c(0x4B, 0x52, 0x63),
@@ -331,7 +331,7 @@ fn rosepine() -> Theme {
     Theme {
         name:          "rosepine",
         bg:            c(0x19, 0x17, 0x24),
-        bg_alpha:      215,
+        bg_alpha:      238,
         row_hover:     c(0x26, 0x23, 0x33),
         row_sel:       c(0x40, 0x3D, 0x52),
         border:        c(0x6E, 0x6A, 0x86),

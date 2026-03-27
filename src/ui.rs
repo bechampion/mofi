@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -12,10 +14,10 @@ use objc2_app_kit::{
 };
 
 use crate::apps::discover_apps;
-use crate::clipboard::{load_history, start_poller, ClipboardEntry, ClipboardHistory};
+use crate::clipboard::{load_history, start_poller, ClipboardContent, ClipboardEntry, ClipboardHistory};
 use crate::config::{config_path, theme_by_name, Config, Theme};
 use crate::frecency::FrecencyStore;
-use crate::launcher::{launch_app, paste_text, LaunchItem, Launcher};
+use crate::launcher::{launch_app, paste_image_png, paste_text, run_shell_command, LaunchItem, Launcher};
 use crate::pass::discover_pass_entries;
 
 // ── macOS helpers ─────────────────────────────────────────────────────────────
@@ -41,7 +43,7 @@ fn restore_app_focus(app: &NSRunningApplication) {
 const MAPLE_MONO_REGULAR: &str = "/Users/jgarcia/Library/Fonts/MapleMono-NF-Regular.ttf";
 const MAPLE_MONO_MEDIUM: &str = "/Users/jgarcia/Library/Fonts/MapleMono-NF-Medium.ttf";
 const ICON_SIZE: f32 = 24.0;
-const ROW_HEIGHT: f32 = 38.0;
+const ROW_HEIGHT: f32 = 34.0;
 const MAX_VISIBLE_ROWS: usize = 7;
 
 // ── Kanagawa palette (kept for per-item accent colors) ────────────────────────
@@ -64,14 +66,18 @@ mod kana {
 
 fn glyph_for_item(item: &LaunchItem) -> &'static str {
     match item {
-        LaunchItem::Clip(e) => glyph_for_clip(&e.text),
+        LaunchItem::Clip(e) => glyph_for_clip(e),
         LaunchItem::Pass(e) => glyph_for_pass(&e.name),
         LaunchItem::App(a)  => glyph_for_app(&a.name),
     }
 }
 
 /// Pick a glyph based on clipboard text content.
-fn glyph_for_clip(text: &str) -> &'static str {
+fn glyph_for_clip(entry: &ClipboardEntry) -> &'static str {
+    if entry.is_image() {
+        return "\u{F021F}"; // nf-md-image
+    }
+    let text = entry.text().unwrap_or("");
     let trimmed = text.trim();
     // URL
     if trimmed.starts_with("http://")
@@ -267,6 +273,7 @@ pub struct RofiApp {
     items: Vec<LaunchItem>,
     filtered: Vec<usize>,
     selected: usize,
+    custom_selected: usize,
     launcher: Launcher,
     frecency: FrecencyStore,
     mode: Mode,
@@ -285,6 +292,7 @@ pub struct RofiApp {
     pending_mode: Arc<Mutex<Option<String>>>,
     input_items: Vec<String>,
     input_filtered: Vec<usize>,
+    custom_commands: Vec<String>,
     /// True when the current Input session is a theme picker (mofi --themes).
     input_is_themes: bool,
     /// Theme that was active when the themes picker opened (restored on Escape).
@@ -301,6 +309,7 @@ pub struct RofiApp {
     /// When the user presses Tab while on a zoxide row, this locks the path
     /// as the drill target so children can be browsed.  Cleared on hide.
     drill_target: Option<String>,
+    clip_thumb_cache: RefCell<HashMap<u64, egui::TextureHandle>>,
 }
 
 impl RofiApp {
@@ -342,6 +351,7 @@ impl RofiApp {
             items: all_items,
             filtered,
             selected: 0,
+            custom_selected: 0,
             launcher: Launcher::new(),
             frecency: FrecencyStore::load(),
             mode: Mode::Apps,
@@ -359,6 +369,7 @@ impl RofiApp {
             pending_mode,
             input_items: Vec::new(),
             input_filtered: Vec::new(),
+            custom_commands: Vec::new(),
             input_is_themes: false,
             theme_before_preview: None,
             theme,
@@ -369,6 +380,7 @@ impl RofiApp {
             zoxide_results: Vec::new(),
             zoxide_last_query: String::new(),
             drill_target: None,
+            clip_thumb_cache: RefCell::new(HashMap::new()),
         };
         app.refilter(true);
         app
@@ -445,7 +457,10 @@ impl RofiApp {
                     self.should_close = true;
                 }
                 LaunchItem::Clip(e)  => {
-                    paste_text(&e.text.clone());
+                    match &e.content {
+                        ClipboardContent::Text(text) => paste_text(text),
+                        ClipboardContent::Image { png, .. } => paste_image_png(png),
+                    }
                     crate::flash_icon('\u{f0c6}'); // fa-paperclip
                     self.should_close = true;
                 }
@@ -497,6 +512,8 @@ impl RofiApp {
         self.should_close = false;
         self.query.clear();
         self.frame_count = 0;
+        self.custom_selected = 0;
+        self.custom_commands.clear();
         self.toast = None;
         // If we were in themes mode and the user cancelled, restore original theme.
         if let Some(original) = self.theme_before_preview.take() {
@@ -556,6 +573,32 @@ impl RofiApp {
             }
         }
     }
+
+    fn clip_thumbnail_id(&self, ctx: &egui::Context, entry: &ClipboardEntry) -> Option<egui::TextureId> {
+        let png = entry.image_png()?;
+        let key = entry.captured_at;
+
+        if let Some(tex) = self.clip_thumb_cache.borrow().get(&key) {
+            return Some(tex.id());
+        }
+
+        let decoded = image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?;
+        let rgba = decoded.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        if w == 0 || h == 0 {
+            return None;
+        }
+
+        let color = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+        let tex = ctx.load_texture(
+            format!("clip-img-{}", key),
+            color,
+            egui::TextureOptions::LINEAR,
+        );
+        let id = tex.id();
+        self.clip_thumb_cache.borrow_mut().insert(key, tex);
+        Some(id)
+    }
 }
 
 // ── eframe::App ───────────────────────────────────────────────────────────────
@@ -579,6 +622,8 @@ impl eframe::App for RofiApp {
                 self.prev_app = capture_previous_app();
                 self.query.clear();
                 self.frame_count = 0;
+                self.custom_selected = 0;
+                self.custom_commands.clear();
                 self.toast = None;
 
                 let new_items = self.pending_input.lock().unwrap().take();
@@ -620,7 +665,9 @@ impl eframe::App for RofiApp {
                         }
                         Some("files") => {
                             self.mode = Mode::Files;
-                            self.file_pane.scan();
+                            self.file_pane = crate::files::Pane::new(
+                                &dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/")),
+                            );
                         }
                         _ => {
                             self.mode = Mode::Apps;
@@ -660,6 +707,8 @@ impl eframe::App for RofiApp {
                 }
                 self.query.clear();
                 self.refilter_input();
+                self.custom_selected = 0;
+                self.custom_commands.clear();
                 *self.pending_input_is_themes.lock().unwrap() = false;
             }
         }
@@ -767,7 +816,11 @@ impl eframe::App for RofiApp {
                                         self.mode = mode;
                                         self.query.clear();
                                         if mode == Mode::Clipboard { self.sync_clipboard(); }
-                                        if mode == Mode::Files { self.file_pane.scan(); }
+                                        if mode == Mode::Files {
+                                            self.file_pane = crate::files::Pane::new(
+                                                &dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/")),
+                                            );
+                                        }
                                         self.zoxide_results.clear();
                                         self.zoxide_last_query.clear();
                                         self.drill_target = None;
@@ -839,10 +892,57 @@ impl eframe::App for RofiApp {
                         }
                         response.request_focus();
 
-                        let down  = ctx.input(|i| i.key_pressed(Key::ArrowDown)) || ctrl_j;
-                        let up    = ctx.input(|i| i.key_pressed(Key::ArrowUp))   || ctrl_k;
-                        let tab   = ctx.input(|i| i.key_pressed(Key::Tab));
-                        let enter = ctx.input(|i| i.key_pressed(Key::Enter));
+        let down  = ctx.input(|i| i.key_pressed(Key::ArrowDown)) || ctrl_j;
+        let up    = ctx.input(|i| i.key_pressed(Key::ArrowUp))   || ctrl_k;
+        let tab   = ctx.input(|i| i.key_pressed(Key::Tab));
+        let enter = ctx.input(|i| i.key_pressed(Key::Enter));
+        let cmd_e = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, Key::E));
+        let cmd_f = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::F));
+
+        if cmd_e || cmd_f {
+            self.mode = Mode::Files;
+            self.query.clear();
+            self.custom_selected = 0;
+            self.custom_commands.clear();
+            self.file_pane = crate::files::Pane::new(
+                &dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/")),
+            );
+            self.zoxide_results.clear();
+            self.zoxide_last_query.clear();
+            self.drill_target = None;
+        }
+
+        let command_mode = self.mode == Mode::Apps && self.query.starts_with('!');
+        if command_mode {
+            let raw = self.query.trim_start_matches('!').trim();
+            if raw.is_empty() {
+                self.custom_commands = vec![
+                    "killall rofi".to_string(),
+                    "mofi --restart".to_string(),
+                ];
+            } else {
+                self.custom_commands = vec![raw.to_string()];
+            }
+            if !self.custom_commands.is_empty() {
+                self.custom_selected = self.custom_selected.min(self.custom_commands.len() - 1);
+                if down {
+                    self.custom_selected = (self.custom_selected + 1) % self.custom_commands.len();
+                }
+                if up {
+                    self.custom_selected = self.custom_selected.checked_sub(1).unwrap_or(self.custom_commands.len() - 1);
+                }
+                if enter {
+                    if let Some(cmd) = self.custom_commands.get(self.custom_selected) {
+                        run_shell_command(cmd);
+                        self.should_close = true;
+                        return;
+                    }
+                }
+            }
+        } else {
+            self.custom_selected = 0;
+            self.custom_commands.clear();
+        }
 
                         // Tab cycles forward (not in Input or Files — Files uses Tab for drill).
                         // Shift+Tab cycles forward too (works in all modes including Files).
@@ -864,7 +964,11 @@ impl eframe::App for RofiApp {
                                 self.mode = next;
                                 self.query.clear();
                                 if self.mode == Mode::Clipboard { self.sync_clipboard(); }
-                                if self.mode == Mode::Files { self.file_pane.scan(); }
+                                if self.mode == Mode::Files {
+                                    self.file_pane = crate::files::Pane::new(
+                                        &dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/")),
+                                    );
+                                }
                                 self.zoxide_results.clear();
                                 self.zoxide_last_query.clear();
                                 self.drill_target = None;
@@ -888,7 +992,7 @@ impl eframe::App for RofiApp {
                             if up   && len > 0 { self.selected = self.selected.checked_sub(1).unwrap_or(len - 1); }
                         }
 
-                        if enter && self.mode != Mode::Files { self.execute_selected(); return; }
+                        if enter && self.mode != Mode::Files && !command_mode { self.execute_selected(); return; }
 
                         // ── Files mode keyboard ───────────────────────────
                         if self.mode == Mode::Files {
@@ -1448,6 +1552,56 @@ impl eframe::App for RofiApp {
                                 }
                                 if cx > bar_right { break; }
                             }
+                        } else if command_mode {
+                            egui::ScrollArea::vertical().max_height(max_list_height).show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                if self.custom_commands.is_empty() {
+                                    return;
+                                }
+                                let aw = ui.available_width();
+                                for (row_idx, cmd) in self.custom_commands.iter().enumerate() {
+                                    let sel = row_idx == self.custom_selected;
+                                    let (rr, _) = ui.allocate_exact_size(Vec2::new(aw, ROW_HEIGHT), egui::Sense::hover());
+                                    if sel { ui.scroll_to_rect(rr, None); }
+
+                                    if sel {
+                                        ui.painter().rect_filled(rr, Rounding::ZERO, t.row_sel);
+                                        ui.painter().rect_filled(
+                                            egui::Rect::from_min_size(egui::pos2(rr.left(), rr.top() + 4.0), Vec2::new(3.0, rr.height() - 8.0)),
+                                            Rounding::ZERO, t.accent,
+                                        );
+                                    } else if ui.rect_contains_pointer(rr) {
+                                        ui.painter().rect_filled(rr, Rounding::ZERO, t.row_hover);
+                                    }
+
+                                    let ix = rr.left() + 14.0;
+                                    ui.painter().text(
+                                        egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
+                                        egui::Align2::CENTER_CENTER,
+                                        "\u{F489}",
+                                        FontId::new(ICON_SIZE * 0.75, FontFamily::Monospace),
+                                        if sel { t.icon_sel } else { t.icon_dim },
+                                    );
+                                    let tx = ix + ICON_SIZE + 12.0;
+                                    ui.painter().text(
+                                        egui::pos2(tx, rr.center().y),
+                                        egui::Align2::LEFT_CENTER,
+                                        cmd,
+                                        FontId::new(12.0, FontFamily::Monospace),
+                                        if sel { t.fg } else { t.fg_dim },
+                                    );
+
+                                    let click = ui.interact(rr, egui::Id::new(("cmd_row", row_idx)), egui::Sense::click());
+                                    if click.hovered() { self.custom_selected = row_idx; }
+                                    if click.double_clicked() {
+                                        if let Some(run) = self.custom_commands.get(self.custom_selected) {
+                                            run_shell_command(run);
+                                            self.should_close = true;
+                                            return;
+                                        }
+                                    }
+                                }
+                            });
                         } else {
                             // ── Normal results list ───────────────────────
                             egui::ScrollArea::vertical().max_height(max_list_height).show(ui, |ui| {
@@ -1485,15 +1639,44 @@ impl eframe::App for RofiApp {
                                     }
 
                                     let ix = rr.left() + 14.0;
-                                    ui.painter().text(
-                                        egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
-                                        egui::Align2::CENTER_CENTER,
-                                        glyph,
-                                        FontId::new(ICON_SIZE * 0.75, FontFamily::Monospace),
-                                        gc,
-                                    );
+                                    let mut tx = ix + ICON_SIZE + 12.0;
+                                    let mut drew_thumb = false;
 
-                                    let tx = ix + ICON_SIZE + 12.0;
+                                    if let LaunchItem::Clip(clip) = item {
+                                        if let Some(tex_id) = self.clip_thumbnail_id(ctx, clip) {
+                                            let thumb_h = (ROW_HEIGHT - 8.0).max(16.0);
+                                            let thumb_w = (thumb_h * 1.35).round();
+                                            let thumb_rect = egui::Rect::from_min_size(
+                                                egui::pos2(ix, rr.center().y - thumb_h * 0.5),
+                                                Vec2::new(thumb_w, thumb_h),
+                                            );
+
+                                            ui.painter().rect_stroke(
+                                                thumb_rect,
+                                                Rounding::same(2.0),
+                                                Stroke::new(1.0, t.border),
+                                            );
+                                            ui.painter().image(
+                                                tex_id,
+                                                thumb_rect.shrink(1.0),
+                                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                                Color32::WHITE,
+                                            );
+                                            tx = thumb_rect.right() + 10.0;
+                                            drew_thumb = true;
+                                        }
+                                    }
+
+                                    if !drew_thumb {
+                                        ui.painter().text(
+                                            egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
+                                            egui::Align2::CENTER_CENTER,
+                                            glyph,
+                                            FontId::new(ICON_SIZE * 0.75, FontFamily::Monospace),
+                                            gc,
+                                        );
+                                    }
+
                                     if let Some(sub) = subtitle {
                                         ui.painter().text(
                                             egui::pos2(tx, rr.center().y - 7.0),

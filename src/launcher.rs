@@ -103,6 +103,20 @@ pub fn launch_app(path: &str) {
     let _ = std::process::Command::new("open").arg(path).spawn();
 }
 
+/// Run a shell command in the background.
+pub fn run_shell_command(cmd: &str) {
+    let cmd = cmd.trim();
+    if cmd.is_empty() {
+        return;
+    }
+    let _ = std::process::Command::new("sh")
+        .args(["-lc", cmd])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 /// Copy text to clipboard only (no auto-paste).
 pub fn paste_text(text: &str) {
     use std::io::Write;
@@ -115,5 +129,18 @@ pub fn paste_text(text: &str) {
             let _ = stdin.write_all(text.as_bytes());
         }
         let _ = child.wait();
+    }
+}
+
+/// Copy PNG image bytes to clipboard.
+pub fn paste_image_png(png_bytes: &[u8]) {
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG};
+    use objc2_foundation::NSData;
+
+    unsafe {
+        let pb = NSPasteboard::generalPasteboard();
+        pb.clearContents();
+        let data = NSData::with_bytes(png_bytes);
+        let _ = pb.setData_forType(Some(&data), NSPasteboardTypePNG);
     }
 }

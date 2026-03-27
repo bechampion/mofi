@@ -16,8 +16,27 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 use signal_hook::consts::SIGUSR1;
 
-const PID_FILE: &str = "/tmp/mofi.pid";
-const SOCK_FILE: &str = "/tmp/mofi.sock";
+fn ipc_dir() -> std::path::PathBuf {
+    let mut p = dirs::cache_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(std::env::temp_dir);
+    p.push("mofi");
+    p.push("ipc");
+    let _ = fs::create_dir_all(&p);
+    p
+}
+
+fn pid_file() -> std::path::PathBuf {
+    let mut p = ipc_dir();
+    p.push("mofi.pid");
+    p
+}
+
+fn sock_file() -> std::path::PathBuf {
+    let mut p = ipc_dir();
+    p.push("mofi.sock");
+    p
+}
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -34,6 +53,10 @@ fn main() -> eframe::Result<()> {
         }
         "--clip" => {
             show_tab_main("clip");
+            Ok(())
+        }
+        "--files" => {
+            show_tab_main("files");
             Ok(())
         }
         "--input" => {
@@ -59,10 +82,13 @@ fn main() -> eframe::Result<()> {
 // ── --pass / --clip (show on a specific tab, wait for selection) ──────────────
 
 fn show_tab_main(tab: &str) {
-    let mut stream = match UnixStream::connect(SOCK_FILE) {
+    let sock = sock_file();
+    let pid_path = pid_file();
+
+    let mut stream = match UnixStream::connect(&sock) {
         Ok(s) => s,
         Err(_) => {
-            eprintln!("mofi: daemon not running (socket not found at {})", SOCK_FILE);
+            eprintln!("mofi: daemon not running (socket not found at {})", sock.display());
             std::process::exit(1);
         }
     };
@@ -72,13 +98,13 @@ fn show_tab_main(tab: &str) {
     let msg = format!("tab:{}\n", tab);
     stream.write_all(msg.as_bytes()).ok();
 
-    match fs::read_to_string(PID_FILE) {
+    match fs::read_to_string(&pid_path) {
         Ok(contents) => {
             let pid: i32 = contents.trim().parse().expect("Invalid PID");
             unsafe { libc::kill(pid, libc::SIGUSR1) };
         }
         Err(_) => {
-            eprintln!("mofi: no PID file at {}", PID_FILE);
+            eprintln!("mofi: no PID file at {}", pid_path.display());
             std::process::exit(1);
         }
     }
@@ -106,23 +132,26 @@ fn show_tab_main(tab: &str) {
 // ── --client (existing toggle / pass flow) ────────────────────────────────────
 
 fn client_main() {
-    let mut stream = match UnixStream::connect(SOCK_FILE) {
+    let sock = sock_file();
+    let pid_path = pid_file();
+
+    let mut stream = match UnixStream::connect(&sock) {
         Ok(s) => s,
         Err(_) => {
-            eprintln!("mofi: daemon not running (socket not found at {})", SOCK_FILE);
+            eprintln!("mofi: daemon not running (socket not found at {})", sock.display());
             std::process::exit(1);
         }
     };
 
     stream.write_all(b"ready\n").ok();
 
-    match fs::read_to_string(PID_FILE) {
+    match fs::read_to_string(&pid_path) {
         Ok(contents) => {
             let pid: i32 = contents.trim().parse().expect("Invalid PID");
             unsafe { libc::kill(pid, libc::SIGUSR1) };
         }
         Err(_) => {
-            eprintln!("mofi: no PID file at {}", PID_FILE);
+            eprintln!("mofi: no PID file at {}", pid_path.display());
             std::process::exit(1);
         }
     }
@@ -159,10 +188,13 @@ fn input_client_main() {
         std::process::exit(1);
     }
 
-    let mut stream = match UnixStream::connect(SOCK_FILE) {
+    let sock = sock_file();
+    let pid_path = pid_file();
+
+    let mut stream = match UnixStream::connect(&sock) {
         Ok(s) => s,
         Err(_) => {
-            eprintln!("mofi: daemon not running (socket not found at {})", SOCK_FILE);
+            eprintln!("mofi: daemon not running (socket not found at {})", sock.display());
             std::process::exit(1);
         }
     };
@@ -174,13 +206,13 @@ fn input_client_main() {
     stream.write_all(message.as_bytes()).ok();
 
     // Signal the daemon to show the window.
-    match fs::read_to_string(PID_FILE) {
+    match fs::read_to_string(&pid_path) {
         Ok(contents) => {
             let pid: i32 = contents.trim().parse().expect("Invalid PID");
             unsafe { libc::kill(pid, libc::SIGUSR1) };
         }
         Err(_) => {
-            eprintln!("mofi: no PID file at {}", PID_FILE);
+            eprintln!("mofi: no PID file at {}", pid_path.display());
             std::process::exit(1);
         }
     }
@@ -221,7 +253,10 @@ fn themes_client_main() {
 
     // Send via the --input protocol: pipe to ourselves as a subprocess.
     // We talk directly to the daemon socket so we don't need to fork.
-    let mut stream = match std::os::unix::net::UnixStream::connect(SOCK_FILE) {
+    let sock = sock_file();
+    let pid_path = pid_file();
+
+    let mut stream = match std::os::unix::net::UnixStream::connect(&sock) {
         Ok(s) => s,
         Err(_) => {
             eprintln!("mofi: daemon not running");
@@ -235,13 +270,13 @@ fn themes_client_main() {
     stream.write_all(message.as_bytes()).ok();
 
     // Signal the daemon to show the window.
-    match fs::read_to_string(PID_FILE) {
+    match fs::read_to_string(&pid_path) {
         Ok(contents) => {
             let pid: i32 = contents.trim().parse().expect("Invalid PID");
             unsafe { libc::kill(pid, libc::SIGUSR1) };
         }
         Err(_) => {
-            eprintln!("mofi: no PID file at {}", PID_FILE);
+            eprintln!("mofi: no PID file at {}", pid_path.display());
             std::process::exit(1);
         }
     }
@@ -348,34 +383,40 @@ fn install_main() {
     let skhdrc = PathBuf::from(shellexpand::tilde("~/.skhdrc").as_ref());
 
     let hotkey_line = format!(
-        "cmd - space : {} --client\ncmd + shift - p : {} --pass\ncmd + shift - y : {} --clip",
-        bin_str, bin_str, bin_str
+        "cmd - space : {} --client\ncmd - f : {} --files\ncmd + shift - e : {} --files\ncmd + shift - p : {} --pass\ncmd + shift - y : {} --clip",
+        bin_str, bin_str, bin_str, bin_str, bin_str
     );
     let marker = "# mofi";
 
     let existing = fs::read_to_string(&skhdrc).unwrap_or_default();
-
-    if existing.contains(marker) {
-        println!("  [skhd]  mofi entry already present in ~/.skhdrc — skipping");
-    } else {
-        // Append the hotkey block.
-        let block = format!("\n{}\n{}\n", marker, hotkey_line);
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&skhdrc)
-            .unwrap_or_else(|e| { eprintln!("mofi: cannot open ~/.skhdrc: {}", e); std::process::exit(1); });
-        use std::io::Write as _;
-        file.write_all(block.as_bytes())
-            .unwrap_or_else(|e| { eprintln!("mofi: cannot write ~/.skhdrc: {}", e); std::process::exit(1); });
-        println!("  [skhd]  appended hotkey → ~/.skhdrc");
-
-        // Reload skhd if it is running.
-        let reload = std::process::Command::new("skhd").arg("--reload").status();
-        match reload {
-            Ok(s) if s.success() => println!("  [skhd]  reloaded"),
-            Ok(_) | Err(_)       => println!("  [skhd]  skhd not running — start it with: skhd --start-service"),
+    let mut kept: Vec<&str> = Vec::new();
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        let is_old_mofi_marker = trimmed == marker;
+        let is_old_mofi_binding = trimmed.contains("mofi --client")
+            || trimmed.contains("mofi --files")
+            || trimmed.contains("mofi --pass")
+            || trimmed.contains("mofi --clip");
+        if !is_old_mofi_marker && !is_old_mofi_binding {
+            kept.push(line);
         }
+    }
+    let mut new_contents = kept.join("\n");
+    if !new_contents.is_empty() && !new_contents.ends_with('\n') {
+        new_contents.push('\n');
+    }
+    let block = format!("\n{}\n{}\n", marker, hotkey_line);
+    new_contents.push_str(&block);
+
+    fs::write(&skhdrc, new_contents)
+        .unwrap_or_else(|e| { eprintln!("mofi: cannot write ~/.skhdrc: {}", e); std::process::exit(1); });
+    println!("  [skhd]  updated hotkeys in ~/.skhdrc");
+
+    // Reload skhd if it is running.
+    let reload = std::process::Command::new("skhd").arg("--reload").status();
+    match reload {
+        Ok(s) if s.success() => println!("  [skhd]  reloaded"),
+        Ok(_) | Err(_)       => println!("  [skhd]  reload failed — run: brew services restart skhd"),
     }
 
     // ── 3. mofi config dir ───────────────────────────────────────────────────
@@ -393,6 +434,7 @@ fn install_main() {
     println!();
     println!("Done. mofi is installed and running.");
     println!("  Open with: Cmd+Space");
+    println!("  Files with: Cmd+F");
     println!("  Pick a theme: mofi --themes");
 }
 
@@ -436,7 +478,7 @@ fn restart_main() {
 
     // Give the daemon a moment to write its PID file, then confirm.
     std::thread::sleep(std::time::Duration::from_millis(400));
-    match fs::read_to_string(PID_FILE) {
+    match fs::read_to_string(pid_file()) {
         Ok(pid) => println!("  [restart] daemon running (PID {})", pid.trim()),
         Err(_)  => println!("  [restart] daemon started (PID file not yet written)"),
     }
@@ -568,12 +610,12 @@ objc2::define_class!(
             use std::io::Write as _;
 
             // 1. Send "show:about\n" to the daemon socket (fire-and-forget).
-            if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(SOCK_FILE) {
+            if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(sock_file()) {
                 stream.write_all(b"show:about\n").ok();
             }
 
             // 2. Signal the daemon to wake up.
-            if let Ok(contents) = std::fs::read_to_string(PID_FILE) {
+            if let Ok(contents) = std::fs::read_to_string(pid_file()) {
                 if let Ok(pid) = contents.trim().parse::<i32>() {
                     unsafe { libc::kill(pid, libc::SIGUSR1) };
                 }
@@ -708,15 +750,16 @@ fn setup_status_bar() {
 
 fn run_daemon() -> eframe::Result<()> {
     let pid = std::process::id();
-    fs::write(PID_FILE, pid.to_string()).ok();
+    fs::write(pid_file(), pid.to_string()).ok();
     let _ = unsafe { libc::atexit(cleanup_files) };
 
     let toggle = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGUSR1, Arc::clone(&toggle))
         .expect("Failed to register SIGUSR1 handler");
 
-    let _ = fs::remove_file(SOCK_FILE);
-    let listener = UnixListener::bind(SOCK_FILE).expect("Failed to bind Unix socket");
+    let sock = sock_file();
+    let _ = fs::remove_file(&sock);
+    let listener = UnixListener::bind(&sock).expect("Failed to bind Unix socket");
 
     // Shared slot for the pass-entry result (existing mechanism).
     let pending_entry: Arc<Mutex<Option<Option<String>>>> = Arc::new(Mutex::new(None));
@@ -868,8 +911,8 @@ fn handle_client(
 }
 
 extern "C" fn cleanup_files() {
-    let _ = fs::remove_file(PID_FILE);
-    let _ = fs::remove_file(SOCK_FILE);
+    let _ = fs::remove_file(pid_file());
+    let _ = fs::remove_file(sock_file());
 }
 
 #[cfg(test)]
