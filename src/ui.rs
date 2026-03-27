@@ -13,7 +13,7 @@ use objc2_app_kit::{
     NSRunningApplication, NSWorkspace,
 };
 
-use crate::apps::discover_apps;
+use crate::apps::{discover_apps, AppEntry};
 use crate::clipboard::{load_history, start_poller, ClipboardContent, ClipboardEntry, ClipboardHistory};
 use crate::config::{config_path, theme_by_name, Config, Theme};
 use crate::frecency::FrecencyStore;
@@ -126,25 +126,41 @@ fn glyph_for_clip(entry: &ClipboardEntry) -> &'static str {
 }
 
 /// Pick a padlock glyph based on the pass entry path.
-fn glyph_for_pass(name: &str) -> &'static str {
+fn glyph_for_pass(_name: &str) -> &'static str {
+    "\u{F023}"
+}
+
+fn pass_accent(name: &str) -> Color32 {
     let lower = name.to_lowercase();
-    // Category hints from folder/entry name.
-    if lower.contains("ssh") || lower.contains("gpg") || lower.contains("key") {
-        "\u{F0306}"   // nf-md-key_variant
-    } else if lower.contains("bank") || lower.contains("finance") || lower.contains("credit") {
-        "\u{F024B}"   // nf-md-bank
-    } else if lower.contains("email") || lower.contains("mail") || lower.contains("smtp") {
-        "\u{F0E0}"    // nf-fa-envelope
-    } else if lower.contains("wifi") || lower.contains("network") || lower.contains("vpn") {
-        "\u{F0A72}"   // nf-md-lock_check  (network cred)
-    } else if lower.contains("github") || lower.contains("gitlab") || lower.contains("git") {
-        "\u{F0A70}"   // nf-md-source_repository_multiple → use lock + git feel
+    if lower.contains("bank") || lower.contains("finance") || lower.contains("credit") {
+        kana::CARP_YELLOW
     } else if lower.contains("work") || lower.contains("corp") || lower.contains("office") {
-        "\u{F0A75}"   // nf-md-briefcase_lock
-    } else if name.contains('/') {
-        "\u{F023}"    // nf-fa-lock  (nested entry — standard padlock)
+        kana::SURIMI_ORANGE
+    } else if lower.contains("wifi") || lower.contains("network") || lower.contains("vpn") {
+        kana::SPRING_BLUE
+    } else if lower.contains("email") || lower.contains("mail") {
+        kana::SAKURA_PINK
+    } else if lower.contains("ssh") || lower.contains("gpg") || lower.contains("key") {
+        kana::CRYSTAL_BLUE
     } else {
-        "\u{F09C0}"   // nf-md-lock  (top-level entry — solid lock)
+        accent_for_name(name)
+    }
+}
+
+fn pass_chip_bg(name: &str, selected: bool) -> Color32 {
+    let c = pass_accent(name);
+    let alpha = if selected { 220 } else { 170 };
+    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
+}
+
+fn pass_emoji_bytes(name: &str) -> &'static [u8] {
+    let lower = name.to_lowercase();
+    if lower.contains("ssh") || lower.contains("gpg") || lower.contains("key") {
+        include_bytes!("../assets/key-emoji.png")
+    } else if lower.contains("bank") || lower.contains("finance") || lower.contains("credit") {
+        include_bytes!("../assets/lock-key-emoji.png")
+    } else {
+        include_bytes!("../assets/lock-emoji.png")
     }
 }
 
@@ -209,7 +225,7 @@ fn glyph_for_app(name: &str) -> &'static str {
 fn glyph_color_for_item(item: &LaunchItem, t: &Theme) -> Color32 {
     match item {
         LaunchItem::Clip(_) => t.accent2,
-        LaunchItem::Pass(_) => t.toast,
+        LaunchItem::Pass(p) => pass_accent(&p.name),
         LaunchItem::App(a)  => accent_for_name(&a.name),
     }
 }
@@ -310,6 +326,8 @@ pub struct RofiApp {
     /// as the drill target so children can be browsed.  Cleared on hide.
     drill_target: Option<String>,
     clip_thumb_cache: RefCell<HashMap<u64, egui::TextureHandle>>,
+    app_icon_cache: RefCell<HashMap<String, egui::TextureHandle>>,
+    pass_emoji_cache: RefCell<HashMap<String, egui::TextureHandle>>,
 }
 
 impl RofiApp {
@@ -381,6 +399,8 @@ impl RofiApp {
             zoxide_last_query: String::new(),
             drill_target: None,
             clip_thumb_cache: RefCell::new(HashMap::new()),
+            app_icon_cache: RefCell::new(HashMap::new()),
+            pass_emoji_cache: RefCell::new(HashMap::new()),
         };
         app.refilter(true);
         app
@@ -597,6 +617,70 @@ impl RofiApp {
         );
         let id = tex.id();
         self.clip_thumb_cache.borrow_mut().insert(key, tex);
+        Some(id)
+    }
+
+    fn app_icon_id(&self, ctx: &egui::Context, app: &AppEntry) -> Option<egui::TextureId> {
+        if let Some(tex) = self.app_icon_cache.borrow().get(&app.path) {
+            return Some(tex.id());
+        }
+
+        use objc2_foundation::NSString;
+
+        let tiff_bytes = {
+            let ws = NSWorkspace::sharedWorkspace();
+            let path = NSString::from_str(&app.path);
+            let image = ws.iconForFile(&path);
+            image.TIFFRepresentation()?.to_vec()
+        };
+
+        let decoded = image::load_from_memory_with_format(&tiff_bytes, image::ImageFormat::Tiff).ok()?;
+        let rgba = decoded.thumbnail(64, 64).to_rgba8();
+        let (w, h) = rgba.dimensions();
+        if w == 0 || h == 0 {
+            return None;
+        }
+
+        let color = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+        let tex = ctx.load_texture(
+            format!("app-icon-{}", app.path),
+            color,
+            egui::TextureOptions::LINEAR,
+        );
+        let id = tex.id();
+        self.app_icon_cache.borrow_mut().insert(app.path.clone(), tex);
+        Some(id)
+    }
+
+    fn pass_emoji_id(&self, ctx: &egui::Context, name: &str) -> Option<egui::TextureId> {
+        let lower = name.to_lowercase();
+        let key = if lower.contains("ssh") || lower.contains("gpg") || lower.contains("key") {
+            "key"
+        } else if lower.contains("bank") || lower.contains("finance") || lower.contains("credit") {
+            "lock-key"
+        } else {
+            "lock"
+        };
+
+        if let Some(tex) = self.pass_emoji_cache.borrow().get(key) {
+            return Some(tex.id());
+        }
+
+        let decoded = image::load_from_memory_with_format(pass_emoji_bytes(name), image::ImageFormat::Png).ok()?;
+        let rgba = decoded.thumbnail(64, 64).to_rgba8();
+        let (w, h) = rgba.dimensions();
+        if w == 0 || h == 0 {
+            return None;
+        }
+
+        let color = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+        let tex = ctx.load_texture(
+            format!("pass-emoji-{}", key),
+            color,
+            egui::TextureOptions::LINEAR,
+        );
+        let id = tex.id();
+        self.pass_emoji_cache.borrow_mut().insert(key.to_string(), tex);
         Some(id)
     }
 }
@@ -1668,6 +1752,67 @@ impl eframe::App for RofiApp {
                                     }
 
                                     if !drew_thumb {
+                                        if let LaunchItem::App(app) = item {
+                                            if let Some(tex_id) = self.app_icon_id(ctx, app) {
+                                                let icon_h = (ROW_HEIGHT - 8.0).max(16.0);
+                                                let icon_rect = egui::Rect::from_min_size(
+                                                    egui::pos2(ix, rr.center().y - icon_h * 0.5),
+                                                    Vec2::new(icon_h, icon_h),
+                                                );
+                                                ui.painter().image(
+                                                    tex_id,
+                                                    icon_rect,
+                                                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                                    Color32::WHITE,
+                                                );
+                                                tx = icon_rect.right() + 10.0;
+                                                drew_thumb = true;
+                                            }
+                                        }
+                                    }
+
+                                    if !drew_thumb {
+                                        if let LaunchItem::Pass(p) = item {
+                                            if let Some(tex_id) = self.pass_emoji_id(ctx, &p.name) {
+                                                let icon_h = (ROW_HEIGHT - 8.0).max(16.0);
+                                                let icon_rect = egui::Rect::from_min_size(
+                                                    egui::pos2(ix, rr.center().y - icon_h * 0.5),
+                                                    Vec2::new(icon_h, icon_h),
+                                                );
+                                                ui.painter().image(
+                                                    tex_id,
+                                                    icon_rect,
+                                                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                                    Color32::WHITE,
+                                                );
+                                                tx = icon_rect.right() + 10.0;
+                                                drew_thumb = true;
+                                            }
+                                        }
+                                    }
+
+                                    if !drew_thumb {
+                                        if matches!(item, LaunchItem::Pass(_)) {
+                                            let chip_bg = match item {
+                                                LaunchItem::Pass(p) => pass_chip_bg(&p.name, sel),
+                                                _ => t.tab_active_bg,
+                                            };
+                                            let chip = egui::Rect::from_center_size(
+                                                egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
+                                                Vec2::new(17.0, 17.0),
+                                            );
+                                            ui.painter().rect_filled(
+                                                chip,
+                                                Rounding::same(4.0),
+                                                chip_bg,
+                                            );
+                                            ui.painter().rect_stroke(
+                                                chip,
+                                                Rounding::same(4.0),
+                                                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, if sel { 210 } else { 170 })),
+                                            );
+                                        }
+
                                         ui.painter().text(
                                             egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
                                             egui::Align2::CENTER_CENTER,
