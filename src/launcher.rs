@@ -5,6 +5,14 @@ use crate::pass::PassEntry;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 
+/// Reap a spawned child in the background so it never becomes a zombie.
+fn reap_child(child: std::process::Child) {
+    std::thread::spawn(move || {
+        let mut c = child;
+        let _ = c.wait();
+    });
+}
+
 /// A result item shown in the launcher list.
 #[derive(Clone, Debug)]
 pub enum LaunchItem {
@@ -143,7 +151,7 @@ fn launch_app_linux(desktop_path: &str) {
     let basename = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
     if !basename.is_empty() {
-        let status = unsafe {
+        let child = unsafe {
             std::process::Command::new("gtk-launch")
                 .arg(basename)
                 .stdin(std::process::Stdio::null())
@@ -155,7 +163,8 @@ fn launch_app_linux(desktop_path: &str) {
                 })
                 .spawn()
         };
-        if status.is_ok() {
+        if let Ok(c) = child {
+            reap_child(c);
             return;
         }
     }
@@ -207,7 +216,8 @@ fn launch_app_linux(desktop_path: &str) {
                                 libc::setsid();
                                 Ok(())
                             })
-                            .spawn();
+                            .spawn()
+                            .map(reap_child);
                     }
                 }
             }
@@ -235,6 +245,7 @@ pub fn launch_shell_command(cmd: &str) {
                 libc::setsid();
                 Ok(())
             })
-            .spawn();
+            .spawn()
+            .map(reap_child);
     }
 }
