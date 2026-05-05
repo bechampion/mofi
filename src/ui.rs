@@ -2520,6 +2520,12 @@ impl RofiApp {
                                     } else {
                                         None
                                     };
+                                    // Extract app icon path early to avoid borrow conflicts.
+                                    let app_icon_path = if let LaunchItem::App(app) = item {
+                                        app.icon_path.clone()
+                                    } else {
+                                        None
+                                    };
 
                                     let (rr, _) = ui.allocate_exact_size(
                                         Vec2::new(aw, ROW_HEIGHT),
@@ -2592,13 +2598,41 @@ impl RofiApp {
                                     }
 
                                     if !drew_thumbnail {
-                                        ui.painter().text(
-                                            egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
-                                            egui::Align2::CENTER_CENTER,
-                                            glyph,
-                                            FontId::new(ICON_SIZE * 0.75, FontFamily::Monospace),
-                                            gc,
-                                        );
+                                        // Try to render the app icon as a PNG image.
+                                        let mut drew_app_icon = false;
+                                        #[cfg(target_os = "linux")]
+                                        if let Some(ref icon_path) = app_icon_path {
+                                            if let Some((tex, _dims)) =
+                                                self.load_image_texture(ctx, icon_path)
+                                            {
+                                                let icon_h = ICON_SIZE;
+                                                let icon_w = ICON_SIZE;
+                                                let icon_rect = egui::Rect::from_min_size(
+                                                    egui::pos2(ix, rr.center().y - icon_h / 2.0),
+                                                    Vec2::new(icon_w, icon_h),
+                                                );
+                                                ui.painter().image(
+                                                    tex.id(),
+                                                    icon_rect,
+                                                    egui::Rect::from_min_max(
+                                                        egui::pos2(0.0, 0.0),
+                                                        egui::pos2(1.0, 1.0),
+                                                    ),
+                                                    Color32::WHITE,
+                                                );
+                                                drew_app_icon = true;
+                                            }
+                                        }
+
+                                        if !drew_app_icon {
+                                            ui.painter().text(
+                                                egui::pos2(ix + ICON_SIZE / 2.0, rr.center().y),
+                                                egui::Align2::CENTER_CENTER,
+                                                glyph,
+                                                FontId::new(ICON_SIZE * 0.75, FontFamily::Monospace),
+                                                gc,
+                                            );
+                                        }
 
                                         let tx = ix + ICON_SIZE + 6.0;
                                         if let Some(sub) = subtitle {
@@ -2676,7 +2710,7 @@ impl RofiApp {
                                         egui::Align2::CENTER_CENTER,
                                         shell_glyph,
                                         FontId::new(ICON_SIZE * 0.75, FontFamily::Monospace),
-                                        if sel { t.accent } else { dim_color(t.accent) },
+                                        if sel { t.icon_sel } else { t.icon_dim },
                                     );
                                     let tx = ix + ICON_SIZE + 6.0;
                                     ui.painter().text(
@@ -2718,11 +2752,7 @@ impl RofiApp {
                                             egui::Align2::CENTER_CENTER,
                                             history_glyph,
                                             FontId::new(ICON_SIZE * 0.75, FontFamily::Monospace),
-                                            if sel {
-                                                t.fg_muted
-                                            } else {
-                                                dim_color(t.fg_muted)
-                                            },
+                                            if sel { t.icon_sel } else { t.icon_dim },
                                         );
                                         let tx = ix + ICON_SIZE + 6.0;
                                         ui.painter().text(

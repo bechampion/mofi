@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 pub struct AppEntry {
     pub name: String,
     pub path: String,
+    /// Resolved filesystem path to the app icon (PNG), if found.
+    pub icon_path: Option<String>,
 }
 
 pub fn discover_apps() -> Vec<AppEntry> {
@@ -82,6 +84,7 @@ fn collect_app(path: &Path, seen: &mut HashSet<String>, apps: &mut Vec<AppEntry>
     apps.push(AppEntry {
         name,
         path: path_str,
+        icon_path: None,
     });
 }
 
@@ -131,6 +134,7 @@ fn parse_desktop_file(path: &Path, seen: &mut HashSet<String>) -> Option<AppEntr
 
     let mut name: Option<String> = None;
     let mut exec: Option<String> = None;
+    let mut icon: Option<String> = None;
     let mut app_type: Option<String> = None;
     let mut no_display = false;
     let mut hidden = false;
@@ -161,6 +165,8 @@ fn parse_desktop_file(path: &Path, seen: &mut HashSet<String>) -> Option<AppEntr
             }
         } else if let Some(val) = line.strip_prefix("Exec=") {
             exec = Some(val.to_string());
+        } else if let Some(val) = line.strip_prefix("Icon=") {
+            icon = Some(val.to_string());
         } else if line == "NoDisplay=true" {
             no_display = true;
         } else if line == "Hidden=true" {
@@ -182,11 +188,53 @@ fn parse_desktop_file(path: &Path, seen: &mut HashSet<String>) -> Option<AppEntr
         return None;
     }
 
+    // Resolve the icon to a filesystem path.
+    let icon_path = icon.and_then(|i| resolve_icon(&i));
+
     // Build an Exec string that can be passed to xdg-open or run directly.
     // We store the desktop file path as the "path" so launch_app can use it.
     let _ = exec; // exec is used via the path in launcher.rs
     Some(AppEntry {
         name,
         path: path_str,
+        icon_path,
     })
+}
+
+/// Resolve an icon name (or absolute path) to a PNG file on disk.
+/// Searches hicolor icon theme at preferred sizes, then /usr/share/pixmaps.
+#[cfg(target_os = "linux")]
+fn resolve_icon(icon: &str) -> Option<String> {
+    // If it's already an absolute path, use it directly (if it exists and is PNG).
+    if icon.starts_with('/') {
+        let p = Path::new(icon);
+        if p.exists() {
+            // Accept PNG directly; skip SVG since we only handle PNG loading.
+            if icon.ends_with(".png") {
+                return Some(icon.to_string());
+            }
+        }
+        return None;
+    }
+
+    // Preferred sizes to search (larger = better quality for 18px display after downscale).
+    let sizes = ["48x48", "64x64", "32x32", "96x96", "128x128", "256x256", "24x24", "16x16"];
+    let base_dirs = ["/usr/share/icons/hicolor"];
+
+    for base in &base_dirs {
+        for size in &sizes {
+            let candidate = format!("{}/{}/apps/{}.png", base, size, icon);
+            if Path::new(&candidate).exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    // Check /usr/share/pixmaps.
+    let pixmap = format!("/usr/share/pixmaps/{}.png", icon);
+    if Path::new(&pixmap).exists() {
+        return Some(pixmap);
+    }
+
+    None
 }
