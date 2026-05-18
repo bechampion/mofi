@@ -718,14 +718,14 @@ fn build_window_list(raw: Vec<WinEntry>, history: &FocusHistory, current_wid: u3
 // The palette cycles per-window *within* an app group (not globally).
 
 const WIN_PALETTE: &[egui::Color32] = &[
-    egui::Color32::from_rgb(126, 156, 216), // crystalBlue
-    egui::Color32::from_rgb(152, 187, 108), // springGreen
-    egui::Color32::from_rgb(229, 183, 103), // carpYellow
-    egui::Color32::from_rgb(210, 126, 153), // sakuraPink
-    egui::Color32::from_rgb(149, 127, 184), // oniViolet
-    egui::Color32::from_rgb(127, 180, 202), // dragonBlue
-    egui::Color32::from_rgb(255, 160, 102), // surimiOrange
-    egui::Color32::from_rgb(106, 153, 85),  // leafGreen
+    egui::Color32::from_rgb(0x89, 0xB4, 0xFA), // blue
+    egui::Color32::from_rgb(0xA6, 0xE3, 0xA1), // green
+    egui::Color32::from_rgb(0xF9, 0xE2, 0xAF), // yellow
+    egui::Color32::from_rgb(0xF3, 0x8B, 0xA8), // red
+    egui::Color32::from_rgb(0xCB, 0xA6, 0xF7), // mauve
+    egui::Color32::from_rgb(0x89, 0xDC, 0xEB), // sky
+    egui::Color32::from_rgb(0xFA, 0xB3, 0x87), // peach
+    egui::Color32::from_rgb(0x94, 0xE2, 0xD5), // teal
 ];
 
 /// Returns a per-window accent color.
@@ -785,12 +785,12 @@ fn glyph_for(name: &str) -> &'static str {
 // ── Fonts ─────────────────────────────────────────────────────────────────────
 
 fn load_fonts(ctx: &egui::Context) {
-    let font_path = dirs::home_dir().unwrap().join("Library/Fonts/MapleMono-NF-Regular.ttf");
+    let font_path = dirs::home_dir().unwrap().join("Library/Fonts/JetBrainsMono-NF-Regular.ttf");
     let mut fonts = egui::FontDefinitions::default();
     if let Ok(bytes) = std::fs::read(&font_path) {
-        fonts.font_data.insert("maple".into(), egui::FontData::from_owned(bytes));
+        fonts.font_data.insert("jetbrains".into(), egui::FontData::from_owned(bytes));
         for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            fonts.families.entry(fam).or_default().insert(0, "maple".into());
+            fonts.families.entry(fam).or_default().insert(0, "jetbrains".into());
         }
     }
     ctx.set_fonts(fonts);
@@ -810,12 +810,12 @@ struct Colors {
 impl Colors {
     fn kanagawa() -> Self {
         Self {
-            bg:       egui::Color32::from_rgba_premultiplied(22, 22, 34, 230),
-            border:   egui::Color32::from_rgb(84, 84, 109),
-            card_bg:  egui::Color32::from_rgba_premultiplied(31, 31, 48, 240),
-            card_sel: egui::Color32::from_rgba_premultiplied(42, 89, 137, 255),
-            fg:       egui::Color32::from_rgb(220, 215, 186),
-            fg_dim:   egui::Color32::from_rgb(114, 113, 105),
+            bg:       egui::Color32::from_rgba_premultiplied(0x1E, 0x1E, 0x2E, 230),
+            border:   egui::Color32::from_rgb(0x58, 0x5B, 0x70),
+            card_bg:  egui::Color32::from_rgba_premultiplied(0x31, 0x32, 0x44, 240),
+            card_sel: egui::Color32::from_rgba_premultiplied(0x45, 0x47, 0x5A, 255),
+            fg:       egui::Color32::from_rgb(0xCD, 0xD6, 0xF4),
+            fg_dim:   egui::Color32::from_rgb(0x6C, 0x70, 0x86),
         }
     }
 }

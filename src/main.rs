@@ -1,6 +1,7 @@
 mod apps;
 mod clipboard;
 mod config;
+mod emoji;
 mod files;
 mod frecency;
 mod launcher;
@@ -58,6 +59,12 @@ fn main() {
             linux_client_main("files");
             #[cfg(not(target_os = "linux"))]
             show_tab_main("files");
+        }
+        "--emoji" => {
+            #[cfg(target_os = "linux")]
+            linux_client_main("emoji");
+            #[cfg(not(target_os = "linux"))]
+            show_tab_main("emoji");
         }
         "--pass" => {
             show_tab_main("pass");
@@ -482,8 +489,8 @@ fn install_macos() {
     let skhdrc = PathBuf::from(shellexpand::tilde("~/.skhdrc").as_ref());
 
     let hotkey_line = format!(
-        "cmd - space : {} --client\ncmd + shift - p : {} --pass\ncmd + shift - y : {} --clip",
-        bin_str, bin_str, bin_str
+        "cmd - space : {} --client\ncmd + shift - p : {} --pass\ncmd + shift - y : {} --clip\ncmd + shift - e : {} --emoji",
+        bin_str, bin_str, bin_str, bin_str
     );
     let marker = "# mofi";
 
@@ -602,13 +609,22 @@ WantedBy=graphical-session.target
     println!("    {} --password   (jump to Pass tab)", bin_str);
     println!("    {} --clipboard  (jump to Clipboard tab)", bin_str);
     println!("    {} --files      (jump to Files tab)", bin_str);
+    println!("    {} --emoji      (jump to Emoji picker)", bin_str);
     println!("  Examples:");
     println!(
         "    Hyprland  → bind = SUPER, Space, exec, {} --client",
         bin_str
     );
     println!(
+        "    Hyprland  → bind = SUPER SHIFT, E, exec, {} --emoji",
+        bin_str
+    );
+    println!(
         "    Sway      → bindsym Mod4+space exec {} --client",
+        bin_str
+    );
+    println!(
+        "    Sway      → bindsym Mod4+Shift+e exec {} --emoji",
         bin_str
     );
     println!(

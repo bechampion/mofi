@@ -17,6 +17,7 @@ use objc2_app_kit::{
 use crate::apps::discover_apps;
 use crate::clipboard::{load_history, start_poller, ClipboardEntry, ClipboardHistory};
 use crate::config::{config_path, theme_by_name, Config, Theme};
+use crate::emoji::{emoji_grid_cols, EMOJI_LIST};
 use crate::frecency::FrecencyStore;
 #[cfg(target_os = "linux")]
 use crate::launcher::launch_shell_command;
@@ -72,9 +73,9 @@ fn font_search_dirs() -> Vec<std::path::PathBuf> {
     dirs
 }
 
-/// Try to load a font by stem name (e.g. "MapleMono-NF-Regular").
+/// Try to load a font by stem name (e.g. "JetBrainsMono-NF-Regular").
 /// First tries the exact filename (with .ttf/.otf), then scans font directories
-/// for any file whose name *contains* the stem — handles e.g. "MapleMono-NF-Regular(1).ttf".
+/// for any file whose name *contains* the stem — handles e.g. "JetBrainsMono-NF-Regular(1).ttf".
 fn find_font(stem: &str) -> Option<Vec<u8>> {
     // Try exact filenames first.
     for ext in &["ttf", "otf"] {
@@ -105,22 +106,22 @@ fn find_font(stem: &str) -> Option<Vec<u8>> {
     None
 }
 
-// ── Kanagawa palette (kept for per-item accent colors) ────────────────────────
+// ── Catppuccin Mocha palette (per-item accent colors) ───────────────────────
 mod kana {
     use egui::Color32;
     pub const fn hex(r: u8, g: u8, b: u8) -> Color32 {
         Color32::from_rgb(r, g, b)
     }
-    pub const CRYSTAL_BLUE: Color32 = hex(0x7E, 0x9C, 0xD8);
-    pub const ONI_VIOLET: Color32 = hex(0x95, 0x7F, 0xB8);
-    pub const SPRING_GREEN: Color32 = hex(0x98, 0xBB, 0x6C);
-    pub const WAVE_AQUA2: Color32 = hex(0x7A, 0xA8, 0x9F);
-    pub const SAKURA_PINK: Color32 = hex(0xD2, 0x7E, 0x99);
-    pub const SURIMI_ORANGE: Color32 = hex(0xFF, 0xA0, 0x66);
-    pub const CARP_YELLOW: Color32 = hex(0xE6, 0xC3, 0x84);
-    pub const WAVE_RED: Color32 = hex(0xE4, 0x68, 0x76);
-    pub const SPRING_BLUE: Color32 = hex(0x7F, 0xB4, 0xCA);
-    pub const BOAT_YELLOW2: Color32 = hex(0xC0, 0xA3, 0x6E);
+    pub const CRYSTAL_BLUE: Color32  = hex(0x89, 0xB4, 0xFA); // blue
+    pub const ONI_VIOLET: Color32    = hex(0xCB, 0xA6, 0xF7); // mauve
+    pub const SPRING_GREEN: Color32  = hex(0xA6, 0xE3, 0xA1); // green
+    pub const WAVE_AQUA2: Color32    = hex(0x94, 0xE2, 0xD5); // teal
+    pub const SAKURA_PINK: Color32   = hex(0xF3, 0x8B, 0xA8); // red
+    pub const SURIMI_ORANGE: Color32 = hex(0xFA, 0xB3, 0x87); // peach
+    pub const CARP_YELLOW: Color32   = hex(0xF9, 0xE2, 0xAF); // yellow
+    pub const WAVE_RED: Color32      = hex(0xF5, 0xC2, 0xE7); // pink
+    pub const SPRING_BLUE: Color32   = hex(0x89, 0xDC, 0xEB); // sky
+    pub const BOAT_YELLOW2: Color32  = hex(0xF2, 0xCD, 0xCD); // flamingo
 }
 
 // ── Nerd Font glyph lookup ────────────────────────────────────────────────────
@@ -341,32 +342,69 @@ fn dim_color(c: Color32) -> Color32 {
 // ── Font loading ──────────────────────────────────────────────────────────────
 
 /// Load fonts and return the best available "medium weight" family.
-/// If MapleMono-NF-Medium is not installed, falls back to Monospace so
+/// If JetBrainsMono-NF-Medium is not installed, falls back to Monospace so
 /// we never reference an unregistered FontFamily (which panics in epaint).
 fn load_fonts(ctx: &egui::Context) -> FontFamily {
     let mut fonts = FontDefinitions::default();
-    if let Some(bytes) = find_font("MapleMono-NF-Regular") {
+
+    // Load Symbols Nerd Font as a fallback for nf-md-* glyphs (U+F0000+)
+    // that JetBrains Mono NF doesn't cover.
+    if let Some(bytes) = find_font("SymbolsNerdFont-Regular") {
         fonts
             .font_data
-            .insert("MapleMono".to_owned(), FontData::from_owned(bytes));
+            .insert("SymbolsNF".to_owned(), FontData::from_owned(bytes));
+    }
+
+    // Load Noto Color Emoji for the Emoji picker grid.
+    // Try the stem name first, then the known absolute path.
+    let noto_bytes = find_font("NotoColorEmoji")
+        .or_else(|| std::fs::read("/usr/share/fonts/noto/NotoColorEmoji.ttf").ok())
+        .or_else(|| std::fs::read("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf").ok());
+    if let Some(bytes) = noto_bytes {
+        fonts
+            .font_data
+            .insert("NotoColorEmoji".to_owned(), FontData::from_owned(bytes));
+        // Dedicated family used exclusively by the emoji grid.
+        fonts.families.insert(
+            FontFamily::Name("emoji".into()),
+            vec!["NotoColorEmoji".to_owned()],
+        );
+    }
+
+    if let Some(bytes) = find_font("JetBrainsMonoNerdFont-Regular") {
+        fonts
+            .font_data
+            .insert("JetBrainsMono".to_owned(), FontData::from_owned(bytes));
         fonts
             .families
             .entry(FontFamily::Proportional)
             .or_default()
-            .insert(0, "MapleMono".to_owned());
+            .insert(0, "JetBrainsMono".to_owned());
         fonts
             .families
             .entry(FontFamily::Monospace)
             .or_default()
-            .insert(0, "MapleMono".to_owned());
+            .insert(0, "JetBrainsMono".to_owned());
     }
-    let medium_family = if let Some(bytes) = find_font("MapleMono-NF-Medium") {
+
+    // Append SymbolsNF as fallback to every family so missing glyphs are covered.
+    if fonts.font_data.contains_key("SymbolsNF") {
+        for family in [FontFamily::Proportional, FontFamily::Monospace] {
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .push("SymbolsNF".to_owned());
+        }
+    }
+
+    let medium_family = if let Some(bytes) = find_font("JetBrainsMonoNerdFont-Medium") {
         fonts
             .font_data
-            .insert("MapleMonoMedium".to_owned(), FontData::from_owned(bytes));
+            .insert("JetBrainsMonoMedium".to_owned(), FontData::from_owned(bytes));
         fonts.families.insert(
             FontFamily::Name("medium".into()),
-            vec!["MapleMonoMedium".to_owned()],
+            vec!["JetBrainsMonoMedium".to_owned(), "SymbolsNF".to_owned()],
         );
         FontFamily::Name("medium".into())
     } else {
@@ -417,6 +455,7 @@ pub enum Mode {
     Clipboard,
     Pass,
     Files,
+    Emoji,
     About,
     /// Activated by `mofi --input`.
     Input,
@@ -468,7 +507,7 @@ pub struct RofiApp {
     theme: Theme,
     config_mtime: Option<SystemTime>,
     /// The FontFamily to use for medium-weight text.  Normally
-    /// FontFamily::Name("medium") when MapleMono-NF-Medium.ttf is installed,
+    /// FontFamily::Name("medium") when JetBrainsMono-NF-Medium.ttf is installed,
     /// otherwise falls back to FontFamily::Monospace to prevent a panic.
     medium_font: FontFamily,
     /// Frecency store — tracks launch frequency/recency for Apps and Pass items.
@@ -489,6 +528,9 @@ pub struct RofiApp {
     image_textures: std::collections::HashMap<String, egui::TextureHandle>,
     /// Single-pane file explorer state.
     file_pane: crate::files::Pane,
+    /// Emoji sprite-sheet texture (loaded once, used by the emoji grid).
+    /// None until first time Mode::Emoji is shown.
+    emoji_texture: Option<egui::TextureHandle>,
     /// Cached zoxide query results (directory paths).
     zoxide_results: Vec<String>,
     /// The query term that produced the current zoxide_results.
@@ -499,6 +541,8 @@ pub struct RofiApp {
     drill_target: Option<String>,
     /// Shell command history for `!command` mode (most recent last).
     shell_history: Vec<String>,
+    /// Filtered emoji indices (into EMOJI_LIST) for the Emoji mode.
+    emoji_filtered: Vec<usize>,
 }
 
 impl RofiApp {
@@ -660,6 +704,8 @@ impl RofiApp {
             zoxide_last_query: String::new(),
             drill_target: None,
             shell_history: load_shell_history(),
+            emoji_filtered: (0..EMOJI_LIST.len()).collect(),
+            emoji_texture: None,
         };
         app.refilter(true);
         app
@@ -727,6 +773,79 @@ impl RofiApp {
         }
     }
 
+    /// Ensure the emoji sprite-sheet texture is loaded, generating it if needed.
+    /// Returns (texture_handle, cols, cell_w, cell_h).
+    fn ensure_emoji_texture(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Option<(egui::TextureHandle, usize, u32, u32)> {
+        const COLS: usize = 20;
+        const CELL_W: u32 = 67;
+        const CELL_H: u32 = 84;
+
+        if self.emoji_texture.is_none() {
+            let sheet_path = dirs::cache_dir()
+                .unwrap_or_else(std::env::temp_dir)
+                .join("mofi")
+                .join("emoji_sheet.png");
+
+            let needs_gen = !sheet_path.exists() || {
+                let meta = sheet_path.with_extension("meta");
+                std::fs::read_to_string(&meta)
+                    .map(|s| !s.trim().starts_with(&EMOJI_LIST.len().to_string()))
+                    .unwrap_or(true)
+            };
+
+            if needs_gen {
+                let _ = std::fs::create_dir_all(sheet_path.parent().unwrap());
+                // The Python generator script is embedded at compile time.
+                let script = include_str!("emoji_gen.py");
+                let script_path = std::env::temp_dir().join("mofi_emoji_gen.py");
+                if std::fs::write(&script_path, script).is_ok() {
+                    let _ = std::process::Command::new("python3")
+                        .arg(&script_path)
+                        .env("MOFI_EMOJI_SRC",  concat!(env!("CARGO_MANIFEST_DIR"), "/src/emoji.rs"))
+                        .env("MOFI_EMOJI_OUT",  sheet_path.to_string_lossy().as_ref())
+                        .env("MOFI_EMOJI_META", sheet_path.with_extension("meta").to_string_lossy().as_ref())
+                        .env("MOFI_EMOJI_COLS", COLS.to_string())
+                        .env("MOFI_EMOJI_CW",   CELL_W.to_string())
+                        .env("MOFI_EMOJI_CH",   CELL_H.to_string())
+                        .status();
+                }
+            }
+
+            if let Ok(data) = std::fs::read(&sheet_path) {
+                if let Ok(img) = image::load_from_memory(&data) {
+                    let rgba = img.to_rgba8();
+                    let (w, h) = rgba.dimensions();
+                    let ci = egui::ColorImage::from_rgba_unmultiplied(
+                        [w as usize, h as usize], rgba.as_raw(),
+                    );
+                    self.emoji_texture = Some(ctx.load_texture(
+                        "emoji_sheet", ci, egui::TextureOptions::LINEAR,
+                    ));
+                }
+            }
+        }
+
+        self.emoji_texture.as_ref().map(|t| (t.clone(), COLS, CELL_W, CELL_H))
+    }
+
+    fn refilter_emoji(&mut self) {
+        if self.query.is_empty() {
+            self.emoji_filtered = (0..EMOJI_LIST.len()).collect();
+        } else {
+            let q = self.query.to_lowercase();
+            self.emoji_filtered = EMOJI_LIST
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.0.contains(&*q) || e.1.to_lowercase().contains(&*q))
+                .map(|(i, _)| i)
+                .collect();
+        }
+        self.selected = 0;
+    }
+
     fn refilter(&mut self, reset_selection: bool) {
         let mode_items: Vec<(usize, &LaunchItem)> = self
             .items
@@ -736,7 +855,7 @@ impl RofiApp {
                 Mode::Apps => matches!(item, LaunchItem::App(_)),
                 Mode::Clipboard => matches!(item, LaunchItem::Clip(_)),
                 Mode::Pass => matches!(item, LaunchItem::Pass(_)),
-                Mode::About | Mode::Input | Mode::Themes | Mode::Files => false,
+                Mode::About | Mode::Input | Mode::Themes | Mode::Files | Mode::Emoji => false,
             })
             .collect();
 
@@ -1239,6 +1358,10 @@ impl RofiApp {
                             self.mode = Mode::Files;
                             self.file_pane.scan();
                         }
+                        Some("emoji") => {
+                            self.mode = Mode::Emoji;
+                            self.refilter_emoji();
+                        }
                         _ => {
                             self.mode = Mode::Apps;
                         }
@@ -1272,6 +1395,10 @@ impl RofiApp {
                     Some("files") => {
                         self.mode = Mode::Files;
                         self.file_pane.scan();
+                    }
+                    Some("emoji") => {
+                        self.mode = Mode::Emoji;
+                        self.refilter_emoji();
                     }
                     _ => {
                         self.mode = Mode::Apps;
@@ -1484,6 +1611,7 @@ impl RofiApp {
                                 (Mode::Clipboard, "Clipboard"),
                                 (Mode::Pass, "Pass"),
                                 (Mode::Files, "Files"),
+                                (Mode::Emoji, "Emoji"),
                                 (Mode::Themes, "Themes"),
                                 (Mode::About, "About"),
                             ];
@@ -1528,7 +1656,11 @@ impl RofiApp {
                                             #[cfg(target_os = "linux")]
                                             self.preload_clipboard_textures(ctx);
                                         }
-                                        self.refilter(true);
+                                        if mode == Mode::Emoji {
+                                            self.refilter_emoji();
+                                        } else {
+                                            self.refilter(true);
+                                        }
                                     }
                                     self.update_tray();
                                 }
@@ -1554,6 +1686,7 @@ impl RofiApp {
                             Mode::Clipboard => "Filter clipboard…",
                             Mode::Pass => "Search passwords…",
                             Mode::Files => "Filter files…",
+                            Mode::Emoji => "Search emoji…",
                             Mode::Input => "Filter…",
                             Mode::Themes => "Filter themes…",
                             Mode::About => "",
@@ -1612,7 +1745,8 @@ impl RofiApp {
                                 Mode::Apps => Mode::Clipboard,
                                 Mode::Clipboard => Mode::Pass,
                                 Mode::Pass => Mode::Files,
-                                Mode::Files => Mode::Themes,
+                                Mode::Files => Mode::Emoji,
+                                Mode::Emoji => Mode::Themes,
                                 Mode::Themes => Mode::About,
                                 Mode::About => Mode::Apps,
                                 Mode::Input => Mode::Input,
@@ -1630,12 +1764,44 @@ impl RofiApp {
                                     #[cfg(target_os = "linux")]
                                     self.preload_clipboard_textures(ctx);
                                 }
-                                self.refilter(true);
+                                if self.mode == Mode::Emoji {
+                                    self.refilter_emoji();
+                                } else {
+                                    self.refilter(true);
+                                }
                             }
                             self.update_tray();
                         }
 
-                        if self.mode == Mode::Input || self.mode == Mode::Themes {
+                        if self.mode == Mode::Emoji {
+                            let cols = emoji_grid_cols(ui.available_width());
+                            let len = self.emoji_filtered.len();
+                            if down && len > 0 {
+                                self.selected = (self.selected + cols).min(len - 1);
+                            }
+                            if up && len > 0 {
+                                self.selected = self.selected.saturating_sub(cols);
+                            }
+                            // Left / Right arrows move within the row
+                            let arrow_left = ctx.input(|i| i.key_pressed(Key::ArrowLeft));
+                            let arrow_right = ctx.input(|i| i.key_pressed(Key::ArrowRight));
+                            if arrow_right && len > 0 {
+                                self.selected = (self.selected + 1).min(len - 1);
+                            }
+                            if arrow_left && len > 0 {
+                                self.selected = self.selected.saturating_sub(1);
+                            }
+                            if enter {
+                                if let Some(&ei) = self.emoji_filtered.get(self.selected) {
+                                    let emoji = EMOJI_LIST[ei].0;
+                                    crate::clipboard::write_clipboard(emoji);
+                                    self.toast = Some((format!("Copied {}", emoji), std::time::Instant::now()));
+                                    self.should_close = true;
+                                    self.oneshot_result = Some(None);
+                                }
+                                return;
+                            }
+                        } else if self.mode == Mode::Input || self.mode == Mode::Themes {
                             let len = self.input_filtered.len();
                             if down && len > 0 {
                                 let new_sel = (self.selected + down_count).min(len - 1);
@@ -1880,6 +2046,8 @@ impl RofiApp {
                                 if self.mode == Mode::Themes {
                                     self.preview_theme_at_selection();
                                 }
+                            } else if self.mode == Mode::Emoji {
+                                self.refilter_emoji();
                             } else {
                                 self.refilter(true);
                             }
@@ -1903,9 +2071,149 @@ impl RofiApp {
 
                         // ── Panels ────────────────────────────────────────
                         let breadcrumb_h = if self.mode == Mode::Files { 34.0 } else { 0.0 };
-                        let max_list_height = ui.available_height() - breadcrumb_h;
+                        let emoji_info_h = if self.mode == Mode::Emoji { 22.0 } else { 0.0 };
+                        let max_list_height = ui.available_height() - breadcrumb_h - emoji_info_h;
 
-                        if self.mode == Mode::About {
+                        if self.mode == Mode::Emoji {
+                            // Emoji picker grid
+                            let sprite = self.ensure_emoji_texture(ctx);
+
+                            let cols = emoji_grid_cols(ui.available_width());
+                            let cell_size = Vec2::new(ui.available_width() / cols as f32, 28.0);
+                            let img_size = 24.0_f32;
+                            let selected = self.selected;
+
+                            let scroll = egui::ScrollArea::vertical()
+                                .id_source(("mofi_emoji", self.scroll_generation))
+                                .max_height(max_list_height);
+                            scroll.show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                if self.emoji_filtered.is_empty() {
+                                    ui.add_space(20.0);
+                                    ui.centered_and_justified(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("No emoji found")
+                                                .font(FontId::new(13.0, FontFamily::Monospace))
+                                                .color(t.fg_muted),
+                                        );
+                                    });
+                                    return;
+                                }
+                                if sprite.is_none() {
+                                    ui.add_space(20.0);
+                                    ui.centered_and_justified(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("Generating emoji sheet...")
+                                                .font(FontId::new(13.0, FontFamily::Monospace))
+                                                .color(t.fg_muted),
+                                        );
+                                    });
+                                    return;
+                                }
+
+                                let (tex, spr_cols, cell_w_px, cell_h_px) = sprite.unwrap();
+                                let [sheet_w, sheet_h] = tex.size();
+                                let uv_cell_w = cell_w_px as f32 / sheet_w as f32;
+                                let uv_cell_h = cell_h_px as f32 / sheet_h as f32;
+
+                                let aw = ui.available_width();
+                                let rows = (self.emoji_filtered.len() + cols - 1) / cols;
+
+                                for row in 0..rows {
+                                    let row_start = row * cols;
+                                    let row_end = (row_start + cols).min(self.emoji_filtered.len());
+
+                                    let (row_rect, _) = ui.allocate_exact_size(
+                                        Vec2::new(aw, cell_size.y),
+                                        egui::Sense::hover(),
+                                    );
+
+                                    if selected >= row_start && selected < row_end {
+                                        if selected != self.last_scroll_to {
+                                            self.last_scroll_to = selected;
+                                            ui.scroll_to_rect(row_rect, None);
+                                        }
+                                    }
+
+                                    for col in 0..(row_end - row_start) {
+                                        let ei_pos = row_start + col;
+                                        let ei = self.emoji_filtered[ei_pos];
+                                        let (emoji_char, _name, _cat) = EMOJI_LIST[ei];
+                                        let sel = ei_pos == selected;
+
+                                        let cell_rect = egui::Rect::from_min_size(
+                                            egui::pos2(
+                                                row_rect.left() + col as f32 * cell_size.x,
+                                                row_rect.top(),
+                                            ),
+                                            cell_size,
+                                        );
+
+                                        if sel {
+                                            ui.painter().rect_filled(
+                                                cell_rect,
+                                                Rounding::same(4.0),
+                                                t.row_sel,
+                                            );
+                                        }
+
+                                        // UV rect for this emoji in the sprite sheet.
+                                        let spr_row = ei / spr_cols;
+                                        let spr_col = ei % spr_cols;
+                                        let uv = egui::Rect::from_min_max(
+                                            egui::pos2(spr_col as f32 * uv_cell_w,
+                                                       spr_row as f32 * uv_cell_h),
+                                            egui::pos2((spr_col + 1) as f32 * uv_cell_w,
+                                                       (spr_row + 1) as f32 * uv_cell_h),
+                                        );
+                                        let img_rect = egui::Rect::from_center_size(
+                                            cell_rect.center(), Vec2::splat(img_size),
+                                        );
+                                        ui.painter().image(tex.id(), img_rect, uv, Color32::WHITE);
+
+                                        let resp = ui.interact(
+                                            cell_rect,
+                                            egui::Id::new(("emoji", ei_pos)),
+                                            egui::Sense::click(),
+                                        );
+                                        if resp.clicked() {
+                                            crate::clipboard::write_clipboard(emoji_char);
+                                            self.toast = Some((format!("Copied {}", emoji_char),
+                                                std::time::Instant::now()));
+                                            self.selected = ei_pos;
+                                            self.should_close = true;
+                                            self.oneshot_result = Some(None);
+                                        }
+                                        if resp.hovered() {
+                                            self.selected = ei_pos;
+                                        }
+                                    }
+                                }
+                            });
+
+                            // ── Info bar: name of selected emoji ─────────
+                            if let Some(&ei) = self.emoji_filtered.get(self.selected) {
+                                let (emoji_char, name, cat) = EMOJI_LIST[ei];
+                                ui.add_space(4.0);
+                                // Paint the color glyph + text label side by side
+                                // so the emoji uses NotoColorEmoji and the text uses Monospace.
+                                let bar_resp = ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    // Color emoji glyph
+                                    ui.label(
+                                        egui::RichText::new(emoji_char)
+                                            .font(FontId::new(14.0, FontFamily::Name("emoji".into())))
+                                    );
+                                    // Name · category
+                                    ui.label(
+                                        egui::RichText::new(format!("{} \u{00b7} {}", name, cat))
+                                            .font(FontId::new(12.0, FontFamily::Monospace))
+                                            .color(t.fg_muted),
+                                    );
+                                });
+                                let _ = bar_resp;
+                            }
+                        } else if self.mode == Mode::About {
                             ui.add_space(18.0);
                             ui.vertical_centered(|ui| {
                                 ui.label(

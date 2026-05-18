@@ -36,7 +36,7 @@ const IDLE_FG: [u8; 3] = [0xFF, 0xFF, 0xFF];
 /// Corner radius for the rounded-square.
 const CORNER_R: f32 = 4.0;
 
-/// Default idle glyph — plain capital "M" from MapleMono.
+/// Default idle glyph — plain capital "M" from JetBrainsMono.
 const IDLE_GLYPH: &str = "M";
 
 // ── Tray struct ───────────────────────────────────────────────────────────────
@@ -252,7 +252,7 @@ fn aa_edge(d: f32) -> u8 {
 // ── Font loading ──────────────────────────────────────────────────────────────
 
 fn load_nerd_font() -> Option<Font> {
-    let stems = ["MapleMono-NF-Regular"];
+    let stems = ["JetBrainsMono-NF-Regular"];
     let dirs = font_search_dirs();
     for stem in &stems {
         for ext in &["ttf", "otf"] {
@@ -306,7 +306,7 @@ pub type TrayHandle = ksni::Handle<MofiTray>;
 
 pub fn spawn_tray() -> TrayHandle {
     let font = load_nerd_font().unwrap_or_else(|| {
-        eprintln!("[mofi-tray] MapleMono NF not found, using built-in fallback");
+        eprintln!("[mofi-tray] JetBrainsMono NF not found, using built-in fallback");
         Font::from_bytes(
             include_bytes!("/usr/share/fonts/noto/NotoSans-Regular.ttf").to_vec(),
             FontSettings::default(),

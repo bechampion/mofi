@@ -300,19 +300,20 @@ fn run_inner<A: AppHandler>(mut app: A, sigterm: Arc<AtomicBool>, start_mapped: 
     // (SIGUSR1) is processed even while the surface is unmapped and the
     // compositor sends no Wayland events.
     let wayland_fd = conn.backend().poll_fd().as_raw_fd();
+    let mut poll_timeout_ms: i32 = 16; // start responsive, updated each frame
 
     loop {
         // Flush any pending outbound Wayland messages.
         event_queue.flush().ok();
 
-        // Poll the Wayland fd for up to 16 ms so we stay responsive but
-        // don't spin at 100 % CPU when nothing is happening.
+        // Poll the Wayland fd using egui's requested repaint delay so we sleep
+        // when the UI is idle (e.g. 50ms) and stay fast when animating (0ms).
         let mut pfd = libc::pollfd {
             fd: wayland_fd,
             events: libc::POLLIN,
             revents: 0,
         };
-        unsafe { libc::poll(&mut pfd, 1, 16) };
+        unsafe { libc::poll(&mut pfd, 1, poll_timeout_ms) };
 
         // Read any events that arrived, then dispatch them.
         if pfd.revents & libc::POLLIN != 0 {
@@ -348,7 +349,8 @@ fn run_inner<A: AppHandler>(mut app: A, sigterm: Arc<AtomicBool>, start_mapped: 
         // Always run app logic (processes toggle / viewport commands) so the
         // surface can be mapped even when currently unmapped.  Rendering is
         // skipped inside paint_frame when !mapped.
-        state.paint_frame(&mut app);
+        let delay = state.paint_frame(&mut app);
+        poll_timeout_ms = delay.max(1) as i32;
 
         if state.should_close || sigterm.load(Ordering::Relaxed) {
             break;
@@ -465,7 +467,7 @@ impl LayerState {
         repeat.last_repeat = now;
     }
 
-    fn paint_frame<A: AppHandler>(&mut self, app: &mut A) {
+    fn paint_frame<A: AppHandler>(&mut self, app: &mut A) -> u32 {
         // Build the screen rect for egui (in egui points = logical pixels at scale=1.0,
         // or width/height when ppp=scale since phys_w/ppp = width).
         self.egui_input.screen_rect = Some(egui::Rect::from_min_size(
@@ -483,7 +485,13 @@ impl LayerState {
             app_wants_close = app.update(ctx);
         });
 
-        // Handle viewport commands emitted by the app.
+        // Extract egui's requested repaint delay (ms) — 0 means "asap", None means "no repaint needed".
+        let repaint_delay_ms: u32 = full_output
+            .viewport_output
+            .values()
+            .next()
+            .map(|v| v.repaint_delay.as_millis().min(200) as u32)
+            .unwrap_or(200);
         let mut new_size: Option<(u32, u32)> = None;
         let mut want_close = false;
         let cmds: &[ViewportCommand] = full_output
@@ -524,7 +532,7 @@ impl LayerState {
         // App signalled close (update() returned true) or sent ViewportCommand::Close.
         if want_close || app_wants_close {
             self.should_close = true;
-            return;
+            return 0;
         }
 
         // ── Tessellate (always, so shapes are consumed) ───────────────────────
@@ -542,7 +550,7 @@ impl LayerState {
                 &[],
                 &full_output.textures_delta,
             );
-            return;
+            return repaint_delay_ms;
         }
 
         // ── Render ────────────────────────────────────────────────────────────
@@ -569,8 +577,10 @@ impl LayerState {
             .swap_buffers(&self.gl_ctx)
             .expect("swap_buffers failed");
 
-        // Request continuous repaint while visible.
-        self.egui_ctx.request_repaint();
+        // Do NOT call request_repaint() here unconditionally — that would
+        // spin at ~60 fps even when the UI is idle. ui.rs controls the
+        // repaint rate via ctx.request_repaint_after(50ms) while visible.
+        repaint_delay_ms
     }
 
     fn map_surface(&mut self, w: u32, h: u32) {
