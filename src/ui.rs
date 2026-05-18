@@ -67,6 +67,7 @@ fn font_search_dirs() -> Vec<std::path::PathBuf> {
     {
         dirs.push(std::path::PathBuf::from("/usr/local/share/fonts"));
         dirs.push(std::path::PathBuf::from("/usr/share/fonts"));
+        dirs.push(std::path::PathBuf::from("/usr/share/fonts/TTF"));
         dirs.push(std::path::PathBuf::from("/usr/share/fonts/truetype"));
         dirs.push(std::path::PathBuf::from("/usr/share/fonts/OTF"));
     }

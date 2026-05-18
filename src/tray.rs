@@ -252,7 +252,7 @@ fn aa_edge(d: f32) -> u8 {
 // ── Font loading ──────────────────────────────────────────────────────────────
 
 fn load_nerd_font() -> Option<Font> {
-    let stems = ["JetBrainsMono-NF-Regular"];
+    let stems = ["JetBrainsMonoNerdFont-Regular", "JetBrainsMono-NF-Regular"];
     let dirs = font_search_dirs();
     for stem in &stems {
         for ext in &["ttf", "otf"] {
@@ -295,6 +295,7 @@ fn font_search_dirs() -> Vec<std::path::PathBuf> {
     }
     dirs.push(std::path::PathBuf::from("/usr/local/share/fonts"));
     dirs.push(std::path::PathBuf::from("/usr/share/fonts"));
+    dirs.push(std::path::PathBuf::from("/usr/share/fonts/TTF"));
     dirs.push(std::path::PathBuf::from("/usr/share/fonts/truetype"));
     dirs.push(std::path::PathBuf::from("/usr/share/fonts/OTF"));
     dirs
